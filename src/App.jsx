@@ -3,12 +3,13 @@ import {
   Users, Home, Wallet, Wrench, LayoutDashboard, LogOut, 
   CheckCircle2, Plus, AlertCircle, Phone, X, ShieldCheck, UserCog, 
   Check, Clock, FileText, Calendar, Edit, Info, Coins, ListOrdered,
-  Droplet, Truck, Sun, Moon, BellRing, ChevronRight, Menu
+  Droplet, Truck, Sun, Moon, BellRing, ChevronRight, Menu,
+  Eye, EyeOff, Download
 } from 'lucide-react';
 
 // --- FIREBASE IMPORTS ---
 import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut } from 'firebase/auth';
+import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut, sendPasswordResetEmail } from 'firebase/auth';
 import { getFirestore, collection, onSnapshot, doc, setDoc, addDoc, updateDoc, deleteDoc } from 'firebase/firestore';
 
 // --- FIREBASE SETUP ---
@@ -44,7 +45,7 @@ export default function App() {
   const [role, setRole] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [loading, setLoading] = useState(true);
-  const [sidebarOpen, setSidebarOpen] = useState(false); // New state for mobile menu
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   // Global states for errors and visual loading states
   const [isProcessing, setIsProcessing] = useState(false);
@@ -54,7 +55,9 @@ export default function App() {
   const [loginTab, setLoginTab] = useState('landlord'); 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [loginError, setLoginError] = useState('');
+  const [showWelcomeScreen, setShowWelcomeScreen] = useState(false);
 
   // Live Database States
   const [houses, setHouses] = useState([]);
@@ -74,12 +77,12 @@ export default function App() {
   const [isHistoryModalOpen, setIsHistoryModalOpen] = useState(false);
   const [isSepticModalOpen, setIsSepticModalOpen] = useState(false);
   const [isWaterBillModalOpen, setIsWaterBillModalOpen] = useState(false);
+  const [isEditTenantModalOpen, setIsEditTenantModalOpen] = useState(false);
   
   // Selection Targets
   const [selectedTenant, setSelectedTenant] = useState(null); 
   const [selectedTenantForDetails, setSelectedTenantForDetails] = useState(null); 
   const [selectedRepair, setSelectedRepair] = useState(null); 
-  const [isEditTenantModalOpen, setIsEditTenantModalOpen] = useState(false);
 
   useEffect(() => {
     localStorage.setItem('ruiru_theme', theme);
@@ -114,7 +117,7 @@ export default function App() {
     return () => { unsubHouses(); unsubTenants(); unsubPayments(); unsubRepairs(); unsubSeptic(); unsubWaterBills(); };
   }, [user]);
 
-  // Derived occupancies to prevent double tenant entries on the same house
+  // Derived occupancies
   const occupiedHouseIds = useMemo(() => {
     return new Set(tenants.map(t => t.houseId).filter(Boolean));
   }, [tenants]);
@@ -129,6 +132,27 @@ export default function App() {
     setIsProcessing(true);
     try {
       await signInWithEmailAndPassword(auth, email, password);
+      // Trigger Welcome Animation interval
+      setShowWelcomeScreen(true);
+      setTimeout(() => {
+        setShowWelcomeScreen(false);
+      }, 2500); 
+    } catch (error) {
+      setLoginError(error.message.replace("Firebase: ", ""));
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleForgotPassword = async () => {
+    if (!email) {
+      setLoginError("Please enter your email address above first to reset your password.");
+      return;
+    }
+    setIsProcessing(true);
+    try {
+      await sendPasswordResetEmail(auth, email);
+      setLoginError("Password reset email sent! Please check your inbox.");
     } catch (error) {
       setLoginError(error.message.replace("Firebase: ", ""));
     } finally {
@@ -145,6 +169,144 @@ export default function App() {
     setModalError('');
   };
 
+  const formatKes = (amount) => `KES ${Number(amount || 0).toLocaleString('en-KE')}`;
+
+  // --- PDF / PRINTING ENGINE ---
+  
+  const printReceipt = (payment, tenant) => {
+    const printWindow = window.open('', '_blank');
+    const html = `
+      <html>
+        <head>
+          <title>Receipt - ${payment.messageCode || 'N/A'}</title>
+          <style>
+            body { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; padding: 40px; color: #333; max-width: 800px; margin: 0 auto; position: relative; }
+            .watermark { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(-45deg); opacity: 0.05; font-size: 140px; font-weight: 900; z-index: -1; pointer-events: none; white-space: nowrap; color: #000; }
+            .header { border-bottom: 2px solid #eee; padding-bottom: 20px; margin-bottom: 30px; text-align: center; }
+            .header h1 { margin: 0; font-size: 28px; color: #111; }
+            .details { margin-bottom: 30px; display: flex; justify-content: space-between; }
+            .details div { font-size: 14px; line-height: 1.6; }
+            .amount-box { background: #f8f9fa; padding: 20px; border-radius: 12px; text-align: center; border: 1px solid #e9ecef; margin-bottom: 30px; }
+            .amount-box h2 { margin: 0; font-size: 36px; color: #10b981; }
+            table { width: 100%; border-collapse: collapse; margin-bottom: 30px; }
+            th, td { border-bottom: 1px solid #eee; padding: 12px; text-align: left; }
+            th { color: #666; font-weight: bold; font-size: 12px; text-transform: uppercase; background: #fafafa; }
+            .footer { font-size: 12px; text-align: center; color: #888; border-top: 1px solid #eee; padding-top: 20px; margin-top: 50px; }
+          </style>
+        </head>
+        <body>
+          <div class="watermark">RUIRU RENTALS</div>
+          <div class="header">
+            <h1>Ruiru Rentals</h1>
+            <p style="margin: 5px 0 0; color: #666; font-weight: bold;">Official Payment Receipt</p>
+          </div>
+          <div class="amount-box">
+            <p style="margin: 0 0 5px; color: #666; text-transform: uppercase; font-size: 12px; font-weight: bold;">Amount Received</p>
+            <h2>${formatKes(payment.amount)}</h2>
+          </div>
+          <div class="details">
+            <div>
+              <strong>Tenant Information:</strong><br/>
+              ${tenant.name}<br/>
+              Phone: ${tenant.phone}
+            </div>
+            <div style="text-align: right;">
+              <strong>Transaction Details:</strong><br/>
+              Date: ${new Date(payment.date).toLocaleString()}<br/>
+              Method: ${payment.method}<br/>
+              Ref/Code: ${payment.messageCode || 'N/A'}
+            </div>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>Description</th>
+                <th style="text-align: right;">Amount</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>${payment.type === 'COMBINED' ? 'Rent & Water Combined Payment' : payment.type + ' Payment'}</td>
+                <td style="text-align: right;">${formatKes(payment.amount)}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="footer">
+            <p>Thank you for your prompt payment!</p>
+            <p>&copy; ${new Date().getFullYear()} Ruiru Rentals. @Gikunju creates.</p>
+          </div>
+        </body>
+      </html>
+    `;
+    printWindow.document.write(html);
+    printWindow.document.close();
+    setTimeout(() => printWindow.print(), 300);
+  };
+
+  const printLedgerReport = () => {
+    const printWindow = window.open('', '_blank');
+    const html = `
+      <html>
+        <head>
+          <title>Ruiru Rentals - Ledger Report</title>
+          <style>
+            body { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; padding: 40px; color: #333; position: relative; font-size: 14px; }
+            .watermark { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(-45deg); opacity: 0.05; font-size: 160px; font-weight: 900; z-index: -1; pointer-events: none; white-space: nowrap; color: #000; }
+            table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 13px; }
+            th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
+            th { background-color: #f4f4f4; color: #333; text-transform: uppercase; font-size: 11px; }
+            .header { display: flex; align-items: center; border-bottom: 2px solid #eee; padding-bottom: 20px; margin-bottom: 30px; }
+            .header-text h1 { margin: 0; font-size: 26px; }
+            .header-text p { margin: 5px 0 0; color: #666; }
+            .footer { margin-top: 50px; font-size: 12px; text-align: center; color: #777; border-top: 1px solid #eee; padding-top: 20px; }
+            .badge { padding: 4px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; background: #e2e8f0; }
+          </style>
+        </head>
+        <body>
+          <div class="watermark">RUIRU RENTALS</div>
+          <div class="header">
+            <div class="header-text">
+              <h1>Ruiru Rentals</h1>
+              <p style="font-weight: bold;">Full Transactions Ledger Report</p>
+              <p style="font-size: 12px;">Generated on: ${new Date().toLocaleString()}</p>
+            </div>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Tenant Name</th>
+                <th>Ref/Code</th>
+                <th>Type</th>
+                <th>Amount Received</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${payments.map(p => `
+                <tr>
+                  <td>${new Date(p.date).toLocaleDateString()}</td>
+                  <td><strong>${p.tenantName}</strong></td>
+                  <td>${p.messageCode || 'N/A'}</td>
+                  <td>${p.type}</td>
+                  <td><strong>${formatKes(p.amount)}</strong></td>
+                  <td><span class="badge">${p.status}</span></td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+          <div class="footer">
+            <p>&copy; ${new Date().getFullYear()} Ruiru Rentals. All rights reserved.</p>
+            <p>@Gikunju creates</p>
+          </div>
+        </body>
+      </html>
+    `;
+    printWindow.document.write(html);
+    printWindow.document.close();
+    setTimeout(() => printWindow.print(), 300);
+  };
+
   // --- REBUILT IMMUNE CRUD OPERATIONS ---
 
   const handleAddHouse = async (e) => {
@@ -156,45 +318,28 @@ export default function App() {
       const formData = new FormData(e.target);
       const rawHouseName = formData.get('name').trim();
 
-      if (!rawHouseName) {
-        throw new Error("Unit name cannot be blank.");
-      }
-
+      if (!rawHouseName) throw new Error("Unit name cannot be blank.");
       if (houses.some(h => h.name.trim().toLowerCase() === rawHouseName.toLowerCase())) {
         throw new Error(`A unit named "${rawHouseName}" already exists in your inventory.`);
       }
 
       const addPromise = addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'houses'), {
-        name: rawHouseName,
-        type: formData.get('type'),
-        rent: Number(formData.get('rent')),
-        status: 'VACANT',
-        repairStatus: 'GOOD'
+        name: rawHouseName, type: formData.get('type'), rent: Number(formData.get('rent')),
+        status: 'VACANT', repairStatus: 'GOOD'
       });
-
       await promiseTimeout(addPromise, 5000);
       closeAnyModal(setIsHouseModalOpen);
-    } catch (err) {
-      setModalError(err.message);
-    } finally {
-      setIsProcessing(false);
-    }
+    } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
-  // New logic for strictly handling Vacant house maintenance
   const handleToggleHouseRepairMode = async (house) => {
     if (!user || isProcessing) return;
     setIsProcessing(true);
     try {
-      // Switch between UNDER_REPAIR and VACANT
       const newStatus = house.status === 'UNDER_REPAIR' ? 'VACANT' : 'UNDER_REPAIR';
       const updatePromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', house.id), { status: newStatus });
       await promiseTimeout(updatePromise, 5000);
-    } catch (err) {
-      setModalError(err.message);
-    } finally {
-      setIsProcessing(false);
-    }
+    } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
   const handleAddTenant = async (e) => {
@@ -207,36 +352,19 @@ export default function App() {
       const houseId = formData.get('houseId');
       
       if (!houseId) throw new Error("Please select an available vacant house unit.");
-
-      // Check occupancy locally in memory first to prevent race condition issues
-      if (occupiedHouseIds.has(houseId)) {
-        throw new Error("That house unit has just been occupied. Please select another vacant unit.");
-      }
+      if (occupiedHouseIds.has(houseId)) throw new Error("That house unit has just been occupied.");
 
       const tenantPromise = addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'tenants'), {
-        name: formData.get('name'),
-        phone: formData.get('phone'),
-        contactPref: formData.get('contactPref'),
-        houseId: houseId,
-        expectedRent: Number(formData.get('expectedRent')),
-        expectedWater: Number(formData.get('expectedWater')),
-        paidRent: 0,
-        paidWater: 0,
-        dateEntered: new Date().toISOString()
+        name: formData.get('name'), phone: formData.get('phone'), contactPref: formData.get('contactPref'),
+        houseId: houseId, expectedRent: Number(formData.get('expectedRent')), expectedWater: Number(formData.get('expectedWater')),
+        paidRent: 0, paidWater: 0, dateEntered: new Date().toISOString()
       });
-
       await promiseTimeout(tenantPromise, 5000);
 
-      // Instantly mark the house as OCCUPIED in database
       const houseUpdatePromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', houseId), { status: 'OCCUPIED' });
       await promiseTimeout(houseUpdatePromise, 5000);
-
       closeAnyModal(setIsTenantModalOpen);
-    } catch (err) {
-      setModalError(err.message);
-    } finally {
-      setIsProcessing(false);
-    }
+    } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
   const handleEditTenant = async (e) => {
@@ -250,34 +378,20 @@ export default function App() {
       const oldHouseId = selectedTenantForDetails.houseId;
 
       if (newHouseId && newHouseId !== oldHouseId) {
-         if (occupiedHouseIds.has(newHouseId)) {
-           throw new Error("Target house unit is already occupied by another tenant.");
-         }
-         const updateNewPromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', newHouseId), { status: 'OCCUPIED' });
-         await promiseTimeout(updateNewPromise, 5000);
-         if (oldHouseId) {
-           const updateOldPromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', oldHouseId), { status: 'VACANT' });
-           await promiseTimeout(updateOldPromise, 5000);
-         }
+         if (occupiedHouseIds.has(newHouseId)) throw new Error("Target house unit is already occupied.");
+         await promiseTimeout(updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', newHouseId), { status: 'OCCUPIED' }), 5000);
+         if (oldHouseId) await promiseTimeout(updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', oldHouseId), { status: 'VACANT' }), 5000);
       }
 
       const editPromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tenants', selectedTenantForDetails.id), {
-        name: formData.get('name'),
-        phone: formData.get('phone'),
-        contactPref: formData.get('contactPref'),
-        expectedRent: Number(formData.get('expectedRent')),
-        expectedWater: Number(formData.get('expectedWater')),
+        name: formData.get('name'), phone: formData.get('phone'), contactPref: formData.get('contactPref'),
+        expectedRent: Number(formData.get('expectedRent')), expectedWater: Number(formData.get('expectedWater')),
         houseId: newHouseId || oldHouseId
       });
-
       await promiseTimeout(editPromise, 5000);
       closeAnyModal(setIsEditTenantModalOpen);
       setSelectedTenantForDetails(null);
-    } catch (err) {
-      setModalError(err.message);
-    } finally {
-      setIsProcessing(false);
-    }
+    } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
   const handleLogPayment = async (e) => {
@@ -317,31 +431,23 @@ export default function App() {
       const isConfirmed = role === 'LANDLORD';
 
       const paymentPromise = addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'payments'), {
-        tenantId: selectedTenant.id,
-        tenantName: selectedTenant.name,
+        tenantId: selectedTenant.id, tenantName: selectedTenant.name,
         amount, appliedRent, appliedWater, excessAmount, type, method, messageCode,
         status: isConfirmed ? 'CONFIRMED' : 'PENDING',
-        date: new Date().toISOString(),
-        loggedBy: role
+        date: new Date().toISOString(), loggedBy: role
       });
-
       await promiseTimeout(paymentPromise, 5000);
 
       if (isConfirmed) {
         const updateBalancePromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tenants', selectedTenant.id), { 
-          paidRent: selectedTenant.paidRent + appliedRent,
-          paidWater: selectedTenant.paidWater + appliedWater
+          paidRent: selectedTenant.paidRent + appliedRent, paidWater: selectedTenant.paidWater + appliedWater
         });
         await promiseTimeout(updateBalancePromise, 5000);
       }
 
       closeAnyModal(setIsPaymentModalOpen);
       setSelectedTenant(null);
-    } catch (err) {
-      setModalError(err.message);
-    } finally {
-      setIsProcessing(false);
-    }
+    } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
   const handleConfirmPayment = async (payment) => {
@@ -373,15 +479,10 @@ export default function App() {
       await promiseTimeout(confirmPromise, 5000);
 
       const balancePromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tenants', tenant.id), { 
-        paidRent: (tenant.paidRent || 0) + appliedRent,
-        paidWater: (tenant.paidWater || 0) + appliedWater
+        paidRent: (tenant.paidRent || 0) + appliedRent, paidWater: (tenant.paidWater || 0) + appliedWater
       });
       await promiseTimeout(balancePromise, 5000);
-    } catch (err) {
-      alert(err.message);
-    } finally {
-      setIsProcessing(false);
-    }
+    } catch (err) { alert(err.message); } finally { setIsProcessing(false); }
   };
 
   const handleLogRepair = async (e) => {
@@ -391,26 +492,14 @@ export default function App() {
     try {
       const formData = new FormData(e.target);
       const houseId = formData.get('houseId');
-
       const repairPromise = addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'repairs'), {
-        description: formData.get('description'),
-        houseId: houseId,
-        status: 'OPEN',
-        cost: 0,
-        date: new Date().toISOString(),
-        loggedBy: role
+        description: formData.get('description'), houseId: houseId, status: 'OPEN', cost: 0,
+        date: new Date().toISOString(), loggedBy: role
       });
       await promiseTimeout(repairPromise, 5000);
-
-      const houseUpdatePromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', houseId), { repairStatus: 'NEEDS_REPAIR' });
-      await promiseTimeout(houseUpdatePromise, 5000);
-
+      await promiseTimeout(updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', houseId), { repairStatus: 'NEEDS_REPAIR' }), 5000);
       closeAnyModal(setIsRepairModalOpen);
-    } catch(err) {
-      setModalError(err.message);
-    } finally {
-      setIsProcessing(false);
-    }
+    } catch(err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
   const handleResolveRepairSubmit = async (e) => {
@@ -419,22 +508,11 @@ export default function App() {
     setIsProcessing(true);
     try {
       const cost = Number(new FormData(e.target).get('cost')) || 0;
-      
-      const resolvePromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'repairs', selectedRepair.id), { 
-        status: 'RESOLVED', cost: cost, resolvedAt: new Date().toISOString() 
-      });
-      await promiseTimeout(resolvePromise, 5000);
-
-      const goodPromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', selectedRepair.houseId), { repairStatus: 'GOOD' });
-      await promiseTimeout(goodPromise, 5000);
-
+      await promiseTimeout(updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'repairs', selectedRepair.id), { status: 'RESOLVED', cost: cost, resolvedAt: new Date().toISOString() }), 5000);
+      await promiseTimeout(updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', selectedRepair.houseId), { repairStatus: 'GOOD' }), 5000);
       closeAnyModal(setIsResolveRepairModalOpen);
       setSelectedRepair(null);
-    } catch (err) {
-      setModalError(err.message);
-    } finally {
-      setIsProcessing(false);
-    }
+    } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
   const handleLogSeptic = async (e) => {
@@ -444,18 +522,11 @@ export default function App() {
     try {
       const optionRaw = new FormData(e.target).get('provider');
       const [provider, costStr] = optionRaw.split('|');
-
-      const septicPromise = addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'septicLogs'), {
+      await promiseTimeout(addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'septicLogs'), {
         provider: provider, cost: Number(costStr), date: new Date().toISOString(), loggedBy: role
-      });
-      await promiseTimeout(septicPromise, 5000);
-
+      }), 5000);
       closeAnyModal(setIsSepticModalOpen);
-    } catch(err) {
-      setModalError(err.message);
-    } finally {
-      setIsProcessing(false);
-    }
+    } catch(err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
   const handleLogWaterBill = async (e) => {
@@ -464,18 +535,11 @@ export default function App() {
     setIsProcessing(true);
     try {
       const formData = new FormData(e.target);
-
-      const waterPromise = addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'masterWaterBills'), {
+      await promiseTimeout(addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'masterWaterBills'), {
         month: formData.get('month'), amount: Number(formData.get('amount')), date: new Date().toISOString(), loggedBy: role
-      });
-      await promiseTimeout(waterPromise, 5000);
-
+      }), 5000);
       closeAnyModal(setIsWaterBillModalOpen);
-    } catch (err) {
-      setModalError(err.message);
-    } finally {
-      setIsProcessing(false);
-    }
+    } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
   const handleUpdateBills = async (e) => {
@@ -484,20 +548,13 @@ export default function App() {
     setIsProcessing(true);
     try {
       const formData = new FormData(e.target);
-
-      const updateBillPromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tenants', selectedTenant.id), {
+      await promiseTimeout(updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tenants', selectedTenant.id), {
         expectedRent: selectedTenant.expectedRent + Number(formData.get('addRent')),
         expectedWater: selectedTenant.expectedWater + Number(formData.get('addWater'))
-      });
-      await promiseTimeout(updateBillPromise, 5000);
-
+      }), 5000);
       closeAnyModal(setIsBillingModalOpen);
       setSelectedTenant(null);
-    } catch (err) {
-      setModalError(err.message);
-    } finally {
-      setIsProcessing(false);
-    }
+    } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
   const handleDeleteTenant = async (tenant) => {
@@ -505,31 +562,18 @@ export default function App() {
     if (window.confirm(`Are you sure you want to completely remove tenant ${tenant.name}?`)) {
        setIsProcessing(true);
        try {
-         const deletePromise = deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tenants', tenant.id));
-         await promiseTimeout(deletePromise, 5000);
-
-         if (tenant.houseId) {
-           const vacantPromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', tenant.houseId), { status: 'VACANT' });
-           await promiseTimeout(vacantPromise, 5000);
-         }
+         await promiseTimeout(deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tenants', tenant.id)), 5000);
+         if (tenant.houseId) await promiseTimeout(updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', tenant.houseId), { status: 'VACANT' }), 5000);
          setSelectedTenantForDetails(null);
-       } catch (err) {
-         console.error(err);
-         alert("Could not remove tenant safely.");
-       } finally {
-         setIsProcessing(false);
-       }
+       } catch (err) { console.error(err); alert("Could not remove tenant safely."); } finally { setIsProcessing(false); }
     }
   };
-
-  const formatKes = (amount) => `KES ${Number(amount || 0).toLocaleString('en-KE')}`;
 
   // --- REBUILT ACCOUNTING MATH ENGINE ---
   const stats = useMemo(() => {
     let collectedRentRev = 0, collectedWaterRev = 0, totalJosephBonus = 0, pendingPaymentsCount = 0;
     let totalRepairExpenses = 0, totalSepticExpenses = 0, totalMasterWaterBills = 0;
 
-    // 1. Gather all actual cash collected through confirmed ledger payments
     payments.forEach(p => {
       if (p.status === 'CONFIRMED') {
         collectedRentRev += (p.appliedRent || 0);
@@ -539,7 +583,6 @@ export default function App() {
       if (p.status === 'PENDING') pendingPaymentsCount++;
     });
 
-    // 2. Gather outstanding active debt balances from current live tenants
     let activeRentArrears = 0, activeWaterArrears = 0;
     tenants.forEach(t => {
       const rBal = (t.expectedRent || 0) - (t.paidRent || 0);
@@ -548,16 +591,13 @@ export default function App() {
       if (wBal > 0) activeWaterArrears += wBal;
     });
 
-    // Expected target balances are dynamic sums of actual collection + current active debts
     const expectedRentRev = collectedRentRev + activeRentArrears;
     const expectedWaterRev = collectedWaterRev + activeWaterArrears;
 
-    // Expenses accounting
     repairs.forEach(r => { if (r.status === 'RESOLVED' && r.cost) totalRepairExpenses += r.cost; });
     septicLogs.forEach(s => { if (s.cost) totalSepticExpenses += s.cost; });
     masterWaterBills.forEach(m => { if (m.amount) totalMasterWaterBills += m.amount; });
 
-    // Water Vault calculation (Collections less Provider master bills)
     const waterReserve = collectedWaterRev - totalMasterWaterBills;
     const totalOperatingExpenses = totalRepairExpenses + totalSepticExpenses;
 
@@ -579,11 +619,25 @@ export default function App() {
     return loginTab === 'landlord' && email.trim() !== '' && email.trim().toLowerCase() !== LANDLORD_EMAIL.toLowerCase();
   }, [loginTab, email]);
 
+
   if (loading) {
     return (
       <div className={`min-h-screen flex flex-col gap-4 items-center justify-center ${theme === 'dark' ? 'bg-slate-950' : 'bg-[#FDFBF7]'}`}>
         <div className={`animate-spin rounded-full h-12 w-12 border-4 border-t-transparent shadow-lg ${theme === 'dark' ? 'border-slate-400' : 'border-gray-800'}`}></div>
         <p className={`font-bold text-sm tracking-widest uppercase opacity-80 animate-pulse ${theme === 'dark' ? 'text-slate-400' : 'text-gray-500'}`}>Ruiru Rentals Syncing...</p>
+      </div>
+    );
+  }
+
+  // --- WELCOME BACK ANIMATION ---
+  if (user && showWelcomeScreen) {
+    return (
+      <div className={`min-h-screen flex flex-col items-center justify-center transition-all duration-500 ${theme === 'dark' ? 'bg-slate-950 text-white' : 'bg-[#FDFBF7] text-gray-900'}`}>
+        <div className="animate-bounce mb-6">
+          <CheckCircle2 size={72} className="text-emerald-500"/>
+        </div>
+        <h1 className="text-4xl md:text-5xl font-extrabold mb-3 animate-pulse text-center px-4">Welcome Back!</h1>
+        <p className="text-gray-500 font-medium text-lg">Preparing your secure workspace...</p>
       </div>
     );
   }
@@ -643,14 +697,32 @@ export default function App() {
             </div>
             <div>
               <label className="block text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Secure Password</label>
-              <input 
-                required type="password" value={password} onChange={e => setPassword(e.target.value)} disabled={isEmailRestrictedForLandlord} placeholder="••••••••" 
-                className={`w-full bg-slate-950 border border-gray-800 focus:border-gray-500 rounded-xl p-3 outline-none text-white text-sm disabled:opacity-30 disabled:cursor-not-allowed`} 
-              />
+              <div className="relative">
+                <input 
+                  required type={showPassword ? "text" : "password"} value={password} onChange={e => setPassword(e.target.value)} disabled={isEmailRestrictedForLandlord} placeholder="••••••••" 
+                  className={`w-full bg-slate-950 border border-gray-800 focus:border-gray-500 rounded-xl p-3 pr-10 outline-none text-white text-sm disabled:opacity-30 disabled:cursor-not-allowed`} 
+                />
+                <button 
+                  type="button" 
+                  onClick={() => setShowPassword(!showPassword)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white transition-colors p-1"
+                >
+                  {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                </button>
+              </div>
+              <div className="text-right mt-2">
+                <button 
+                  type="button" 
+                  onClick={handleForgotPassword}
+                  className="text-xs font-semibold text-gray-500 hover:text-gray-300 transition-colors"
+                >
+                  Forgot Password?
+                </button>
+              </div>
             </div>
             <button 
               type="submit" disabled={isProcessing || isEmailRestrictedForLandlord} 
-              className="w-full bg-gray-800 hover:bg-gray-700 disabled:bg-gray-900 disabled:text-gray-600 disabled:cursor-not-allowed text-white font-bold py-3 rounded-xl transition-all hover:shadow-lg flex items-center justify-center gap-2"
+              className="w-full bg-gray-800 hover:bg-gray-700 disabled:bg-gray-900 disabled:text-gray-600 disabled:cursor-not-allowed text-white font-bold py-3 rounded-xl transition-all hover:shadow-lg flex items-center justify-center gap-2 mt-2"
             >
               {isProcessing ? <div className="animate-spin rounded-full h-5 w-5 border-2 border-white border-t-transparent"></div> : 'Verify Credentials & Sign In'}
             </button>
@@ -729,461 +801,476 @@ export default function App() {
         </div>
       </aside>
 
-      <main className="flex-1 p-6 md:p-8 overflow-y-auto w-full transition-all duration-300 ease-in-out">
-        {activeTab === 'dashboard' && role === 'LANDLORD' && (
-          <div className="space-y-6 animate-in fade-in duration-500">
-            <div className="flex justify-between items-center">
-              <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Landlord Finance Overview</h2>
-            </div>
-            
-            {/* RUJWASCO WATER ACCUMULATION METRICS & Deficit Alerter */}
-            {stats.waterReserve < 0 ? (
-              <div className="bg-rose-500/10 border border-rose-500/30 p-4 rounded-xl flex items-center gap-4 animate-pulse">
-                <div className="bg-rose-500/20 p-3 rounded-full text-rose-500"><AlertCircle size={24}/></div>
-                <div className="flex-1">
-                  <h4 className="text-rose-500 font-bold">Deficit Alert: RUJWASCO Bill Settle Needed</h4>
-                  <p className={`text-sm ${theme === 'dark' ? 'text-rose-400' : 'text-rose-700'}`}>
-                    Collected water payments from tenants total <strong className="font-mono">{formatKes(stats.collectedWaterRev)}</strong>. 
-                    This is short by <strong className={`font-mono text-lg ${theme === 'dark' ? 'text-rose-500' : 'text-rose-600'}`}>{formatKes(Math.abs(stats.waterReserve))}</strong> to settle the logged invoices of <strong className="font-mono">{formatKes(stats.totalMasterWaterBills)}</strong>.
-                  </p>
+      {/* MAIN CONTENT AREA */}
+      <div className="flex-1 flex flex-col h-screen overflow-hidden">
+        <main className="flex-1 p-6 md:p-8 overflow-y-auto w-full transition-all duration-300 ease-in-out flex flex-col">
+          
+          {/* TAB CONTENTS */}
+          <div className="flex-1">
+            {activeTab === 'dashboard' && role === 'LANDLORD' && (
+              <div className="space-y-6 animate-in fade-in duration-500">
+                <div className="flex justify-between items-center">
+                  <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Landlord Finance Overview</h2>
                 </div>
-              </div>
-            ) : stats.totalMasterWaterBills > 0 ? (
-              <div className="bg-emerald-500/10 border border-emerald-500/30 p-4 rounded-xl flex items-center gap-4">
-                <div className={`bg-emerald-500/20 p-3 rounded-full ${theme === 'dark' ? 'text-emerald-500' : 'text-emerald-600'}`}><BellRing size={24}/></div>
-                <div className="flex-1">
-                  <h4 className={`font-bold ${theme === 'dark' ? 'text-emerald-400' : 'text-emerald-700'}`}>Water Settle Target Met!</h4>
-                  <p className={`text-sm ${theme === 'dark' ? 'text-emerald-500' : 'text-emerald-800'}`}>
-                    The needed water bills of <strong className="font-mono">{formatKes(stats.totalMasterWaterBills)}</strong> are fully accumulated inside the vault! 
-                    Current accumulated water funds: <strong className="font-mono">{formatKes(stats.collectedWaterRev)}</strong>. (Remaining Surplus: <strong className="font-mono">{formatKes(stats.waterReserve)}</strong>).
-                  </p>
+                
+                {/* RUJWASCO WATER ACCUMULATION METRICS & Deficit Alerter */}
+                {stats.waterReserve < 0 ? (
+                  <div className="bg-rose-500/10 border border-rose-500/30 p-4 rounded-xl flex items-center gap-4 animate-pulse">
+                    <div className="bg-rose-500/20 p-3 rounded-full text-rose-500"><AlertCircle size={24}/></div>
+                    <div className="flex-1">
+                      <h4 className="text-rose-500 font-bold">Deficit Alert: RUJWASCO Bill Settle Needed</h4>
+                      <p className={`text-sm ${theme === 'dark' ? 'text-rose-400' : 'text-rose-700'}`}>
+                        Collected water payments from tenants total <strong className="font-mono">{formatKes(stats.collectedWaterRev)}</strong>. 
+                        This is short by <strong className={`font-mono text-lg ${theme === 'dark' ? 'text-rose-500' : 'text-rose-600'}`}>{formatKes(Math.abs(stats.waterReserve))}</strong> to settle the logged invoices of <strong className="font-mono">{formatKes(stats.totalMasterWaterBills)}</strong>.
+                      </p>
+                    </div>
+                  </div>
+                ) : stats.totalMasterWaterBills > 0 ? (
+                  <div className="bg-emerald-500/10 border border-emerald-500/30 p-4 rounded-xl flex items-center gap-4">
+                    <div className={`bg-emerald-500/20 p-3 rounded-full ${theme === 'dark' ? 'text-emerald-500' : 'text-emerald-600'}`}><BellRing size={24}/></div>
+                    <div className="flex-1">
+                      <h4 className={`font-bold ${theme === 'dark' ? 'text-emerald-400' : 'text-emerald-700'}`}>Water Settle Target Met!</h4>
+                      <p className={`text-sm ${theme === 'dark' ? 'text-emerald-500' : 'text-emerald-800'}`}>
+                        The needed water bills of <strong className="font-mono">{formatKes(stats.totalMasterWaterBills)}</strong> are fully accumulated inside the vault! 
+                        Current accumulated water funds: <strong className="font-mono">{formatKes(stats.collectedWaterRev)}</strong>. (Remaining Surplus: <strong className="font-mono">{formatKes(stats.waterReserve)}</strong>).
+                      </p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="bg-cyan-500/10 border border-cyan-500/30 p-4 rounded-xl flex items-center gap-4">
+                    <div className={`bg-cyan-500/20 p-3 rounded-full ${theme === 'dark' ? 'text-cyan-500' : 'text-cyan-600'}`}><Info size={24}/></div>
+                    <div className="flex-1">
+                      <h4 className={`font-bold ${theme === 'dark' ? 'text-cyan-400' : 'text-cyan-700'}`}>Water Vault Tracker</h4>
+                      <p className={`text-sm ${theme === 'dark' ? 'text-cyan-500' : 'text-cyan-800'}`}>
+                        Accumulated water payments inside vault: <strong className="font-mono">{formatKes(stats.collectedWaterRev)}</strong>. Log a master provider bill to evaluate balance limits.
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                  <div className={`p-6 rounded-2xl border shadow-sm transition-all duration-300 hover:-translate-y-1 hover:shadow-lg ${theme === 'dark' ? 'bg-emerald-950/20 border-emerald-800' : 'bg-emerald-50/50 border-emerald-200'}`}>
+                    <p className={`text-sm font-bold mb-1 ${theme === 'dark' ? 'text-emerald-500' : 'text-emerald-700'}`}>Total Rent Collected</p>
+                    <h3 className={`text-2xl font-extrabold ${theme === 'dark' ? 'text-emerald-400' : 'text-emerald-600'}`}>{formatKes(stats.collectedRentRev)}</h3>
+                    <p className={`text-[10px] mt-1 font-bold ${theme === 'dark' ? 'text-emerald-500' : 'text-emerald-700'}`}>All-Time Expected: {formatKes(stats.expectedRentRev)}</p>
+                  </div>
+
+                  <div className={`p-6 rounded-2xl border shadow-sm flex flex-col justify-between transition-all duration-300 hover:-translate-y-1 hover:shadow-lg ${theme === 'dark' ? 'bg-cyan-950/20 border-cyan-800' : 'bg-cyan-50/50 border-cyan-200'}`}>
+                    <div>
+                      <p className={`text-xs font-extrabold uppercase tracking-wide mb-1 flex items-center gap-1 ${theme === 'dark' ? 'text-cyan-400' : 'text-cyan-600'}`}>
+                        <Droplet size={14}/> Water Vault Total
+                      </p>
+                      <h3 className={`text-2xl font-extrabold ${theme === 'dark' ? 'text-cyan-300' : 'text-cyan-500'}`}>{formatKes(stats.collectedWaterRev)}</h3>
+                    </div>
+                    <div className={`mt-3 pt-3 border-t ${theme === 'dark' ? 'border-cyan-900/40' : 'border-cyan-200'}`}>
+                      <button onClick={() => { setModalError(''); setIsWaterBillModalOpen(true); }} className={`w-full text-white text-[10px] font-bold py-2 rounded-lg transition ${theme === 'dark' ? 'bg-cyan-600 hover:bg-cyan-700' : 'bg-cyan-700 hover:bg-cyan-800'}`}>
+                        Log RUJWASCO Invoice
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className={`p-6 rounded-2xl border shadow-sm flex flex-col justify-between transition-all duration-300 hover:-translate-y-1 hover:shadow-lg ${theme === 'dark' ? 'bg-rose-950/20 border-rose-800' : 'bg-rose-50/50 border-rose-200'}`}>
+                    <div>
+                      <p className={`text-xs font-extrabold uppercase tracking-wide mb-1 flex items-center gap-1 ${theme === 'dark' ? 'text-rose-400' : 'text-rose-600'}`}>
+                        <AlertCircle size={14}/> Total Operations Exp.
+                      </p>
+                      <h3 className={`text-2xl font-extrabold ${theme === 'dark' ? 'text-rose-400' : 'text-rose-600'}`}>{formatKes(stats.totalOperatingExpenses)}</h3>
+                    </div>
+                    <div className={`mt-3 pt-3 border-t text-[10px] font-bold space-y-0.5 ${theme === 'dark' ? 'border-rose-900/40 text-rose-400' : 'border-rose-200 text-rose-600'}`}>
+                      <p>Repairs: {formatKes(stats.totalRepairExpenses)}</p>
+                      <p>Septic Removals: {formatKes(stats.totalSepticExpenses)}</p>
+                    </div>
+                  </div>
+
+                  <div className={`p-6 rounded-2xl border shadow-sm transition-all duration-300 hover:-translate-y-1 hover:shadow-lg ${theme === 'dark' ? 'bg-gray-900/50 border-gray-800' : 'bg-[#E8DFCE]/50 border-[#DCD4C6]'}`}>
+                    <p className={`text-xs font-extrabold uppercase tracking-wide mb-1 flex items-center gap-1 ${theme === 'dark' ? 'text-gray-400' : 'text-gray-600'}`}>
+                      <Coins size={14}/> Joseph's Tip Pool
+                    </p>
+                    <h3 className={`text-2xl font-black font-mono ${theme === 'dark' ? 'text-gray-200' : 'text-gray-900'}`}>{formatKes(stats.totalJosephBonus)}</h3>
+                    <p className="text-[10px] text-gray-500 font-bold mt-1">Accumulated from excess payments</p>
+                  </div>
                 </div>
-              </div>
-            ) : (
-              <div className="bg-cyan-500/10 border border-cyan-500/30 p-4 rounded-xl flex items-center gap-4">
-                <div className={`bg-cyan-500/20 p-3 rounded-full ${theme === 'dark' ? 'text-cyan-500' : 'text-cyan-600'}`}><Info size={24}/></div>
-                <div className="flex-1">
-                  <h4 className={`font-bold ${theme === 'dark' ? 'text-cyan-400' : 'text-cyan-700'}`}>Water Vault Tracker</h4>
-                  <p className={`text-sm ${theme === 'dark' ? 'text-cyan-500' : 'text-cyan-800'}`}>
-                    Accumulated water payments inside vault: <strong className="font-mono">{formatKes(stats.collectedWaterRev)}</strong>. Log a master provider bill to evaluate balance limits.
-                  </p>
+
+                <div className={`rounded-2xl border p-6 shadow-sm ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
+                  <h3 className={`text-lg font-bold mb-4 ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Pending Verifications</h3>
+                  <p className="text-sm text-gray-500 mb-4 font-medium">Logged by Manager; needs Super Admin confirmation.</p>
+                  {payments.filter(p => p.status === 'PENDING').length === 0 ? (
+                    <p className={`text-sm font-bold p-4 rounded-xl flex items-center gap-2 ${theme === 'dark' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-emerald-500/10 text-emerald-600'}`}>
+                      <CheckCircle2 size={18}/> All payments verified and up to date.
+                    </p>
+                  ) : (
+                    <div className="space-y-3">
+                      {payments.filter(p => p.status === 'PENDING').map(p => (
+                        <div key={p.id} className={`flex flex-col sm:flex-row sm:items-center justify-between p-4 rounded-xl border gap-4 transition-all hover:shadow-md ${theme === 'dark' ? 'bg-slate-950 border-slate-800' : 'bg-[#FDFBF7] border-[#E8DFCE]'}`}>
+                          <div>
+                            <p className={`font-bold text-lg ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{p.tenantName}</p>
+                            <p className="text-xs text-gray-500 font-semibold">{p.type === 'COMBINED' ? 'Rent & Water Combined' : p.type} via {p.method}</p>
+                            {p.messageCode && (
+                              <p className={`text-[10px] font-mono font-bold mt-1.5 inline-block px-2 py-1 rounded-md border ${theme === 'dark' ? 'bg-white/10 text-gray-300 border-white/10' : 'bg-black/5 text-gray-700 border-black/10'}`}>Ref: {p.messageCode}</p>
+                            )}
+                          </div>
+                          <div className="flex items-center justify-between sm:justify-end gap-4">
+                            <span className={`font-black text-xl ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{formatKes(p.amount)}</span>
+                            <button 
+                              onClick={() => handleConfirmPayment(p)} 
+                              disabled={isProcessing}
+                              className="bg-gray-800 hover:bg-gray-900 text-white px-5 py-2.5 rounded-xl text-sm font-bold transition-all disabled:bg-gray-400 flex items-center gap-2"
+                            >
+                              {isProcessing ? 'Processing...' : 'Confirm'}
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
 
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-              <div className={`p-6 rounded-2xl border shadow-sm transition-all duration-300 hover:-translate-y-1 hover:shadow-lg ${theme === 'dark' ? 'bg-emerald-950/20 border-emerald-800' : 'bg-emerald-50/50 border-emerald-200'}`}>
-                <p className={`text-sm font-bold mb-1 ${theme === 'dark' ? 'text-emerald-500' : 'text-emerald-700'}`}>Total Rent Collected</p>
-                <h3 className={`text-2xl font-extrabold ${theme === 'dark' ? 'text-emerald-400' : 'text-emerald-600'}`}>{formatKes(stats.collectedRentRev)}</h3>
-                <p className={`text-[10px] mt-1 font-bold ${theme === 'dark' ? 'text-emerald-500' : 'text-emerald-700'}`}>All-Time Expected: {formatKes(stats.expectedRentRev)}</p>
-              </div>
-
-              <div className={`p-6 rounded-2xl border shadow-sm flex flex-col justify-between transition-all duration-300 hover:-translate-y-1 hover:shadow-lg ${theme === 'dark' ? 'bg-cyan-950/20 border-cyan-800' : 'bg-cyan-50/50 border-cyan-200'}`}>
-                <div>
-                  <p className={`text-xs font-extrabold uppercase tracking-wide mb-1 flex items-center gap-1 ${theme === 'dark' ? 'text-cyan-400' : 'text-cyan-600'}`}>
-                    <Droplet size={14}/> Water Vault Total
-                  </p>
-                  <h3 className={`text-2xl font-extrabold ${theme === 'dark' ? 'text-cyan-300' : 'text-cyan-500'}`}>{formatKes(stats.collectedWaterRev)}</h3>
-                </div>
-                <div className={`mt-3 pt-3 border-t ${theme === 'dark' ? 'border-cyan-900/40' : 'border-cyan-200'}`}>
-                  <button onClick={() => { setModalError(''); setIsWaterBillModalOpen(true); }} className={`w-full text-white text-[10px] font-bold py-2 rounded-lg transition ${theme === 'dark' ? 'bg-cyan-600 hover:bg-cyan-700' : 'bg-cyan-700 hover:bg-cyan-800'}`}>
-                    Log RUJWASCO Invoice
-                  </button>
-                </div>
-              </div>
-
-              <div className={`p-6 rounded-2xl border shadow-sm flex flex-col justify-between transition-all duration-300 hover:-translate-y-1 hover:shadow-lg ${theme === 'dark' ? 'bg-rose-950/20 border-rose-800' : 'bg-rose-50/50 border-rose-200'}`}>
-                <div>
-                  <p className={`text-xs font-extrabold uppercase tracking-wide mb-1 flex items-center gap-1 ${theme === 'dark' ? 'text-rose-400' : 'text-rose-600'}`}>
-                    <AlertCircle size={14}/> Total Operations Exp.
-                  </p>
-                  <h3 className={`text-2xl font-extrabold ${theme === 'dark' ? 'text-rose-400' : 'text-rose-600'}`}>{formatKes(stats.totalOperatingExpenses)}</h3>
-                </div>
-                <div className={`mt-3 pt-3 border-t text-[10px] font-bold space-y-0.5 ${theme === 'dark' ? 'border-rose-900/40 text-rose-400' : 'border-rose-200 text-rose-600'}`}>
-                  <p>Repairs: {formatKes(stats.totalRepairExpenses)}</p>
-                  <p>Septic Removals: {formatKes(stats.totalSepticExpenses)}</p>
-                </div>
-              </div>
-
-              <div className={`p-6 rounded-2xl border shadow-sm transition-all duration-300 hover:-translate-y-1 hover:shadow-lg ${theme === 'dark' ? 'bg-gray-900/50 border-gray-800' : 'bg-[#E8DFCE]/50 border-[#DCD4C6]'}`}>
-                <p className={`text-xs font-extrabold uppercase tracking-wide mb-1 flex items-center gap-1 ${theme === 'dark' ? 'text-gray-400' : 'text-gray-600'}`}>
-                  <Coins size={14}/> Joseph's Tip Pool
-                </p>
-                <h3 className={`text-2xl font-black font-mono ${theme === 'dark' ? 'text-gray-200' : 'text-gray-900'}`}>{formatKes(stats.totalJosephBonus)}</h3>
-                <p className="text-[10px] text-gray-500 font-bold mt-1">Accumulated from excess payments</p>
-              </div>
-            </div>
-
-            <div className={`rounded-2xl border p-6 shadow-sm ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
-               <h3 className={`text-lg font-bold mb-4 ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Pending Verifications</h3>
-               <p className="text-sm text-gray-500 mb-4 font-medium">Logged by Manager; needs Super Admin confirmation.</p>
-               {payments.filter(p => p.status === 'PENDING').length === 0 ? (
-                 <p className={`text-sm font-bold p-4 rounded-xl flex items-center gap-2 ${theme === 'dark' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-emerald-500/10 text-emerald-600'}`}>
-                   <CheckCircle2 size={18}/> All payments verified and up to date.
-                 </p>
-               ) : (
-                 <div className="space-y-3">
-                   {payments.filter(p => p.status === 'PENDING').map(p => (
-                     <div key={p.id} className={`flex flex-col sm:flex-row sm:items-center justify-between p-4 rounded-xl border gap-4 transition-all hover:shadow-md ${theme === 'dark' ? 'bg-slate-950 border-slate-800' : 'bg-[#FDFBF7] border-[#E8DFCE]'}`}>
-                       <div>
-                         <p className={`font-bold text-lg ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{p.tenantName}</p>
-                         <p className="text-xs text-gray-500 font-semibold">{p.type === 'COMBINED' ? 'Rent & Water Combined' : p.type} via {p.method}</p>
-                         {p.messageCode && (
-                           <p className={`text-[10px] font-mono font-bold mt-1.5 inline-block px-2 py-1 rounded-md border ${theme === 'dark' ? 'bg-white/10 text-gray-300 border-white/10' : 'bg-black/5 text-gray-700 border-black/10'}`}>Ref: {p.messageCode}</p>
-                         )}
-                       </div>
-                       <div className="flex items-center justify-between sm:justify-end gap-4">
-                         <span className={`font-black text-xl ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{formatKes(p.amount)}</span>
-                         <button 
-                           onClick={() => handleConfirmPayment(p)} 
-                           disabled={isProcessing}
-                           className="bg-gray-800 hover:bg-gray-900 text-white px-5 py-2.5 rounded-xl text-sm font-bold transition-all disabled:bg-gray-400 flex items-center gap-2"
-                         >
-                           {isProcessing ? 'Processing...' : 'Confirm'}
-                         </button>
-                       </div>
-                     </div>
-                   ))}
-                 </div>
-               )}
-            </div>
-          </div>
-        )}
-
-        {activeTab === 'houses' && (
-          <div className="space-y-6 animate-in fade-in duration-500">
-            <div className="flex justify-between items-center">
-              <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Properties & Units</h2>
-              {role === 'LANDLORD' && (
-                <button onClick={() => { setModalError(''); setIsHouseModalOpen(true); }} className="bg-gray-800 hover:bg-gray-900 text-white px-5 py-2.5 rounded-xl text-sm font-bold flex items-center gap-2 shadow-sm transition-all hover:shadow-md hover:-translate-y-0.5">
-                  <Plus size={18}/> Add Unit
-                </button>
-              )}
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-              {houses.length === 0 && <p className="text-gray-500 font-medium">No houses registered yet.</p>}
-              {houses.map(house => {
-                const isVacant = house.status === 'VACANT' && !occupiedHouseIds.has(house.id);
-                const isUnderRepair = house.status === 'UNDER_REPAIR';
-                const isOccupied = house.status === 'OCCUPIED' || occupiedHouseIds.has(house.id);
-                
-                return (
-                  <div key={house.id} className={`p-5 rounded-2xl border shadow-sm relative overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:shadow-xl flex flex-col justify-between ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
-                    <div className={`absolute top-0 left-0 w-2 h-full ${isUnderRepair ? 'bg-rose-500' : isVacant ? 'bg-amber-500' : 'bg-emerald-500'}`}></div>
-                    <div>
-                      <div className="flex justify-between items-start mb-3 ml-2">
-                        <h3 className={`font-bold text-xl ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{house.name}</h3>
-                        <span className={`text-[10px] px-2.5 py-1 rounded-md font-black uppercase tracking-wider border ${isUnderRepair ? 'bg-rose-100 text-rose-700 border-rose-200' : isVacant ? 'bg-amber-100 text-amber-700 border-amber-200' : 'bg-emerald-100 text-emerald-700 border-emerald-200'}`}>
-                          {isUnderRepair ? 'Under Repair' : isVacant ? 'VACANT' : 'OCCUPIED'}
-                        </span>
-                      </div>
-                      <div className={`ml-2 text-sm space-y-1.5 font-medium ${theme === 'dark' ? 'text-slate-400' : 'text-gray-500'}`}>
-                        <p>Type: {house.type}</p>
-                        <p>Rent Target: <strong className={`font-black text-base ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{formatKes(house.rent)}</strong></p>
-                        
-                        {/* Show if an OCCUPIED house has a complaint logged */}
-                        {house.repairStatus === 'NEEDS_REPAIR' && isOccupied && (
-                          <div className="bg-rose-500/10 border border-rose-500/20 px-3 py-2 rounded-lg mt-3">
-                            <p className={`text-xs font-bold flex items-center gap-1.5 animate-pulse ${theme === 'dark' ? 'text-rose-400' : 'text-rose-600'}`}>
-                              <AlertCircle size={14}/> Needs Action (Complaint Logged)
-                            </p>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                    
-                    {/* Landlord Specific Repair Mode Toggle For Vacant Houses */}
-                    {role === 'LANDLORD' && !isOccupied && (
-                      <div className={`ml-2 mt-4 pt-4 border-t ${theme === 'dark' ? 'border-white/10' : 'border-black/5'}`}>
-                         <button 
-                           onClick={() => handleToggleHouseRepairMode(house)}
-                           disabled={isProcessing}
-                           className={`w-full text-xs font-bold py-2.5 rounded-xl transition-all disabled:opacity-50 flex items-center justify-center gap-2 ${isUnderRepair ? 'bg-emerald-600 hover:bg-emerald-700 text-white' : 'bg-gray-800 hover:bg-gray-900 text-white'}`}>
-                           {isUnderRepair ? <><CheckCircle2 size={16}/> Mark as Ready & Vacant</> : <><Wrench size={16}/> Set to Under Repair</>}
-                         </button>
-                      </div>
-                    )}
-                  </div>
-                )
-              })}
-            </div>
-          </div>
-        )}
-
-        {activeTab === 'tenants' && (
-          <div className="space-y-6 animate-in fade-in duration-500">
-            <div className="flex justify-between items-center">
-              <div>
-                <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Tenants Directory</h2>
-              </div>
-              <button onClick={() => { setModalError(''); setIsTenantModalOpen(true); }} className="bg-gray-800 hover:bg-gray-900 text-white px-5 py-2.5 rounded-xl text-sm font-bold flex items-center gap-2 shadow-sm transition-all hover:shadow-md hover:-translate-y-0.5">
-                <Plus size={18}/> Register Tenant
-              </button>
-            </div>
-
-            <div className={`rounded-2xl border overflow-hidden shadow-sm ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
-              <table className="w-full text-left text-sm">
-                <thead className={`border-b ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-slate-400' : 'bg-[#FDFBF7] border-[#E8DFCE] text-gray-500'}`}>
-                  <tr>
-                    <th className="p-4 font-bold">Tenant Name</th>
-                    <th className="p-4 font-bold hidden sm:table-cell">House Unit</th>
-                    <th className="p-4 font-bold hidden sm:table-cell">Bal Status</th>
-                    <th className="p-4 font-bold text-right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody className={`divide-y ${theme === 'dark' ? 'divide-slate-800' : 'divide-[#E8DFCE]'}`}>
-                  {tenants.length === 0 && (
-                    <tr><td colSpan="4" className="p-8 text-center text-gray-500 font-medium">No tenants registered.</td></tr>
+            {activeTab === 'houses' && (
+              <div className="space-y-6 animate-in fade-in duration-500">
+                <div className="flex justify-between items-center">
+                  <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Properties & Units</h2>
+                  {role === 'LANDLORD' && (
+                    <button onClick={() => { setModalError(''); setIsHouseModalOpen(true); }} className="bg-gray-800 hover:bg-gray-900 text-white px-5 py-2.5 rounded-xl text-sm font-bold flex items-center gap-2 shadow-sm transition-all hover:shadow-md hover:-translate-y-0.5">
+                      <Plus size={18}/> Add Unit
+                    </button>
                   )}
-                  {tenants.map(tenant => {
-                    const house = houses.find(h => h.id === tenant.houseId);
-                    const owesMoney = (tenant.expectedRent - tenant.paidRent) > 0 || (tenant.expectedWater - tenant.paidWater) > 0;
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+                  {houses.length === 0 && <p className="text-gray-500 font-medium">No houses registered yet.</p>}
+                  {houses.map(house => {
+                    const isVacant = house.status === 'VACANT' && !occupiedHouseIds.has(house.id);
+                    const isUnderRepair = house.status === 'UNDER_REPAIR';
+                    const isOccupied = house.status === 'OCCUPIED' || occupiedHouseIds.has(house.id);
+                    
                     return (
-                      <tr key={tenant.id} className={`transition cursor-pointer ${theme === 'dark' ? 'hover:bg-slate-950/40' : 'hover:bg-[#FDFBF7]'}`} onClick={() => setSelectedTenantForDetails(tenant)}>
-                        {/* ABSOLUTE FIX: Forced Text Color for Tenant Name in Dark/Light Mode */}
-                        <td className={`p-4 font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{tenant.name}</td>
-                        <td className={`p-4 font-semibold hidden sm:table-cell ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>{house ? house.name : 'Unknown'}</td>
-                        <td className="p-4 hidden sm:table-cell">
-                          {owesMoney ? <span className={`font-bold text-[10px] uppercase tracking-wider px-2.5 py-1 rounded-md border ${theme === 'dark' ? 'bg-rose-500/10 text-rose-400 border-rose-500/20' : 'bg-rose-500/10 text-rose-600 border-rose-500/20'}`}>Has Arrears</span> : <span className={`font-bold text-[10px] uppercase tracking-wider px-2.5 py-1 rounded-md border ${theme === 'dark' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-emerald-500/10 text-emerald-600 border-emerald-500/20'}`}>Cleared</span>}
-                        </td>
-                        <td className="p-4 text-right">
-                           <button onClick={(e) => { e.stopPropagation(); setSelectedTenantForDetails(tenant); }} className={`text-xs font-bold px-4 py-2 rounded-lg border transition-colors ${theme === 'dark' ? 'text-gray-300 hover:text-white bg-white/5 border-white/10' : 'text-gray-700 hover:text-gray-900 bg-black/5 border-black/10'}`}>View Profile</button>
-                        </td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
-
-        {activeTab === 'billing' && (
-          <div className="space-y-8 animate-in fade-in duration-500">
-            <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Billing & Payments</h2>
-
-            <div>
-              <h3 className="text-lg font-bold mb-4 font-mono uppercase tracking-wider text-gray-500">Tenant Billing Profiles</h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                {tenants.map(tenant => {
-                  const house = houses.find(h => h.id === tenant.houseId);
-                  const rentBal = (tenant.expectedRent || 0) - (tenant.paidRent || 0);
-                  const waterBal = (tenant.expectedWater || 0) - (tenant.paidWater || 0);
-                  const tenantRepairs = repairs.filter(r => r.houseId === tenant.houseId && r.status === 'OPEN');
-                  const pendingPayments = payments.filter(p => p.tenantId === tenant.id && p.status === 'PENDING');
-
-                  return (
-                    <div key={tenant.id} className={`p-5 rounded-2xl border shadow-sm flex flex-col justify-between transition-all duration-300 hover:-translate-y-1 hover:shadow-xl ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
-                      <div>
-                        <div className={`flex justify-between items-start mb-3 border-b pb-3 gap-2 ${theme === 'dark' ? 'border-slate-800' : 'border-[#DCD4C6]'}`}>
-                          <div>
-                            <h4 className={`font-extrabold text-lg leading-tight ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{tenant.name}</h4>
-                            <div className={`flex items-center gap-1.5 text-xs font-bold mt-1.5 ${theme === 'dark' ? 'text-slate-400' : 'text-gray-600'}`}>
-                              <Home size={14} className={`shrink-0 ${theme === 'dark' ? 'text-gray-400' : 'text-gray-800'}`}/> {house ? house.name : 'Unassigned'}
-                            </div>
-                            <div className={`flex items-center gap-1.5 text-xs font-bold mt-1 ${theme === 'dark' ? 'text-slate-400' : 'text-gray-600'}`}>
-                              <Phone size={14} className={`shrink-0 ${theme === 'dark' ? 'text-emerald-500' : 'text-emerald-600'}`}/> {tenant.phone}
-                            </div>
+                      <div key={house.id} className={`p-5 rounded-2xl border shadow-sm relative overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:shadow-xl flex flex-col justify-between ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
+                        <div className={`absolute top-0 left-0 w-2 h-full ${isUnderRepair ? 'bg-rose-500' : isVacant ? 'bg-amber-500' : 'bg-emerald-500'}`}></div>
+                        <div>
+                          <div className="flex justify-between items-start mb-3 ml-2">
+                            <h3 className={`font-bold text-xl ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{house.name}</h3>
+                            <span className={`text-[10px] px-2.5 py-1 rounded-md font-black uppercase tracking-wider border ${isUnderRepair ? 'bg-rose-100 text-rose-700 border-rose-200' : isVacant ? 'bg-amber-100 text-amber-700 border-amber-200' : 'bg-emerald-100 text-emerald-700 border-emerald-200'}`}>
+                              {isUnderRepair ? 'Under Repair' : isVacant ? 'VACANT' : 'OCCUPIED'}
+                            </span>
                           </div>
-                          <div className={`text-right shrink-0 whitespace-nowrap p-2 rounded-xl border ${theme === 'dark' ? 'bg-white/5 border-white/5' : 'bg-black/5 border-black/5'}`}>
-                            <span className="text-[9px] text-gray-500 font-black uppercase block tracking-widest">Rent Bal</span>
-                            <span className={`text-sm font-black block ${rentBal > 0 ? (theme === 'dark' ? 'text-rose-500' : 'text-rose-600') : (theme === 'dark' ? 'text-emerald-500' : 'text-emerald-600')}`}>{formatKes(rentBal)}</span>
-                            <span className="text-[9px] text-gray-500 font-black uppercase block tracking-widest mt-1.5">Water Bal</span>
-                            <span className={`text-sm font-black block ${waterBal > 0 ? (theme === 'dark' ? 'text-rose-500' : 'text-rose-600') : (theme === 'dark' ? 'text-emerald-500' : 'text-emerald-600')}`}>{formatKes(waterBal)}</span>
+                          <div className={`ml-2 text-sm space-y-1.5 font-medium ${theme === 'dark' ? 'text-slate-400' : 'text-gray-500'}`}>
+                            <p>Type: {house.type}</p>
+                            <p>Rent Target: <strong className={`font-black text-base ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{formatKes(house.rent)}</strong></p>
+                            
+                            {/* Show if an OCCUPIED house has a complaint logged */}
+                            {house.repairStatus === 'NEEDS_REPAIR' && isOccupied && (
+                              <div className="bg-rose-500/10 border border-rose-500/20 px-3 py-2 rounded-lg mt-3">
+                                <p className={`text-xs font-bold flex items-center gap-1.5 animate-pulse ${theme === 'dark' ? 'text-rose-400' : 'text-rose-600'}`}>
+                                  <AlertCircle size={14}/> Needs Action (Complaint Logged)
+                                </p>
+                              </div>
+                            )}
                           </div>
                         </div>
-
-                        {tenantRepairs.length > 0 && (
-                          <div className={`mb-4 border p-3 rounded-xl flex items-start gap-2 text-xs ${theme === 'dark' ? 'bg-rose-500/10 border-rose-500/20 text-rose-400' : 'bg-rose-500/10 border-rose-500/20 text-rose-600'}`}>
-                            <AlertCircle size={16} className="shrink-0 mt-0.5"/>
-                            <div>
-                              <span className="font-bold block mb-1">Active Complaints:</span>
-                              {tenantRepairs.slice(0, 2).map(r => <span key={r.id} className="block truncate max-w-200px font-semibold">- {r.description}</span>)}
-                            </div>
+                        
+                        {/* Landlord Specific Repair Mode Toggle For Vacant Houses */}
+                        {role === 'LANDLORD' && !isOccupied && (
+                          <div className={`ml-2 mt-4 pt-4 border-t ${theme === 'dark' ? 'border-white/10' : 'border-black/5'}`}>
+                            <button 
+                              onClick={() => handleToggleHouseRepairMode(house)}
+                              disabled={isProcessing}
+                              className={`w-full text-xs font-bold py-2.5 rounded-xl transition-all disabled:opacity-50 flex items-center justify-center gap-2 ${isUnderRepair ? 'bg-emerald-600 hover:bg-emerald-700 text-white' : 'bg-gray-800 hover:bg-gray-900 text-white'}`}>
+                              {isUnderRepair ? <><CheckCircle2 size={16}/> Mark as Ready & Vacant</> : <><Wrench size={16}/> Set to Under Repair</>}
+                            </button>
                           </div>
                         )}
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
 
-                        {pendingPayments.map(pendingPayment => (
-                          <div key={pendingPayment.id} className="mb-4 bg-amber-500/10 border border-amber-500/20 p-3.5 rounded-xl shadow-sm">
-                            <h5 className={`text-xs font-black flex items-center gap-1.5 mb-1.5 uppercase tracking-wider ${theme === 'dark' ? 'text-amber-500' : 'text-amber-600'}`}><Clock size={14}/> Pending Approval</h5>
-                            <div className={`text-[11px] space-y-1 font-semibold flex justify-between ${theme === 'dark' ? 'text-slate-400' : 'text-gray-600'}`}>
+            {activeTab === 'tenants' && (
+              <div className="space-y-6 animate-in fade-in duration-500">
+                <div className="flex justify-between items-center">
+                  <div>
+                    <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Tenants Directory</h2>
+                  </div>
+                  <button onClick={() => { setModalError(''); setIsTenantModalOpen(true); }} className="bg-gray-800 hover:bg-gray-900 text-white px-5 py-2.5 rounded-xl text-sm font-bold flex items-center gap-2 shadow-sm transition-all hover:shadow-md hover:-translate-y-0.5">
+                    <Plus size={18}/> Register Tenant
+                  </button>
+                </div>
+
+                <div className={`rounded-2xl border overflow-hidden shadow-sm ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
+                  <table className="w-full text-left text-sm">
+                    <thead className={`border-b ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-slate-400' : 'bg-[#FDFBF7] border-[#E8DFCE] text-gray-500'}`}>
+                      <tr>
+                        <th className="p-4 font-bold">Tenant Name</th>
+                        <th className="p-4 font-bold hidden sm:table-cell">House Unit</th>
+                        <th className="p-4 font-bold hidden sm:table-cell">Bal Status</th>
+                        <th className="p-4 font-bold text-right">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className={`divide-y ${theme === 'dark' ? 'divide-slate-800' : 'divide-[#E8DFCE]'}`}>
+                      {tenants.length === 0 && (
+                        <tr><td colSpan="4" className="p-8 text-center text-gray-500 font-medium">No tenants registered.</td></tr>
+                      )}
+                      {tenants.map(tenant => {
+                        const house = houses.find(h => h.id === tenant.houseId);
+                        const owesMoney = (tenant.expectedRent - tenant.paidRent) > 0 || (tenant.expectedWater - tenant.paidWater) > 0;
+                        return (
+                          <tr key={tenant.id} className={`transition cursor-pointer ${theme === 'dark' ? 'hover:bg-slate-950/40' : 'hover:bg-[#FDFBF7]'}`} onClick={() => setSelectedTenantForDetails(tenant)}>
+                            <td className={`p-4 font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{tenant.name}</td>
+                            <td className={`p-4 font-semibold hidden sm:table-cell ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>{house ? house.name : 'Unknown'}</td>
+                            <td className="p-4 hidden sm:table-cell">
+                              {owesMoney ? <span className={`font-bold text-[10px] uppercase tracking-wider px-2.5 py-1 rounded-md border ${theme === 'dark' ? 'bg-rose-500/10 text-rose-400 border-rose-500/20' : 'bg-rose-500/10 text-rose-600 border-rose-500/20'}`}>Has Arrears</span> : <span className={`font-bold text-[10px] uppercase tracking-wider px-2.5 py-1 rounded-md border ${theme === 'dark' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-emerald-500/10 text-emerald-600 border-emerald-500/20'}`}>Cleared</span>}
+                            </td>
+                            <td className="p-4 text-right">
+                              <button onClick={(e) => { e.stopPropagation(); setSelectedTenantForDetails(tenant); }} className={`text-xs font-bold px-4 py-2 rounded-lg border transition-colors ${theme === 'dark' ? 'text-gray-300 hover:text-white bg-white/5 border-white/10' : 'text-gray-700 hover:text-gray-900 bg-black/5 border-black/10'}`}>View Profile</button>
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'billing' && (
+              <div className="space-y-8 animate-in fade-in duration-500">
+                <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Billing & Payments</h2>
+
+                <div>
+                  <h3 className="text-lg font-bold mb-4 font-mono uppercase tracking-wider text-gray-500">Tenant Billing Profiles</h3>
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                    {tenants.map(tenant => {
+                      const house = houses.find(h => h.id === tenant.houseId);
+                      const rentBal = (tenant.expectedRent || 0) - (tenant.paidRent || 0);
+                      const waterBal = (tenant.expectedWater || 0) - (tenant.paidWater || 0);
+                      const tenantRepairs = repairs.filter(r => r.houseId === tenant.houseId && r.status === 'OPEN');
+                      const pendingPayments = payments.filter(p => p.tenantId === tenant.id && p.status === 'PENDING');
+
+                      return (
+                        <div key={tenant.id} className={`p-5 rounded-2xl border shadow-sm flex flex-col justify-between transition-all duration-300 hover:-translate-y-1 hover:shadow-xl ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
+                          <div>
+                            <div className={`flex justify-between items-start mb-3 border-b pb-3 gap-2 ${theme === 'dark' ? 'border-slate-800' : 'border-[#DCD4C6]'}`}>
                               <div>
-                                <p>Amount: <span className={`font-black text-xs ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{formatKes(pendingPayment.amount)}</span></p>
-                                <p>Type: {pendingPayment.type === 'COMBINED' ? 'Rent & Water' : pendingPayment.type}</p>
+                                <h4 className={`font-extrabold text-lg leading-tight ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{tenant.name}</h4>
+                                <div className={`flex items-center gap-1.5 text-xs font-bold mt-1.5 ${theme === 'dark' ? 'text-slate-400' : 'text-gray-600'}`}>
+                                  <Home size={14} className={`shrink-0 ${theme === 'dark' ? 'text-gray-400' : 'text-gray-800'}`}/> {house ? house.name : 'Unassigned'}
+                                </div>
+                                <div className={`flex items-center gap-1.5 text-xs font-bold mt-1 ${theme === 'dark' ? 'text-slate-400' : 'text-gray-600'}`}>
+                                  <Phone size={14} className={`shrink-0 ${theme === 'dark' ? 'text-emerald-500' : 'text-emerald-600'}`}/> {tenant.phone}
+                                </div>
                               </div>
-                              <div className="text-right">
-                                <p>Code: <span className={`font-mono bg-amber-500/20 px-1.5 rounded font-bold uppercase border border-amber-500/20 ${theme === 'dark' ? 'text-amber-400' : 'text-amber-700'}`}>{pendingPayment.messageCode || "NONE"}</span></p>
-                                <p className="text-[10px] mt-0.5">{pendingPayment.method}</p>
+                              <div className={`text-right shrink-0 whitespace-nowrap p-2 rounded-xl border ${theme === 'dark' ? 'bg-white/5 border-white/5' : 'bg-black/5 border-black/5'}`}>
+                                <span className="text-[9px] text-gray-500 font-black uppercase block tracking-widest">Rent Bal</span>
+                                <span className={`text-sm font-black block ${rentBal > 0 ? (theme === 'dark' ? 'text-rose-500' : 'text-rose-600') : (theme === 'dark' ? 'text-emerald-500' : 'text-emerald-600')}`}>{formatKes(rentBal)}</span>
+                                <span className="text-[9px] text-gray-500 font-black uppercase block tracking-widest mt-1.5">Water Bal</span>
+                                <span className={`text-sm font-black block ${waterBal > 0 ? (theme === 'dark' ? 'text-rose-500' : 'text-rose-600') : (theme === 'dark' ? 'text-emerald-500' : 'text-emerald-600')}`}>{formatKes(waterBal)}</span>
                               </div>
                             </div>
+
+                            {tenantRepairs.length > 0 && (
+                              <div className={`mb-4 border p-3 rounded-xl flex items-start gap-2 text-xs ${theme === 'dark' ? 'bg-rose-500/10 border-rose-500/20 text-rose-400' : 'bg-rose-500/10 border-rose-500/20 text-rose-600'}`}>
+                                <AlertCircle size={16} className="shrink-0 mt-0.5"/>
+                                <div>
+                                  <span className="font-bold block mb-1">Active Complaints:</span>
+                                  {tenantRepairs.slice(0, 2).map(r => <span key={r.id} className="block truncate max-w-200px font-semibold">- {r.description}</span>)}
+                                </div>
+                              </div>
+                            )}
+
+                            {pendingPayments.map(pendingPayment => (
+                              <div key={pendingPayment.id} className="mb-4 bg-amber-500/10 border border-amber-500/20 p-3.5 rounded-xl shadow-sm">
+                                <h5 className={`text-xs font-black flex items-center gap-1.5 mb-1.5 uppercase tracking-wider ${theme === 'dark' ? 'text-amber-500' : 'text-amber-600'}`}><Clock size={14}/> Pending Approval</h5>
+                                <div className={`text-[11px] space-y-1 font-semibold flex justify-between ${theme === 'dark' ? 'text-slate-400' : 'text-gray-600'}`}>
+                                  <div>
+                                    <p>Amount: <span className={`font-black text-xs ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{formatKes(pendingPayment.amount)}</span></p>
+                                    <p>Type: {pendingPayment.type === 'COMBINED' ? 'Rent & Water' : pendingPayment.type}</p>
+                                  </div>
+                                  <div className="text-right">
+                                    <p>Code: <span className={`font-mono bg-amber-500/20 px-1.5 rounded font-bold uppercase border border-amber-500/20 ${theme === 'dark' ? 'text-amber-400' : 'text-amber-700'}`}>{pendingPayment.messageCode || "NONE"}</span></p>
+                                    <p className="text-[10px] mt-0.5">{pendingPayment.method}</p>
+                                  </div>
+                                </div>
+                                {role === 'LANDLORD' && (
+                                  <button 
+                                    onClick={() => handleConfirmPayment(pendingPayment)} 
+                                    disabled={isProcessing}
+                                    className="w-full mt-3 bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs py-2 rounded-lg transition-all disabled:opacity-50 shadow-sm"
+                                  >
+                                    {isProcessing ? 'Processing...' : 'Confirm & Update Balances'}
+                                  </button>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+
+                          <div className={`flex flex-col gap-2.5 mt-4 pt-3 border-t ${theme === 'dark' ? 'border-slate-800' : 'border-[#DCD4C6]'}`}>
+                            <div className="flex gap-2.5">
+                              <button onClick={() => { setModalError(''); setSelectedTenant(tenant); setIsPaymentModalOpen(true); }} className="flex-1 bg-gray-800 hover:bg-gray-900 text-white text-xs font-bold py-2.5 rounded-xl transition-all shadow-sm text-center">Log Payment</button>
+                              {role === 'MANAGER' && (
+                                <button onClick={() => { setModalError(''); setSelectedTenant(tenant); setIsBillingModalOpen(true); }} className={`flex-1 text-xs font-bold py-2.5 rounded-xl transition-all shadow-sm text-center border ${theme === 'dark' ? 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700' : 'bg-white hover:bg-gray-50 text-gray-800 border-gray-200'}`}>Update Bills</button>
+                              )}
+                            </div>
                             {role === 'LANDLORD' && (
-                              <button 
-                                onClick={() => handleConfirmPayment(pendingPayment)} 
-                                disabled={isProcessing}
-                                className="w-full mt-3 bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs py-2 rounded-lg transition-all disabled:opacity-50 shadow-sm"
-                              >
-                                {isProcessing ? 'Processing...' : 'Confirm & Update Balances'}
+                              <button onClick={() => { setSelectedTenant(tenant); setIsHistoryModalOpen(true); }} className={`w-full text-xs font-bold py-2.5 rounded-xl transition flex items-center justify-center gap-1.5 border ${theme === 'dark' ? 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700' : 'bg-[#FDFBF7] hover:bg-white text-gray-700 border-[#DCD4C6]'}`}>
+                                <ListOrdered size={16}/> View Verified History
                               </button>
                             )}
                           </div>
-                        ))}
-                      </div>
-
-                      <div className={`flex flex-col gap-2.5 mt-4 pt-3 border-t ${theme === 'dark' ? 'border-slate-800' : 'border-[#DCD4C6]'}`}>
-                        <div className="flex gap-2.5">
-                          <button onClick={() => { setModalError(''); setSelectedTenant(tenant); setIsPaymentModalOpen(true); }} className="flex-1 bg-gray-800 hover:bg-gray-900 text-white text-xs font-bold py-2.5 rounded-xl transition-all shadow-sm text-center">Log Payment</button>
-                          {role === 'MANAGER' && (
-                            <button onClick={() => { setModalError(''); setSelectedTenant(tenant); setIsBillingModalOpen(true); }} className={`flex-1 text-xs font-bold py-2.5 rounded-xl transition-all shadow-sm text-center border ${theme === 'dark' ? 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700' : 'bg-white hover:bg-gray-50 text-gray-800 border-gray-200'}`}>Update Bills</button>
-                          )}
                         </div>
-                        {role === 'LANDLORD' && (
-                          <button onClick={() => { setSelectedTenant(tenant); setIsHistoryModalOpen(true); }} className={`w-full text-xs font-bold py-2.5 rounded-xl transition flex items-center justify-center gap-1.5 border ${theme === 'dark' ? 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700' : 'bg-[#FDFBF7] hover:bg-white text-gray-700 border-[#DCD4C6]'}`}>
-                            <ListOrdered size={16}/> View Verified History
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  )
-                })}
-              </div>
-            </div>
-
-            <div>
-              <h3 className="text-lg font-bold mb-4 font-mono uppercase tracking-wider text-gray-500">Payment Ledger</h3>
-              <div className={`rounded-2xl border overflow-hidden shadow-sm overflow-x-auto ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
-                <table className="w-full text-left text-sm min-w-150 whitespace-nowrap">
-                  <thead className={`border-b ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-slate-400' : 'bg-[#FDFBF7] border-[#E8DFCE] text-gray-500'}`}>
-                    <tr>
-                      <th className="p-4 font-bold">Date</th>
-                      <th className="p-4 font-bold">Tenant</th>
-                      <th className="p-4 font-bold">Transaction Ref</th>
-                      <th className="p-4 font-bold">Type</th>
-                      <th className="p-4 font-bold">Amount Received</th>
-                      <th className="p-4 font-bold">Excess Split</th>
-                      <th className="p-4 font-bold">Status</th>
-                    </tr>
-                  </thead>
-                  <tbody className={`divide-y ${theme === 'dark' ? 'divide-slate-800' : 'divide-[#E8DFCE]'}`}>
-                    {payments.length === 0 && (
-                      <tr><td colSpan="7" className="p-8 text-center text-gray-500 font-medium">No payments recorded.</td></tr>
-                    )}
-                    {payments.map(payment => (
-                      <tr key={payment.id} className={`transition ${theme === 'dark' ? 'hover:bg-slate-950/40' : 'hover:bg-[#FDFBF7]'}`}>
-                        <td className="p-4 text-gray-500 font-medium">{new Date(payment.date).toLocaleDateString()}</td>
-                        {/* ABSOLUTE FIX: Forced Text Color for Table Rows in Dark/Light Mode */}
-                        <td className={`p-4 font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{payment.tenantName}</td>
-                        <td className="p-4">
-                          {payment.messageCode ? <span className={`font-mono text-[11px] px-2 py-1 rounded border uppercase font-bold ${theme === 'dark' ? 'bg-white/5 text-slate-300 border-white/10' : 'bg-black/5 text-gray-600 border-black/10'}`}>{payment.messageCode}</span> : <span className="text-xs text-gray-400 font-medium">N/A</span>}
-                        </td>
-                        <td className={`p-4 font-bold ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>{payment.type === 'COMBINED' ? 'Rent & Water' : payment.type}</td>
-                        <td className={`p-4 font-mono font-black ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{formatKes(payment.amount)}</td>
-                        <td className="p-4">
-                          {payment.excessAmount ? <span className={`text-[10px] border px-2.5 py-1 rounded-md font-bold uppercase tracking-wider ${theme === 'dark' ? 'bg-gray-700/30 text-gray-300 border-gray-600' : 'bg-gray-800/10 text-gray-800 border-gray-800/20'}`}>Excess of {formatKes(payment.excessAmount)}</span> : <span className="text-xs text-gray-400 font-medium">-</span>}
-                        </td>
-                        <td className="p-4">
-                          {payment.status === 'CONFIRMED' ? <span className={`text-xs font-bold flex items-center gap-1.5 ${theme === 'dark' ? 'text-emerald-400' : 'text-emerald-600'}`}><Check size={16}/> Confirmed</span> : <span className={`text-xs font-bold flex items-center gap-1.5 ${theme === 'dark' ? 'text-amber-400' : 'text-amber-600'}`}><Clock size={16}/> Pending</span>}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {activeTab === 'repairs' && (
-          <div className="space-y-6 animate-in fade-in duration-500">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-              <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Repairs & Operations</h2>
-              <div className="flex gap-2">
-                <button onClick={() => { setModalError(''); setIsSepticModalOpen(true); }} className="bg-gray-800 hover:bg-gray-900 text-white px-5 py-2.5 rounded-xl text-sm font-bold flex items-center gap-2 shadow-sm transition-all hover:shadow-md"><Truck size={18}/> Log Septic Cleanout</button>
-                <button onClick={() => { setModalError(''); setIsRepairModalOpen(true); }} className="bg-rose-600 hover:bg-rose-700 text-white px-5 py-2.5 rounded-xl text-sm font-bold flex items-center gap-2 shadow-sm transition-all hover:shadow-md"><Plus size={18}/> Log Issue</button>
-              </div>
-            </div>
-
-            <div className={`rounded-2xl border overflow-hidden shadow-sm ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
-              <div className={`p-5 border-b ${theme === 'dark' ? 'bg-slate-950 border-slate-800' : 'bg-[#FDFBF7] border-[#E8DFCE]'}`}>
-                <h3 className={`font-bold flex items-center gap-2 text-lg ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}><Wrench size={20}/> House Repairs & Complaints</h3>
-              </div>
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-sm whitespace-nowrap min-w-150">
-                  <thead className={`border-b ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-slate-400' : 'bg-[#FDFBF7] border-[#E8DFCE] text-gray-500'}`}>
-                    <tr>
-                      <th className="p-4 font-bold">Date Logged</th>
-                      <th className="p-4 font-bold">House Unit</th>
-                      <th className="p-4 font-bold">Description</th>
-                      <th className="p-4 font-bold">Status</th>
-                      <th className="p-4 font-bold">Resolution Cost</th>
-                      <th className="p-4 font-bold text-right">Action</th>
-                    </tr>
-                  </thead>
-                  <tbody className={`divide-y ${theme === 'dark' ? 'divide-slate-800' : 'divide-[#E8DFCE]'}`}>
-                    {repairs.length === 0 && (
-                      <tr><td colSpan="6" className="p-8 text-center text-gray-500 font-medium">No issues reported!</td></tr>
-                    )}
-                    {repairs.map(repair => {
-                      const house = houses.find(h => h.id === repair.houseId);
-                      return (
-                        <tr key={repair.id} className={`transition ${theme === 'dark' ? 'hover:bg-slate-950/40' : 'hover:bg-[#FDFBF7]'}`}>
-                          <td className="p-4 text-gray-500 font-medium">{new Date(repair.date).toLocaleDateString()}</td>
-                          {/* ABSOLUTE FIX: Forced Text Color for Repair Rows in Dark/Light Mode */}
-                          <td className={`p-4 font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{house ? house.name : 'Unknown'}</td>
-                          <td className={`p-4 whitespace-normal max-w-xs font-medium ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>{repair.description}</td>
-                          <td className="p-4">{repair.status === 'OPEN' ? <span className={`text-[10px] font-bold px-2.5 py-1 uppercase tracking-wider rounded-md border ${theme === 'dark' ? 'bg-rose-500/10 border-rose-500/20 text-rose-400' : 'bg-rose-500/10 border-rose-500/20 text-rose-600'}`}>Needs Action</span> : <span className={`text-xs font-bold ${theme === 'dark' ? 'text-emerald-400' : 'text-emerald-600'}`}>Resolved</span>}</td>
-                          <td className={`p-4 font-mono font-black ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{repair.status === 'RESOLVED' && repair.cost ? formatKes(repair.cost) : 'N/A'}</td>
-                          <td className="p-4 text-right">
-                            {repair.status === 'OPEN' && (
-                              <button onClick={() => { setModalError(''); setSelectedRepair(repair); setIsResolveRepairModalOpen(true); }} className={`text-xs font-bold px-4 py-2 rounded-lg border transition-colors ${theme === 'dark' ? 'text-gray-300 hover:text-white bg-white/5 border-white/10' : 'text-gray-800 hover:text-gray-900 bg-black/5 border-black/10'}`}>Mark Resolved</button>
-                            )}
-                          </td>
-                        </tr>
                       )
                     })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
+                  </div>
+                </div>
 
-            <div className={`rounded-2xl border overflow-hidden shadow-sm mt-8 ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
-              <div className={`p-5 border-b ${theme === 'dark' ? 'bg-slate-950 border-slate-800' : 'bg-[#FDFBF7] border-[#E8DFCE]'}`}>
-                <h3 className={`font-bold flex items-center gap-2 text-lg ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}><Truck size={20}/> Septic Removal Logs</h3>
+                <div>
+                  <div className="flex justify-between items-end mb-4">
+                    <h3 className="text-lg font-bold font-mono uppercase tracking-wider text-gray-500">Payment Ledger</h3>
+                    <button onClick={printLedgerReport} className="text-xs font-bold px-4 py-2 bg-gray-800 hover:bg-gray-900 text-white rounded-lg flex items-center gap-2 transition-all shadow-sm">
+                      <Download size={14} /> Download Ledger Report
+                    </button>
+                  </div>
+                  
+                  <div className={`rounded-2xl border overflow-hidden shadow-sm overflow-x-auto ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
+                    <table className="w-full text-left text-sm min-w-150 whitespace-nowrap">
+                      <thead className={`border-b ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-slate-400' : 'bg-[#FDFBF7] border-[#E8DFCE] text-gray-500'}`}>
+                        <tr>
+                          <th className="p-4 font-bold">Date</th>
+                          <th className="p-4 font-bold">Tenant</th>
+                          <th className="p-4 font-bold">Transaction Ref</th>
+                          <th className="p-4 font-bold">Type</th>
+                          <th className="p-4 font-bold">Amount Received</th>
+                          <th className="p-4 font-bold">Excess Split</th>
+                          <th className="p-4 font-bold">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody className={`divide-y ${theme === 'dark' ? 'divide-slate-800' : 'divide-[#E8DFCE]'}`}>
+                        {payments.length === 0 && (
+                          <tr><td colSpan="7" className="p-8 text-center text-gray-500 font-medium">No payments recorded.</td></tr>
+                        )}
+                        {payments.map(payment => (
+                          <tr key={payment.id} className={`transition ${theme === 'dark' ? 'hover:bg-slate-950/40' : 'hover:bg-[#FDFBF7]'}`}>
+                            <td className="p-4 text-gray-500 font-medium">{new Date(payment.date).toLocaleDateString()}</td>
+                            <td className={`p-4 font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{payment.tenantName}</td>
+                            <td className="p-4">
+                              {payment.messageCode ? <span className={`font-mono text-[11px] px-2 py-1 rounded border uppercase font-bold ${theme === 'dark' ? 'bg-white/5 text-slate-300 border-white/10' : 'bg-black/5 text-gray-600 border-black/10'}`}>{payment.messageCode}</span> : <span className="text-xs text-gray-400 font-medium">N/A</span>}
+                            </td>
+                            <td className={`p-4 font-bold ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>{payment.type === 'COMBINED' ? 'Rent & Water' : payment.type}</td>
+                            <td className={`p-4 font-mono font-black ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{formatKes(payment.amount)}</td>
+                            <td className="p-4">
+                              {payment.excessAmount ? <span className={`text-[10px] border px-2.5 py-1 rounded-md font-bold uppercase tracking-wider ${theme === 'dark' ? 'bg-gray-700/30 text-gray-300 border-gray-600' : 'bg-gray-800/10 text-gray-800 border-gray-800/20'}`}>Excess of {formatKes(payment.excessAmount)}</span> : <span className="text-xs text-gray-400 font-medium">-</span>}
+                            </td>
+                            <td className="p-4">
+                              {payment.status === 'CONFIRMED' ? <span className={`text-xs font-bold flex items-center gap-1.5 ${theme === 'dark' ? 'text-emerald-400' : 'text-emerald-600'}`}><Check size={16}/> Confirmed</span> : <span className={`text-xs font-bold flex items-center gap-1.5 ${theme === 'dark' ? 'text-amber-400' : 'text-amber-600'}`}><Clock size={16}/> Pending</span>}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
               </div>
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-sm whitespace-nowrap min-w-125">
-                  <thead className={`border-b ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-slate-400' : 'bg-[#FDFBF7] border-[#E8DFCE] text-gray-500'}`}>
-                    <tr>
-                      <th className="p-4 font-bold">Date Logged</th>
-                      <th className="p-4 font-bold">Service Provider</th>
-                      <th className="p-4 font-bold">Cost Outlaid</th>
-                      <th className="p-4 font-bold">Logged By</th>
-                    </tr>
-                  </thead>
-                  <tbody className={`divide-y ${theme === 'dark' ? 'divide-slate-800' : 'divide-[#E8DFCE]'}`}>
-                    {septicLogs.length === 0 && (
-                      <tr><td colSpan="4" className="p-8 text-center text-gray-500 font-medium">No septic cleanouts logged yet.</td></tr>
-                    )}
-                    {septicLogs.map(log => (
-                      <tr key={log.id} className={`transition ${theme === 'dark' ? 'hover:bg-slate-950/40' : 'hover:bg-[#FDFBF7]'}`}>
-                        <td className="p-4 text-gray-500 font-medium">{new Date(log.date).toLocaleDateString()}</td>
-                        {/* ABSOLUTE FIX: Forced Text Color for Septic Logs in Dark/Light Mode */}
-                        <td className={`p-4 font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{log.provider}</td>
-                        <td className={`p-4 font-mono font-black ${theme === 'dark' ? 'text-rose-500' : 'text-rose-600'}`}>{formatKes(log.cost)}</td>
-                        <td className="p-4 text-gray-500 font-medium">{log.loggedBy}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+            )}
+
+            {activeTab === 'repairs' && (
+              <div className="space-y-6 animate-in fade-in duration-500">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                  <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Repairs & Operations</h2>
+                  <div className="flex gap-2">
+                    <button onClick={() => { setModalError(''); setIsSepticModalOpen(true); }} className="bg-gray-800 hover:bg-gray-900 text-white px-5 py-2.5 rounded-xl text-sm font-bold flex items-center gap-2 shadow-sm transition-all hover:shadow-md"><Truck size={18}/> Log Septic Cleanout</button>
+                    <button onClick={() => { setModalError(''); setIsRepairModalOpen(true); }} className="bg-rose-600 hover:bg-rose-700 text-white px-5 py-2.5 rounded-xl text-sm font-bold flex items-center gap-2 shadow-sm transition-all hover:shadow-md"><Plus size={18}/> Log Issue</button>
+                  </div>
+                </div>
+
+                <div className={`rounded-2xl border overflow-hidden shadow-sm ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
+                  <div className={`p-5 border-b ${theme === 'dark' ? 'bg-slate-950 border-slate-800' : 'bg-[#FDFBF7] border-[#E8DFCE]'}`}>
+                    <h3 className={`font-bold flex items-center gap-2 text-lg ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}><Wrench size={20}/> House Repairs & Complaints</h3>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-sm whitespace-nowrap min-w-150">
+                      <thead className={`border-b ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-slate-400' : 'bg-[#FDFBF7] border-[#E8DFCE] text-gray-500'}`}>
+                        <tr>
+                          <th className="p-4 font-bold">Date Logged</th>
+                          <th className="p-4 font-bold">House Unit</th>
+                          <th className="p-4 font-bold">Description</th>
+                          <th className="p-4 font-bold">Status</th>
+                          <th className="p-4 font-bold">Resolution Cost</th>
+                          <th className="p-4 font-bold text-right">Action</th>
+                        </tr>
+                      </thead>
+                      <tbody className={`divide-y ${theme === 'dark' ? 'divide-slate-800' : 'divide-[#E8DFCE]'}`}>
+                        {repairs.length === 0 && (
+                          <tr><td colSpan="6" className="p-8 text-center text-gray-500 font-medium">No issues reported!</td></tr>
+                        )}
+                        {repairs.map(repair => {
+                          const house = houses.find(h => h.id === repair.houseId);
+                          return (
+                            <tr key={repair.id} className={`transition ${theme === 'dark' ? 'hover:bg-slate-950/40' : 'hover:bg-[#FDFBF7]'}`}>
+                              <td className="p-4 text-gray-500 font-medium">{new Date(repair.date).toLocaleDateString()}</td>
+                              <td className={`p-4 font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{house ? house.name : 'Unknown'}</td>
+                              <td className={`p-4 whitespace-normal max-w-xs font-medium ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>{repair.description}</td>
+                              <td className="p-4">{repair.status === 'OPEN' ? <span className={`text-[10px] font-bold px-2.5 py-1 uppercase tracking-wider rounded-md border ${theme === 'dark' ? 'bg-rose-500/10 border-rose-500/20 text-rose-400' : 'bg-rose-500/10 border-rose-500/20 text-rose-600'}`}>Needs Action</span> : <span className={`text-xs font-bold ${theme === 'dark' ? 'text-emerald-400' : 'text-emerald-600'}`}>Resolved</span>}</td>
+                              <td className={`p-4 font-mono font-black ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{repair.status === 'RESOLVED' && repair.cost ? formatKes(repair.cost) : 'N/A'}</td>
+                              <td className="p-4 text-right">
+                                {repair.status === 'OPEN' && (
+                                  <button onClick={() => { setModalError(''); setSelectedRepair(repair); setIsResolveRepairModalOpen(true); }} className={`text-xs font-bold px-4 py-2 rounded-lg border transition-colors ${theme === 'dark' ? 'text-gray-300 hover:text-white bg-white/5 border-white/10' : 'text-gray-800 hover:text-gray-900 bg-black/5 border-black/10'}`}>Mark Resolved</button>
+                                )}
+                              </td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                <div className={`rounded-2xl border overflow-hidden shadow-sm mt-8 ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
+                  <div className={`p-5 border-b ${theme === 'dark' ? 'bg-slate-950 border-slate-800' : 'bg-[#FDFBF7] border-[#E8DFCE]'}`}>
+                    <h3 className={`font-bold flex items-center gap-2 text-lg ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}><Truck size={20}/> Septic Removal Logs</h3>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-sm whitespace-nowrap min-w-125">
+                      <thead className={`border-b ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-slate-400' : 'bg-[#FDFBF7] border-[#E8DFCE] text-gray-500'}`}>
+                        <tr>
+                          <th className="p-4 font-bold">Date Logged</th>
+                          <th className="p-4 font-bold">Service Provider</th>
+                          <th className="p-4 font-bold">Cost Outlaid</th>
+                          <th className="p-4 font-bold">Logged By</th>
+                        </tr>
+                      </thead>
+                      <tbody className={`divide-y ${theme === 'dark' ? 'divide-slate-800' : 'divide-[#E8DFCE]'}`}>
+                        {septicLogs.length === 0 && (
+                          <tr><td colSpan="4" className="p-8 text-center text-gray-500 font-medium">No septic cleanouts logged yet.</td></tr>
+                        )}
+                        {septicLogs.map(log => (
+                          <tr key={log.id} className={`transition ${theme === 'dark' ? 'hover:bg-slate-950/40' : 'hover:bg-[#FDFBF7]'}`}>
+                            <td className="p-4 text-gray-500 font-medium">{new Date(log.date).toLocaleDateString()}</td>
+                            <td className={`p-4 font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{log.provider}</td>
+                            <td className={`p-4 font-mono font-black ${theme === 'dark' ? 'text-rose-500' : 'text-rose-600'}`}>{formatKes(log.cost)}</td>
+                            <td className="p-4 text-gray-500 font-medium">{log.loggedBy}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
               </div>
-            </div>
+            )}
           </div>
-        )}
-      </main>
+
+          {/* ADDED FOOTER HERE */}
+          <footer className={`mt-10 py-6 border-t text-center text-sm font-medium flex flex-col gap-1 items-center justify-center transition-colors ${theme === 'dark' ? 'border-slate-800 text-slate-500' : 'border-[#E8DFCE] text-gray-500'}`}>
+            <p>&copy; {new Date().getFullYear()} Ruiru Rentals. All rights reserved.</p>
+            <p className="text-xs opacity-70">@Gikunju creates</p>
+          </footer>
+
+        </main>
+      </div>
 
       {/* ================= STRICT MODALS ================= */}
       
-      {/* GLOBAL MODAL ERROR COMPONENT (REUSABLE) */}
       {modalError && (
         <div className="fixed top-4 right-4 bg-rose-600 text-white p-4 rounded-2xl shadow-2xl z-100 flex items-center gap-3 animate-in fade-in slide-in-from-top-4 max-w-sm">
           <AlertCircle size={24}/>
@@ -1569,7 +1656,7 @@ export default function App() {
 
       {isHistoryModalOpen && selectedTenant && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-60 backdrop-blur-sm transition-opacity" onClick={() => closeAnyModal(setIsHistoryModalOpen)}>
-          <div className={`rounded-3xl w-full max-w-2xl p-7 shadow-2xl animate-in fade-in zoom-in-95 duration-200 ${theme === 'dark' ? 'bg-slate-900 text-white border border-slate-800' : 'bg-[#FDFBF7] text-gray-900 border border-[#E8DFCE]'}`} onClick={e => e.stopPropagation()}>
+          <div className={`rounded-3xl w-full max-w-3xl p-7 shadow-2xl animate-in fade-in zoom-in-95 duration-200 ${theme === 'dark' ? 'bg-slate-900 text-white border border-slate-800' : 'bg-[#FDFBF7] text-gray-900 border border-[#E8DFCE]'}`} onClick={e => e.stopPropagation()}>
             <div className={`flex justify-between items-center mb-6 border-b pb-4 ${theme === 'dark' ? 'border-slate-800' : 'border-[#DCD4C6]'}`}>
               <div>
                 <h3 className="text-xl font-bold">Verified Payment Ledger</h3>
@@ -1582,15 +1669,24 @@ export default function App() {
                 <p className={`text-sm font-medium py-10 text-center rounded-2xl ${theme === 'dark' ? 'bg-white/5 text-gray-400' : 'bg-black/5 text-gray-500'}`}>No confirmed payments exist for this tenant yet.</p>
               ) : (
                 tenantPaymentHistory.map(p => (
-                  <div key={p.id} className={`flex justify-between items-center p-4 border rounded-2xl transition-all hover:shadow-md ${theme === 'dark' ? 'bg-slate-950 border-slate-800' : 'bg-[#F4EFE6] border-[#DCD4C6]'}`}>
-                    <div>
+                  <div key={p.id} className={`flex flex-col sm:flex-row sm:justify-between sm:items-center p-4 border rounded-2xl transition-all hover:shadow-md gap-4 ${theme === 'dark' ? 'bg-slate-950 border-slate-800' : 'bg-[#F4EFE6] border-[#DCD4C6]'}`}>
+                    <div className="flex-1">
                       <p className={`font-bold text-base ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{p.type === 'COMBINED' ? 'Rent & Water' : p.type} Payment</p>
                       <p className="text-xs text-gray-500 font-semibold mt-1">Logged on: {new Date(p.date).toLocaleDateString()} | Method: {p.method}</p>
                       {p.messageCode && <p className={`text-[10px] font-mono font-bold px-2 py-1 rounded-md inline-block mt-2 border ${theme === 'dark' ? 'bg-white/5 text-gray-300 border-white/10' : 'bg-black/5 text-gray-700 border-black/10'}`}>CODE: {p.messageCode}</p>}
                     </div>
-                    <div className="text-right">
+                    <div className="text-left sm:text-right">
                       <p className={`font-black text-lg font-mono ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{formatKes(p.amount)}</p>
                       {p.excessAmount && <p className={`text-[10px] font-bold mt-1.5 uppercase tracking-wider ${theme === 'dark' ? 'text-gray-400' : 'text-gray-600'}`}>Excess: {formatKes(p.excessAmount)}</p>}
+                    </div>
+                    <div>
+                      {/* NEW RECEIPT DOWNLOAD BUTTON */}
+                      <button 
+                        onClick={() => printReceipt(p, selectedTenant)}
+                        className={`mt-2 sm:mt-0 w-full sm:w-auto flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-bold rounded-xl transition ${theme === 'dark' ? 'bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600/40' : 'bg-emerald-100 text-emerald-700 hover:bg-emerald-200'}`}
+                      >
+                        <Download size={14}/> Download Receipt
+                      </button>
                     </div>
                   </div>
                 ))
