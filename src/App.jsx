@@ -9,7 +9,15 @@ import {
 
 // --- FIREBASE IMPORTS ---
 import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut, sendPasswordResetEmail } from 'firebase/auth';
+import { 
+  getAuth, 
+  signInWithEmailAndPassword, 
+  onAuthStateChanged, 
+  signOut, 
+  sendPasswordResetEmail,
+  GoogleAuthProvider,
+  signInWithPopup
+} from 'firebase/auth';
 import { getFirestore, collection, onSnapshot, doc, setDoc, addDoc, updateDoc, deleteDoc } from 'firebase/firestore';
 
 // --- FIREBASE SETUP ---
@@ -30,6 +38,12 @@ const appId = "hse-app-b1d2b";
 // --- CONFIGURE YOUR EMAILS AND ROLES HERE ---
 const LANDLORD_EMAIL = "pngikunju671@gmail.com";
 const LANDLORD_UID = "b4HMBcL0WXT3Qg2vunj5ITZOVb72";
+
+// Add approved manager emails here. Anyone logging in via Google must be in this list to access the Manager Portal!
+const AUTHORIZED_MANAGERS = [
+  "nganga137peter@gmail.com",
+  "josephmalkovich99@gmail.com"
+];
 
 // Safe database timeout wrapper to prevent sandbox freezes
 const promiseTimeout = (promise, ms = 15000) => {
@@ -88,17 +102,37 @@ export default function App() {
     localStorage.setItem('ruiru_theme', theme);
   }, [theme]);
 
+  // Auth state listener with strict post-authentication email guards
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-      setUser(currentUser);
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       if (currentUser) {
-        const assignedRole = currentUser.uid === LANDLORD_UID ? 'LANDLORD' : 'MANAGER';
-        setRole(assignedRole);
-        setActiveTab(assignedRole === 'LANDLORD' ? 'dashboard' : 'houses');
+        const userEmail = currentUser.email?.toLowerCase();
+        const isLandlord = userEmail === LANDLORD_EMAIL.toLowerCase() || currentUser.uid === LANDLORD_UID;
+        const isAuthorizedManager = AUTHORIZED_MANAGERS.map(e => e.toLowerCase()).includes(userEmail);
+
+        if (isLandlord) {
+          setUser(currentUser);
+          setRole('LANDLORD');
+          setActiveTab('dashboard');
+          setLoading(false);
+        } else if (isAuthorizedManager) {
+          setUser(currentUser);
+          setRole('MANAGER');
+          setActiveTab('houses');
+          setLoading(false);
+        } else {
+          // If authenticated but email is not on whitelist, force logout and flag access error
+          setLoginError("Unauthorized Access: This Google account or email is not whitelisted.");
+          await signOut(auth);
+          setUser(null);
+          setRole(null);
+          setLoading(false);
+        }
       } else {
+        setUser(null);
         setRole(null);
+        setLoading(false);
       }
-      setLoading(false);
     });
     return () => unsubscribe();
   }, []);
@@ -122,6 +156,7 @@ export default function App() {
     return new Set(tenants.map(t => t.houseId).filter(Boolean));
   }, [tenants]);
 
+  // Handle standard email password sign in
   const handleLoginSubmit = async (e) => {
     e.preventDefault();
     setLoginError('');
@@ -132,16 +167,43 @@ export default function App() {
     setIsProcessing(true);
     try {
       await signInWithEmailAndPassword(auth, email, password);
-      // Trigger Welcome Animation interval
-      setShowWelcomeScreen(true);
-      setTimeout(() => {
-        setShowWelcomeScreen(false);
-      }, 2500); 
+      triggerWelcome();
     } catch (error) {
       setLoginError(error.message.replace("Firebase: ", ""));
     } finally {
       setIsProcessing(false);
     }
+  };
+
+  // Google Single-Sign On (SSO) Popup handler
+  const handleGoogleSignIn = async () => {
+    setLoginError('');
+    setIsProcessing(true);
+    const provider = new GoogleAuthProvider();
+    try {
+      const result = await signInWithPopup(auth, provider);
+      const loggedEmail = result.user.email?.toLowerCase();
+      
+      const isLandlord = loggedEmail === LANDLORD_EMAIL.toLowerCase();
+      const isAuthorizedManager = AUTHORIZED_MANAGERS.map(e => e.toLowerCase()).includes(loggedEmail);
+      
+      if (!isLandlord && !isAuthorizedManager) {
+        throw new Error("Access Denied: This email is not registered inside Ruiru Rentals database.");
+      }
+      triggerWelcome();
+    } catch (error) {
+      setLoginError(error.message.replace("Firebase: ", ""));
+      await signOut(auth);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const triggerWelcome = () => {
+    setShowWelcomeScreen(true);
+    setTimeout(() => {
+      setShowWelcomeScreen(false);
+    }, 2500);
   };
 
   const handleForgotPassword = async () => {
@@ -171,114 +233,211 @@ export default function App() {
 
   const formatKes = (amount) => `KES ${Number(amount || 0).toLocaleString('en-KE')}`;
 
-  // --- PDF / PRINTING ENGINE ---
-  
+  // --- PROFESSIONAL PDF / PRINTING ENGINE ---
   const printReceipt = (payment, tenant) => {
     const printWindow = window.open('', '_blank');
+    const house = houses.find(h => h.id === tenant.houseId);
+    const houseName = house ? house.name : 'Unassigned';
+    
+    // Get the base URL to ensure the logo loads properly in the print window
+    const baseUrl = window.location.origin;
+
     const html = `
+      <!DOCTYPE html>
       <html>
         <head>
           <title>Receipt - ${payment.messageCode || 'N/A'}</title>
           <style>
-            body { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; padding: 40px; color: #333; max-width: 800px; margin: 0 auto; position: relative; }
-            .watermark { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(-45deg); opacity: 0.05; font-size: 140px; font-weight: 900; z-index: -1; pointer-events: none; white-space: nowrap; color: #000; }
-            .header { border-bottom: 2px solid #eee; padding-bottom: 20px; margin-bottom: 30px; text-align: center; }
-            .header h1 { margin: 0; font-size: 28px; color: #111; }
-            .details { margin-bottom: 30px; display: flex; justify-content: space-between; }
-            .details div { font-size: 14px; line-height: 1.6; }
-            .amount-box { background: #f8f9fa; padding: 20px; border-radius: 12px; text-align: center; border: 1px solid #e9ecef; margin-bottom: 30px; }
-            .amount-box h2 { margin: 0; font-size: 36px; color: #10b981; }
-            table { width: 100%; border-collapse: collapse; margin-bottom: 30px; }
-            th, td { border-bottom: 1px solid #eee; padding: 12px; text-align: left; }
-            th { color: #666; font-weight: bold; font-size: 12px; text-transform: uppercase; background: #fafafa; }
-            .footer { font-size: 12px; text-align: center; color: #888; border-top: 1px solid #eee; padding-top: 20px; margin-top: 50px; }
+            @media print {
+              body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+            }
+            body { 
+              font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; 
+              padding: 40px; 
+              color: #333; 
+              max-width: 800px; 
+              margin: 0 auto; 
+              position: relative; 
+              background: #fff;
+            }
+            /* Dark Green Watermark */
+            .watermark { 
+              position: fixed; 
+              top: 50%; 
+              left: 50%; 
+              transform: translate(-50%, -50%) rotate(-35deg); 
+              opacity: 0.08; 
+              font-size: 110px; 
+              font-weight: 900; 
+              z-index: -1; 
+              pointer-events: none; 
+              white-space: nowrap; 
+              color: #064e3b; /* Tailwind emerald-900 */
+              text-transform: uppercase;
+              letter-spacing: 4px;
+            }
+            .header-container {
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              border-bottom: 2px solid #e2e8f0;
+              padding-bottom: 25px;
+              margin-bottom: 30px;
+            }
+            .logo-area img {
+              width: 80px;
+              height: 80px;
+              border-radius: 12px;
+              object-fit: cover;
+              border: 1px solid #e2e8f0;
+            }
+            .header-text { text-align: right; }
+            .header-text h1 { margin: 0; font-size: 28px; color: #0f172a; font-weight: 800; letter-spacing: -0.5px; }
+            .header-text p { margin: 5px 0 0; color: #64748b; font-weight: 600; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; }
+            
+            .amount-box { 
+              background: #f8fafc; 
+              padding: 25px; 
+              border-radius: 16px; 
+              text-align: center; 
+              border: 1px solid #e2e8f0; 
+              margin-bottom: 35px; 
+            }
+            .amount-box p { margin: 0 0 8px; color: #64748b; text-transform: uppercase; font-size: 12px; font-weight: bold; letter-spacing: 1px; }
+            .amount-box h2 { margin: 0; font-size: 42px; color: #059669; font-family: monospace; font-weight: 900; }
+            
+            .details { display: flex; justify-content: space-between; margin-bottom: 35px; background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px; }
+            .details div { font-size: 14px; line-height: 1.8; color: #475569; }
+            .details strong { color: #0f172a; font-size: 15px; }
+            
+            table { width: 100%; border-collapse: collapse; margin-bottom: 40px; border: 1px solid #e2e8f0; border-radius: 12px; overflow: hidden; }
+            th, td { border-bottom: 1px solid #e2e8f0; padding: 16px; text-align: left; }
+            th { color: #64748b; font-weight: bold; font-size: 12px; text-transform: uppercase; background: #f8fafc; letter-spacing: 0.5px; }
+            td { font-size: 15px; color: #1e293b; font-weight: 500; }
+            
+            .footer { font-size: 13px; text-align: center; color: #94a3b8; border-top: 2px solid #e2e8f0; padding-top: 25px; margin-top: 50px; }
+            .footer p { margin: 5px 0; }
+            .signature { font-weight: bold; color: #cbd5e1; margin-top: 15px !important; font-size: 11px; }
           </style>
         </head>
         <body>
           <div class="watermark">RUIRU RENTALS</div>
-          <div class="header">
-            <h1>Ruiru Rentals</h1>
-            <p style="margin: 5px 0 0; color: #666; font-weight: bold;">Official Payment Receipt</p>
+          
+          <div class="header-container">
+            <div class="logo-area">
+              <img src="${baseUrl}/HSlogo.png" alt="Ruiru Rentals Logo" onerror="this.style.display='none'">
+            </div>
+            <div class="header-text">
+              <h1>Ruiru Rentals</h1>
+              <p>Official Payment Receipt</p>
+            </div>
           </div>
+
           <div class="amount-box">
-            <p style="margin: 0 0 5px; color: #666; text-transform: uppercase; font-size: 12px; font-weight: bold;">Amount Received</p>
+            <p>Total Amount Received</p>
             <h2>${formatKes(payment.amount)}</h2>
           </div>
+
           <div class="details">
             <div>
-              <strong>Tenant Information:</strong><br/>
-              ${tenant.name}<br/>
+              <strong>Tenant Details:</strong><br/>
+              Name: <span style="font-weight: 600;">${tenant.name}</span><br/>
+              Unit/House: <span style="font-weight: 800; color: #0f172a;">${houseName}</span><br/>
               Phone: ${tenant.phone}
             </div>
             <div style="text-align: right;">
-              <strong>Transaction Details:</strong><br/>
-              Date: ${new Date(payment.date).toLocaleString()}<br/>
+              <strong>Transaction Info:</strong><br/>
+              Date: <span style="font-weight: 600;">${new Date(payment.date).toLocaleString()}</span><br/>
               Method: ${payment.method}<br/>
-              Ref/Code: ${payment.messageCode || 'N/A'}
+              Ref Code: <span style="font-family: monospace; font-weight: bold; background: #f1f5f9; padding: 2px 6px; border-radius: 4px;">${payment.messageCode || 'N/A'}</span>
             </div>
           </div>
+
           <table>
             <thead>
               <tr>
-                <th>Description</th>
-                <th style="text-align: right;">Amount</th>
+                <th>Description of Payment</th>
+                <th style="text-align: right;">Amount Applied</th>
               </tr>
             </thead>
             <tbody>
               <tr>
                 <td>${payment.type === 'COMBINED' ? 'Rent & Water Combined Payment' : payment.type + ' Payment'}</td>
-                <td style="text-align: right;">${formatKes(payment.amount)}</td>
+                <td style="text-align: right; font-family: monospace; font-weight: bold; font-size: 16px;">${formatKes(payment.amount)}</td>
               </tr>
             </tbody>
           </table>
+
           <div class="footer">
-            <p>Thank you for your prompt payment!</p>
-            <p>&copy; ${new Date().getFullYear()} Ruiru Rentals. @Gikunju creates.</p>
+            <p style="font-weight: bold; color: #475569; font-size: 15px;">Thank you for your prompt payment!</p>
+            <p>This is a system-generated receipt. No signature is required.</p>
+            <p class="signature">&copy; ${new Date().getFullYear()} Ruiru Rentals. @Gikunju creates.</p>
           </div>
         </body>
       </html>
     `;
     printWindow.document.write(html);
     printWindow.document.close();
-    setTimeout(() => printWindow.print(), 300);
+    setTimeout(() => printWindow.print(), 500);
   };
 
   const printLedgerReport = () => {
     const printWindow = window.open('', '_blank');
+    const baseUrl = window.location.origin;
+
     const html = `
+      <!DOCTYPE html>
       <html>
         <head>
           <title>Ruiru Rentals - Ledger Report</title>
           <style>
-            body { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; padding: 40px; color: #333; position: relative; font-size: 14px; }
-            .watermark { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(-45deg); opacity: 0.05; font-size: 160px; font-weight: 900; z-index: -1; pointer-events: none; white-space: nowrap; color: #000; }
+            @media print {
+              body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+            }
+            body { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; padding: 40px; color: #333; position: relative; font-size: 14px; background: #fff; }
+            
+            /* Dark Green Watermark */
+            .watermark { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(-35deg); opacity: 0.05; font-size: 160px; font-weight: 900; z-index: -1; pointer-events: none; white-space: nowrap; color: #064e3b; text-transform: uppercase; }
+            
+            .header-container { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #e2e8f0; padding-bottom: 25px; margin-bottom: 30px; }
+            .logo-area img { width: 70px; height: 70px; border-radius: 12px; object-fit: cover; }
+            .header-text { text-align: right; }
+            .header-text h1 { margin: 0; font-size: 26px; color: #0f172a; }
+            .header-text p { margin: 5px 0 0; color: #64748b; font-weight: 600; font-size: 12px; text-transform: uppercase; }
+            
             table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 13px; }
-            th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
-            th { background-color: #f4f4f4; color: #333; text-transform: uppercase; font-size: 11px; }
-            .header { display: flex; align-items: center; border-bottom: 2px solid #eee; padding-bottom: 20px; margin-bottom: 30px; }
-            .header-text h1 { margin: 0; font-size: 26px; }
-            .header-text p { margin: 5px 0 0; color: #666; }
-            .footer { margin-top: 50px; font-size: 12px; text-align: center; color: #777; border-top: 1px solid #eee; padding-top: 20px; }
-            .badge { padding: 4px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; background: #e2e8f0; }
+            th, td { border: 1px solid #e2e8f0; padding: 12px; text-align: left; }
+            th { background-color: #f8fafc; color: #475569; text-transform: uppercase; font-size: 11px; font-weight: bold; letter-spacing: 0.5px; }
+            td { color: #1e293b; }
+            
+            .badge { padding: 4px 8px; border-radius: 6px; font-size: 10px; font-weight: bold; background: #e2e8f0; color: #475569; text-transform: uppercase; }
+            .badge-confirmed { background: #d1fae5; color: #065f46; }
+            
+            .footer { margin-top: 50px; font-size: 12px; text-align: center; color: #94a3b8; border-top: 2px solid #e2e8f0; padding-top: 20px; }
           </style>
         </head>
         <body>
           <div class="watermark">RUIRU RENTALS</div>
-          <div class="header">
+          
+          <div class="header-container">
+            <div class="logo-area">
+              <img src="${baseUrl}/HSlogo.png" alt="Logo" onerror="this.style.display='none'">
+            </div>
             <div class="header-text">
               <h1>Ruiru Rentals</h1>
-              <p style="font-weight: bold;">Full Transactions Ledger Report</p>
-              <p style="font-size: 12px;">Generated on: ${new Date().toLocaleString()}</p>
+              <p>Full Transactions Ledger Report</p>
+              <p style="font-size: 11px; color: #94a3b8; margin-top: 8px;">Generated on: ${new Date().toLocaleString()}</p>
             </div>
           </div>
+
           <table>
             <thead>
               <tr>
                 <th>Date</th>
                 <th>Tenant Name</th>
-                <th>Ref/Code</th>
+                <th>Ref Code</th>
                 <th>Type</th>
-                <th>Amount Received</th>
+                <th>Amount</th>
                 <th>Status</th>
               </tr>
             </thead>
@@ -287,28 +446,28 @@ export default function App() {
                 <tr>
                   <td>${new Date(p.date).toLocaleDateString()}</td>
                   <td><strong>${p.tenantName}</strong></td>
-                  <td>${p.messageCode || 'N/A'}</td>
-                  <td>${p.type}</td>
-                  <td><strong>${formatKes(p.amount)}</strong></td>
-                  <td><span class="badge">${p.status}</span></td>
+                  <td style="font-family: monospace;">${p.messageCode || 'N/A'}</td>
+                  <td>${p.type === 'COMBINED' ? 'Rent & Water' : p.type}</td>
+                  <td style="font-family: monospace; font-weight: bold; font-size: 14px;">${formatKes(p.amount)}</td>
+                  <td><span class="badge ${p.status === 'CONFIRMED' ? 'badge-confirmed' : ''}">${p.status}</span></td>
                 </tr>
               `).join('')}
             </tbody>
           </table>
+
           <div class="footer">
             <p>&copy; ${new Date().getFullYear()} Ruiru Rentals. All rights reserved.</p>
-            <p>@Gikunju creates</p>
+            <p style="margin-top: 10px; font-weight: bold; color: #cbd5e1; font-size: 10px;">@Gikunju creates</p>
           </div>
         </body>
       </html>
     `;
     printWindow.document.write(html);
     printWindow.document.close();
-    setTimeout(() => printWindow.print(), 300);
+    setTimeout(() => printWindow.print(), 500);
   };
 
   // --- REBUILT IMMUNE CRUD OPERATIONS ---
-
   const handleAddHouse = async (e) => {
     e.preventDefault();
     if (!user || isProcessing) return;
@@ -727,6 +886,27 @@ export default function App() {
               {isProcessing ? <div className="animate-spin rounded-full h-5 w-5 border-2 border-white border-t-transparent"></div> : 'Verify Credentials & Sign In'}
             </button>
           </form>
+
+          {/* SECURE GOOGLE SINGLE-SIGN ON (SSO) ACCESS POINT */}
+          <div className="mt-5 border-t border-gray-800 pt-5 text-center">
+            <p className="text-gray-500 text-[10px] uppercase font-bold tracking-widest mb-3">Or connect instantly via SSO</p>
+            <button 
+              type="button"
+              onClick={handleGoogleSignIn}
+              disabled={isProcessing}
+              className="w-full bg-slate-950 border border-gray-800 text-gray-300 hover:text-white hover:bg-slate-900 hover:border-gray-700 font-bold py-3 rounded-xl transition-all flex items-center justify-center gap-3 text-sm"
+            >
+              <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" width="24" height="24" xmlns="http://www.w3.org/2000/svg">
+                <g transform="matrix(1, 0, 0, 1, 0, 0)">
+                  <path d="M21.35,11.1H12v2.7h5.38c-0.24,1.28 -0.96,2.37 -2.04,3.1v2.58h3.3c1.93,-1.78 3.04,-4.4 3.04,-7.48C21.68,11.78 21.56,11.4 21.35,11.1z" fill="#4285F4" />
+                  <path d="M12,20.9c2.43,0 4.47,-0.8 5.96,-2.18l-3.3,-2.58c-0.92,0.62 -2.1,0.98 -3.6,0.98 -2.77,0 -5.11,-1.87 -5.95,-4.38H1.67v2.67C3.15,18.3 7.27,20.9 12,20.9z" fill="#34A853" />
+                  <path d="M6.05,12.74a5.27,5.27,0,0,1,0,-3.48V6.59H1.67a8.91,8.91,0,0,0,0,8.82l4.38,-2.67z" fill="#FBBC05" />
+                  <path d="M12,5.18c1.32,0 2.5,0.45 3.44,1.35l2.58,-2.58C16.46,2.51 14.43,1.7 12,1.7c-4.73,0 -8.85,2.6 -10.33,6.41l4.38,2.67C6.89,7.05 9.23,5.18 12,5.18z" fill="#EA4335" />
+                </g>
+              </svg>
+              Sign In with Google
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -805,7 +985,6 @@ export default function App() {
       <div className="flex-1 flex flex-col h-screen overflow-hidden">
         <main className="flex-1 p-6 md:p-8 overflow-y-auto w-full transition-all duration-300 ease-in-out flex flex-col">
           
-          {/* TAB CONTENTS */}
           <div className="flex-1">
             {activeTab === 'dashboard' && role === 'LANDLORD' && (
               <div className="space-y-6 animate-in fade-in duration-500">
@@ -813,7 +992,6 @@ export default function App() {
                   <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Landlord Finance Overview</h2>
                 </div>
                 
-                {/* RUJWASCO WATER ACCUMULATION METRICS & Deficit Alerter */}
                 {stats.waterReserve < 0 ? (
                   <div className="bg-rose-500/10 border border-rose-500/30 p-4 rounded-xl flex items-center gap-4 animate-pulse">
                     <div className="bg-rose-500/20 p-3 rounded-full text-rose-500"><AlertCircle size={24}/></div>
@@ -959,7 +1137,6 @@ export default function App() {
                             <p>Type: {house.type}</p>
                             <p>Rent Target: <strong className={`font-black text-base ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{formatKes(house.rent)}</strong></p>
                             
-                            {/* Show if an OCCUPIED house has a complaint logged */}
                             {house.repairStatus === 'NEEDS_REPAIR' && isOccupied && (
                               <div className="bg-rose-500/10 border border-rose-500/20 px-3 py-2 rounded-lg mt-3">
                                 <p className={`text-xs font-bold flex items-center gap-1.5 animate-pulse ${theme === 'dark' ? 'text-rose-400' : 'text-rose-600'}`}>
@@ -970,7 +1147,6 @@ export default function App() {
                           </div>
                         </div>
                         
-                        {/* Landlord Specific Repair Mode Toggle For Vacant Houses */}
                         {role === 'LANDLORD' && !isOccupied && (
                           <div className={`ml-2 mt-4 pt-4 border-t ${theme === 'dark' ? 'border-white/10' : 'border-black/5'}`}>
                             <button 
@@ -1260,7 +1436,6 @@ export default function App() {
             )}
           </div>
 
-          {/* ADDED FOOTER HERE */}
           <footer className={`mt-10 py-6 border-t text-center text-sm font-medium flex flex-col gap-1 items-center justify-center transition-colors ${theme === 'dark' ? 'border-slate-800 text-slate-500' : 'border-[#E8DFCE] text-gray-500'}`}>
             <p>&copy; {new Date().getFullYear()} Ruiru Rentals. All rights reserved.</p>
             <p className="text-xs opacity-70">@Gikunju creates</p>
@@ -1272,7 +1447,7 @@ export default function App() {
       {/* ================= STRICT MODALS ================= */}
       
       {modalError && (
-        <div className="fixed top-4 right-4 bg-rose-600 text-white p-4 rounded-2xl shadow-2xl z-100 flex items-center gap-3 animate-in fade-in slide-in-from-top-4 max-w-sm">
+        <div className="fixed top-4 right-4 bg-rose-600 text-white p-4 rounded-2xl shadow-2xl z-[100] flex items-center gap-3 animate-in fade-in slide-in-from-top-4 max-w-sm">
           <AlertCircle size={24}/>
           <div className="flex-1">
             <p className="text-sm font-bold">Operation Issue</p>
@@ -1367,7 +1542,7 @@ export default function App() {
       )}
 
       {isEditTenantModalOpen && selectedTenantForDetails && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-70 backdrop-blur-sm transition-opacity" onClick={() => closeAnyModal(setIsEditTenantModalOpen)}>
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-[70] backdrop-blur-sm transition-opacity" onClick={() => closeAnyModal(setIsEditTenantModalOpen)}>
           <div className={`rounded-3xl w-full max-w-md p-7 shadow-2xl animate-in fade-in zoom-in-95 duration-200 ${theme === 'dark' ? 'bg-slate-900 text-white border border-slate-800' : 'bg-[#FDFBF7] text-gray-900 border border-[#E8DFCE]'}`} onClick={e => e.stopPropagation()}>
             <div className="flex justify-between items-center mb-6">
               <h3 className="text-xl font-bold">Edit Tenant Details</h3>
