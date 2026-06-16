@@ -18,7 +18,17 @@ import {
   GoogleAuthProvider,
   signInWithPopup
 } from 'firebase/auth';
-import { getFirestore, collection, onSnapshot, doc, setDoc, addDoc, updateDoc, deleteDoc } from 'firebase/firestore';
+import { 
+  getFirestore, 
+  collection, 
+  onSnapshot, 
+  doc, 
+  setDoc, 
+  addDoc, 
+  updateDoc, 
+  deleteDoc,
+  enableIndexedDbPersistence 
+} from 'firebase/firestore';
 
 // --- FIREBASE SETUP ---
 const firebaseConfig = {
@@ -34,6 +44,13 @@ const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
 const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = "hse-app-b1d2b"; 
+
+// FORCE FRESH DATA SYNC
+enableIndexedDbPersistence(db).catch((err) => {
+    if (err.code === 'failed-precondition') {
+        console.warn("Persistence failed: Multiple tabs open.");
+    }
+});
 
 // --- CONFIGURE YOUR EMAILS AND ROLES HERE ---
 const LANDLORD_EMAIL = "pngikunju671@gmail.com";
@@ -138,17 +155,40 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    console.log("DEBUG: Connection effect triggered. User exists:", !!user);
     if (!user) return;
+    
     const getColRef = (colName) => collection(db, 'artifacts', appId, 'public', 'data', colName);
 
-    const unsubHouses = onSnapshot(getColRef('houses'), (snap) => setHouses(snap.docs.map(d => ({ id: d.id, ...d.data() }))), console.error);
-    const unsubTenants = onSnapshot(getColRef('tenants'), (snap) => setTenants(snap.docs.map(d => ({ id: d.id, ...d.data() }))), console.error);
-    const unsubPayments = onSnapshot(getColRef('payments'), (snap) => setPayments(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date))), console.error);
-    const unsubRepairs = onSnapshot(getColRef('repairs'), (snap) => setRepairs(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date))), console.error);
-    const unsubSeptic = onSnapshot(getColRef('septicLogs'), (snap) => setSepticLogs(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date))), console.error);
-    const unsubWaterBills = onSnapshot(getColRef('masterWaterBills'), (snap) => setMasterWaterBills(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date))), console.error);
+    const unsubHouses = onSnapshot(getColRef('houses'), (snap) => {
+        console.log("SYNC CHECK: Houses update received. Documents:", snap.size);
+        setHouses(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    }, (err) => console.error("Snapshot Error (Houses):", err));
 
-    return () => { unsubHouses(); unsubTenants(); unsubPayments(); unsubRepairs(); unsubSeptic(); unsubWaterBills(); };
+    const unsubTenants = onSnapshot(getColRef('tenants'), (snap) => {
+        setTenants(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    }, console.error);
+
+    const unsubPayments = onSnapshot(getColRef('payments'), (snap) => {
+        setPayments(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
+    }, console.error);
+
+    const unsubRepairs = onSnapshot(getColRef('repairs'), (snap) => {
+        setRepairs(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
+    }, console.error);
+
+    const unsubSeptic = onSnapshot(getColRef('septicLogs'), (snap) => {
+        setSepticLogs(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
+    }, console.error);
+
+    const unsubWaterBills = onSnapshot(getColRef('masterWaterBills'), (snap) => {
+        setMasterWaterBills(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
+    }, console.error);
+
+    return () => { 
+        unsubHouses(); unsubTenants(); unsubPayments(); 
+        unsubRepairs(); unsubSeptic(); unsubWaterBills(); 
+    };
   }, [user]);
 
   // Derived occupancies
@@ -1447,7 +1487,7 @@ export default function App() {
       {/* ================= STRICT MODALS ================= */}
       
       {modalError && (
-        <div className="fixed top-4 right-4 bg-rose-600 text-white p-4 rounded-2xl shadow-2xl z-[100] flex items-center gap-3 animate-in fade-in slide-in-from-top-4 max-w-sm">
+        <div className="fixed top-4 right-4 bg-rose-600 text-white p-4 rounded-2xl shadow-2xl z-100 flex items-center gap-3 animate-in fade-in slide-in-from-top-4 max-w-sm">
           <AlertCircle size={24}/>
           <div className="flex-1">
             <p className="text-sm font-bold">Operation Issue</p>
@@ -1542,7 +1582,7 @@ export default function App() {
       )}
 
       {isEditTenantModalOpen && selectedTenantForDetails && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-[70] backdrop-blur-sm transition-opacity" onClick={() => closeAnyModal(setIsEditTenantModalOpen)}>
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-70 backdrop-blur-sm transition-opacity" onClick={() => closeAnyModal(setIsEditTenantModalOpen)}>
           <div className={`rounded-3xl w-full max-w-md p-7 shadow-2xl animate-in fade-in zoom-in-95 duration-200 ${theme === 'dark' ? 'bg-slate-900 text-white border border-slate-800' : 'bg-[#FDFBF7] text-gray-900 border border-[#E8DFCE]'}`} onClick={e => e.stopPropagation()}>
             <div className="flex justify-between items-center mb-6">
               <h3 className="text-xl font-bold">Edit Tenant Details</h3>
