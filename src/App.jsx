@@ -162,7 +162,14 @@ export default function App() {
 
     const unsubHouses = onSnapshot(getColRef('houses'), (snap) => {
         console.log("SYNC CHECK: Houses update received. Documents:", snap.size);
-        setHouses(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+        const fetchedHouses = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        
+        // Natural alphanumeric sort (e.g., "House 2" comes before "House 10")
+        fetchedHouses.sort((a, b) => 
+            (a.name || '').localeCompare((b.name || ''), undefined, { numeric: true, sensitivity: 'base' })
+        );
+        
+        setHouses(fetchedHouses);
     }, (err) => console.error("Snapshot Error (Houses):", err));
 
     const unsubTenants = onSnapshot(getColRef('tenants'), (snap) => {
