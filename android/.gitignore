@@ -2,6 +2,7 @@
 
 # Built application files
 *.apk
+!app/release/Ruiru-Rentals.apk
 *.aar
 *.ap_
 *.aab
