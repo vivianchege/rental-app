@@ -80,6 +80,13 @@ service cloud.firestore {
       return managerCollectionAllowed(collectionName) || collectionName == 'auditLogs';
     }
 
+    function landlordCanWrite(resourceData, requestedData) {
+      return isLandlord() &&
+        (sameWorkspace(resourceData) || (isLegacyLandlord() && legacyRecord(resourceData))) &&
+        (sameWorkspace(requestedData) || (isLegacyLandlord() && legacyRecord(requestedData))) &&
+        requestedData.updatedBy == request.auth.uid;
+    }
+
     match /users/{userId} {
       // A user may read their own role profile. Landlords may read manager profiles.
       allow read: if signedIn() && (request.auth.uid == userId || isLandlord());
@@ -113,11 +120,9 @@ service cloud.firestore {
         request.resource.data.createdBy == request.auth.uid;
 
       // Updates are allowed only to an authenticated actor. Normal UI workflows use
-      // archival/status changes instead of deleting financial records.
-      allow update: if isLandlord() &&
-        (sameWorkspace(resource.data) || (isLegacyLandlord() && legacyRecord(resource.data))) &&
-        (sameWorkspace(request.resource.data) || (isLegacyLandlord() && legacyRecord(request.resource.data))) &&
-        request.resource.data.updatedBy == request.auth.uid;
+      // archival/status changes instead of deleting financial records. This covers
+      // tenant archival, releasing its house, and water-vault reset metadata.
+      allow update: if landlordCanWrite(resource.data, request.resource.data);
 
       allow update: if isManager() &&
         managerCollectionAllowed(collectionName) &&

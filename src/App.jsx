@@ -1,12 +1,12 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { 
   Users, Home, Wallet, Wrench, LayoutDashboard, LogOut, 
   CheckCircle2, Plus, AlertCircle, Phone, X, ShieldCheck,
   Check, Clock, FileText, Calendar, Edit, Info, Coins, ListOrdered,
   Droplet, Truck, Sun, Moon, BellRing, Menu,
   Eye, EyeOff, Download, Search, ReceiptText, FileBarChart,
-  Settings, ShieldAlert, Bell, Building2, Activity,
-  SlidersHorizontal, Database, ArrowUpRight
+  Settings, Bell, Building2, Activity,
+  SlidersHorizontal, Database, ArrowUpRight, RotateCcw
 } from 'lucide-react';
 import { allocatePayment, parseMoney } from './lib/money';
 import { hasPermission, normalizeRole, PERMISSIONS, ROLES } from './lib/permissions';
@@ -55,6 +55,7 @@ const appId = firebaseConfig.projectId || 'house-management-portal';
 const DEFAULT_CURRENCY = import.meta.env.VITE_DEFAULT_CURRENCY || 'KES';
 const DEFAULT_TIMEZONE = import.meta.env.VITE_DEFAULT_TIMEZONE || 'Africa/Nairobi';
 const DEFAULT_WORKSPACE_ID = import.meta.env.VITE_DEFAULT_WORKSPACE_ID || 'main-workspace';
+const compareNatural = (left, right) => String(left || '').localeCompare(String(right || ''), undefined, { numeric: true, sensitivity: 'base' });
 
 // Temporary compatibility bridge for the existing live accounts. Create users/{uid}
 // profiles and remove this bridge after the migration is complete.
@@ -92,11 +93,9 @@ export default function App() {
   const [role, setRole] = useState(null);
   const [userProfile, setUserProfile] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard');
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => Boolean(auth));
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [globalSearch, setGlobalSearch] = useState('');
-  const [dataError, setDataError] = useState('');
-
   // Global states for errors and visual loading states
   const [isProcessing, setIsProcessing] = useState(false);
   const [modalError, setModalError] = useState('');
@@ -106,7 +105,7 @@ export default function App() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
-  const [loginError, setLoginError] = useState('');
+  const [loginError, setLoginError] = useState(() => auth ? '' : 'The portal is not configured yet. Add the Firebase values from .env.example.');
   const [showWelcomeScreen, setShowWelcomeScreen] = useState(false);
 
   // Live Database States
@@ -116,6 +115,7 @@ export default function App() {
   const [repairs, setRepairs] = useState([]);
   const [septicLogs, setSepticLogs] = useState([]);
   const [masterWaterBills, setMasterWaterBills] = useState([]);
+  const [waterVaultResets, setWaterVaultResets] = useState([]);
   const [expenses, setExpenses] = useState([]);
   const [activityLogs, setActivityLogs] = useState([]);
   const [notifications, setNotifications] = useState([]);
@@ -148,8 +148,6 @@ export default function App() {
   // from a protected profile/custom claim instead of a hard-coded email allowlist.
   useEffect(() => {
     if (!auth) {
-      setLoading(false);
-      setLoginError('The portal is not configured yet. Add the Firebase values from .env.example.');
       return undefined;
     }
 
@@ -201,22 +199,22 @@ export default function App() {
 
   useEffect(() => {
     if (!user || !db) return undefined;
-    setDataError('');
     
     const getColRef = (colName) => {
       const ref = collection(db, 'artifacts', appId, 'public', 'data', colName);
       const isLegacyManager = role === ROLES.MANAGER && LEGACY_ROLE_BY_UID[user?.uid] === ROLES.MANAGER;
       return role === ROLES.MANAGER && !isLegacyManager ? query(ref, where('workspaceId', '==', workspaceId)) : ref;
     };
-    const handleSnapshotError = () => setDataError('Some records could not be loaded. Check your connection or access permissions.');
+    // Individual subscriptions can fail for legacy records or during a brief
+    // offline period. Keep the rest of the portal usable without blocking the UI
+    // with a generic global error banner.
+    const handleSnapshotError = () => {};
 
     const unsubHouses = onSnapshot(getColRef('houses'), (snap) => {
         const fetchedHouses = snap.docs.map(d => ({ id: d.id, ...d.data() }));
         
         // Natural alphanumeric sort (e.g., "House 2" comes before "House 10")
-        fetchedHouses.sort((a, b) => 
-            (a.name || '').localeCompare((b.name || ''), undefined, { numeric: true, sensitivity: 'base' })
-        );
+        fetchedHouses.sort((a, b) => compareNatural(a.name, b.name));
         
         setHouses(fetchedHouses);
     }, handleSnapshotError);
@@ -241,6 +239,12 @@ export default function App() {
       setMasterWaterBills(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
     }, handleSnapshotError);
 
+    const unsubWaterVaultResets = role === ROLES.LANDLORD
+      ? onSnapshot(getColRef('waterVaultResets'), (snap) => {
+        setWaterVaultResets(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
+      }, handleSnapshotError)
+      : () => {};
+
     const unsubExpenses = onSnapshot(getColRef('expenses'), (snap) => {
       setExpenses(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
     }, handleSnapshotError);
@@ -257,7 +261,7 @@ export default function App() {
 
     return () => { 
       unsubHouses(); unsubTenants(); unsubPayments();
-      unsubRepairs(); unsubSeptic(); unsubWaterBills(); unsubExpenses();
+      unsubRepairs(); unsubSeptic(); unsubWaterBills(); unsubWaterVaultResets(); unsubExpenses();
       unsubActivity(); unsubNotifications();
     };
   }, [user, role, workspaceId]);
@@ -272,16 +276,21 @@ export default function App() {
 
   const recordAudit = async (action, entity, entityId, metadata = {}) => {
     if (!db || !user) return;
-    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'auditLogs'), {
-      ...recordDefaults(),
-      action,
-      entity,
-      entityId,
-      actorId: user.uid,
-      actorRole: role,
-      timestamp: new Date().toISOString(),
-      metadata,
-    });
+    try {
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'auditLogs'), {
+        ...recordDefaults(),
+        action,
+        entity,
+        entityId,
+        actorId: user.uid,
+        actorRole: role,
+        timestamp: new Date().toISOString(),
+        metadata,
+      });
+    } catch {
+      // Audit availability must never make the underlying user action appear
+      // to fail, especially during logout or legacy-record migration.
+    }
   };
 
   // Handle standard email password sign in
@@ -348,16 +357,30 @@ export default function App() {
   };
 
   const handleLogout = async () => {
+    setLoginError('');
     try {
       if (db && user) {
-        await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'auditLogs'), {
-          ...recordDefaults(), actorId: user.uid, actorRole: role, action: 'LOGOUT', entity: 'session', entityId: user.uid, timestamp: new Date().toISOString()
-        });
+        try {
+          await promiseTimeout(addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'auditLogs'), {
+            ...recordDefaults(), actorId: user.uid, actorRole: role, action: 'LOGOUT', entity: 'session', entityId: user.uid, timestamp: new Date().toISOString()
+          }), 2500);
+        } catch {
+          // Signing out must not depend on the audit collection being writable.
+        }
       }
-      if (auth) await signOut(auth);
-      setRole(null);
-      setUserProfile(null);
-    } catch { setLoginError('Unable to sign out cleanly.'); }
+    } finally {
+      try {
+        if (auth) await signOut(auth);
+      } catch {
+        setLoginError('Unable to contact Firebase, but this session has been cleared from the portal.');
+      } finally {
+        setUser(null);
+        setRole(null);
+        setUserProfile(null);
+        setSelectedTenant(null);
+        setSelectedTenantForDetails(null);
+      }
+    }
   };
 
   const closeAnyModal = (setter) => {
@@ -904,6 +927,32 @@ export default function App() {
     } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
+  const handleResetWaterVault = async () => {
+    if (!user || !db || role !== ROLES.LANDLORD || isProcessing) return;
+    if (!window.confirm('Reset the water vault for a new tracking period? Existing payments and provider bills will remain available in history.')) return;
+    setIsProcessing(true);
+    setModalError('');
+    try {
+      const date = new Date().toISOString();
+      const created = await promiseTimeout(addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'waterVaultResets'), {
+        ...recordDefaults(),
+        date,
+        collectedWaterAtReset: stats.totalWaterCollectedAllTime,
+        providerBillsAtReset: stats.totalMasterWaterBills,
+        reason: 'MANUAL_RESET',
+        createdAt: date,
+      }), 5000);
+      await recordAudit('WATER_VAULT_RESET', 'water_vault', created.id, {
+        collectedWaterAtReset: stats.totalWaterCollectedAllTime,
+        providerBillsAtReset: stats.totalMasterWaterBills,
+      });
+    } catch (err) {
+      setModalError(err.message || 'Could not reset the water vault.');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
   const handleUpdateBills = async (e) => {
     e.preventDefault();
     if (!user || !db || !selectedTenant || isProcessing) return;
@@ -932,17 +981,29 @@ export default function App() {
            const tenantRef = doc(db, 'artifacts', appId, 'public', 'data', 'tenants', tenant.id);
            const tenantSnapshot = await transaction.get(tenantRef);
            if (!tenantSnapshot.exists()) throw new Error('Tenant record no longer exists.');
-           transaction.update(tenantRef, { status: 'ARCHIVED', archivedAt: new Date().toISOString(), archivedBy: user.uid, updatedBy: user.uid });
-           if (tenant.houseId) transaction.update(doc(db, 'artifacts', appId, 'public', 'data', 'houses', tenant.houseId), { status: 'VACANT', updatedBy: user.uid, updatedAt: new Date().toISOString() });
+           const currentTenant = tenantSnapshot.data();
+           if (currentTenant.status === 'ARCHIVED' || currentTenant.archivedAt) throw new Error('This tenant has already been archived.');
+           const houseRef = currentTenant.houseId ? doc(db, 'artifacts', appId, 'public', 'data', 'houses', currentTenant.houseId) : null;
+           const houseSnapshot = houseRef ? await transaction.get(houseRef) : null;
+           if (houseRef && !houseSnapshot.exists()) throw new Error('The tenant’s house unit no longer exists.');
+           const now = new Date().toISOString();
+           transaction.update(tenantRef, { status: 'ARCHIVED', archivedAt: now, archivedBy: user.uid, updatedBy: user.uid, updatedAt: now });
+           if (houseRef) {
+             transaction.update(houseRef, { status: 'VACANT', updatedBy: user.uid, updatedAt: now });
+           }
          }), 5000);
          await recordAudit('TENANT_ARCHIVED', 'tenant', tenant.id, { houseId: tenant.houseId });
          setSelectedTenantForDetails(null);
-       } catch (err) { setModalError(err.message || 'Could not archive tenant safely.'); } finally { setIsProcessing(false); }
+       } catch (err) {
+         setModalError(err?.code === 'permission-denied'
+           ? 'Firebase denied this landlord action. Publish the current Firestore rules and confirm this account is the landlord account.'
+           : (err.message || 'Could not archive tenant safely.'));
+       } finally { setIsProcessing(false); }
     }
   };
 
   // --- REBUILT ACCOUNTING MATH ENGINE ---
-  const stats = useMemo(() => {
+  const stats = (() => {
     let collectedRentRev = 0, collectedWaterRev = 0, totalJosephBonus = 0, pendingPaymentsCount = 0;
     let totalRepairExpenses = 0, totalSepticExpenses = 0, totalMasterWaterBills = 0;
 
@@ -969,14 +1030,18 @@ export default function App() {
     repairs.forEach(r => { if (r.status === 'RESOLVED' && r.cost) totalRepairExpenses += r.cost; });
     septicLogs.forEach(s => { if (s.cost) totalSepticExpenses += s.cost; });
     masterWaterBills.forEach(m => { if (m.amount) totalMasterWaterBills += m.amount; });
-    const waterReserve = collectedWaterRev - totalMasterWaterBills;
+    const latestWaterVaultReset = waterVaultResets[0];
+    const collectedWaterSinceReset = Math.max(0, collectedWaterRev - Number(latestWaterVaultReset?.collectedWaterAtReset || 0));
+    const providerBillsSinceReset = Math.max(0, totalMasterWaterBills - Number(latestWaterVaultReset?.providerBillsAtReset || 0));
+    const waterReserve = collectedWaterSinceReset - providerBillsSinceReset;
     const occupiedUnits = houses.filter(h => h.status === 'OCCUPIED' || occupiedHouseIds.has(h.id)).length;
     const totalOperatingExpensesWithRecords = totalRepairExpenses + totalSepticExpenses + expenses
       .filter(expense => expense.status !== 'REJECTED')
       .reduce((sum, expense) => sum + Number(expense.amount || 0), 0);
 
     return {
-      expectedRentRev, collectedRentRev, expectedWaterRev, collectedWaterRev,
+      expectedRentRev, collectedRentRev, expectedWaterRev, collectedWaterRev: collectedWaterSinceReset,
+      totalWaterCollectedAllTime: collectedWaterRev, totalWaterBillsSinceReset: providerBillsSinceReset,
       pendingPaymentsCount, totalJosephBonus, totalOperatingExpenses: totalOperatingExpensesWithRecords, totalMasterWaterBills, waterReserve,
       vacantHouses: houses.filter(h => h.status === 'VACANT' && !occupiedHouseIds.has(h.id)).length,
       openRepairs: repairs.filter(r => r.status === 'OPEN').length,
@@ -984,7 +1049,7 @@ export default function App() {
       occupancyRate: houses.length ? Math.round((occupiedUnits / houses.length) * 100) : 0,
       netOperatingResult: collectedRentRev - totalOperatingExpensesWithRecords,
     };
-  }, [activeTenants, houses, repairs, payments, septicLogs, masterWaterBills, expenses, occupiedHouseIds]);
+  })();
 
   const tenantPaymentHistory = useMemo(() => {
     if (!selectedTenant) return [];
@@ -992,6 +1057,8 @@ export default function App() {
   }, [selectedTenant, payments]);
 
   const normalizedSearch = globalSearch.trim().toLowerCase();
+  const houseNameById = useMemo(() => new Map(houses.map(house => [house.id, house.name || ''])), [houses]);
+  const tenantById = useMemo(() => new Map(activeTenants.map(tenant => [tenant.id, tenant])), [activeTenants]);
   const filteredHouses = useMemo(() => houses.filter(house => !normalizedSearch || `${house.name} ${house.type}`.toLowerCase().includes(normalizedSearch)), [houses, normalizedSearch]);
   const filteredTenants = useMemo(() => activeTenants.filter(tenant => {
     const house = houses.find(h => h.id === tenant.houseId);
@@ -999,6 +1066,14 @@ export default function App() {
   }), [activeTenants, houses, normalizedSearch]);
   const filteredPayments = useMemo(() => payments.filter(payment => !normalizedSearch || `${payment.tenantName} ${payment.messageCode || ''} ${payment.type} ${payment.method}`.toLowerCase().includes(normalizedSearch)), [payments, normalizedSearch]);
   const filteredRepairs = useMemo(() => repairs.filter(repair => !normalizedSearch || `${repair.description} ${houses.find(h => h.id === repair.houseId)?.name || ''}`.toLowerCase().includes(normalizedSearch)), [repairs, houses, normalizedSearch]);
+  const sortedHouses = useMemo(() => [...filteredHouses].sort((a, b) => compareNatural(a.name, b.name)), [filteredHouses]);
+  const sortedTenants = useMemo(() => [...filteredTenants].sort((a, b) => (
+    compareNatural(houseNameById.get(a.houseId), houseNameById.get(b.houseId)) || compareNatural(a.name, b.name)
+  )), [filteredTenants, houseNameById]);
+  const sortedPayments = useMemo(() => [...filteredPayments].sort((a, b) => (
+    compareNatural(houseNameById.get(tenantById.get(a.tenantId)?.houseId), houseNameById.get(tenantById.get(b.tenantId)?.houseId)) ||
+    (new Date(b.date) - new Date(a.date))
+  )), [filteredPayments, houseNameById, tenantById]);
 
   const can = (permission) => hasPermission(role, permission, userProfile?.permissions);
   const paymentMethods = userProfile?.paymentMethods || ['M-Pesa', 'Bank Transfer', 'Cash', 'Other'];
@@ -1219,8 +1294,6 @@ export default function App() {
             </div>
           </header>
 
-          {dataError && <div className={`mb-6 flex items-start gap-3 p-3 rounded-lg border text-sm ${theme === 'dark' ? 'border-amber-700/50 bg-amber-950/30 text-amber-300' : 'border-amber-200 bg-amber-50 text-amber-800'}`} role="status"><ShieldAlert size={18} className="mt-0.5 shrink-0" /><span>{dataError}</span></div>}
-          
           <div className="flex-1">
             {activeTab === 'dashboard' && role === 'LANDLORD' && (
               <div className="space-y-6 animate-in fade-in duration-500">
@@ -1239,13 +1312,13 @@ export default function App() {
                       </p>
                     </div>
                   </div>
-                ) : stats.totalMasterWaterBills > 0 ? (
+                ) : stats.totalWaterBillsSinceReset > 0 ? (
                   <div className="bg-emerald-500/10 border border-emerald-500/30 p-4 rounded-xl flex items-center gap-4">
                     <div className={`bg-emerald-500/20 p-3 rounded-full ${theme === 'dark' ? 'text-emerald-500' : 'text-emerald-600'}`}><BellRing size={24}/></div>
                     <div className="flex-1">
                       <h4 className={`font-bold ${theme === 'dark' ? 'text-emerald-400' : 'text-emerald-700'}`}>Water Settle Target Met!</h4>
                       <p className={`text-sm ${theme === 'dark' ? 'text-emerald-500' : 'text-emerald-800'}`}>
-                        The needed water bills of <strong className="font-mono">{formatKes(stats.totalMasterWaterBills)}</strong> are fully accumulated inside the vault! 
+                        The needed water bills of <strong className="font-mono">{formatKes(stats.totalWaterBillsSinceReset)}</strong> are fully accumulated inside the vault!
                         Current accumulated water funds: <strong className="font-mono">{formatKes(stats.collectedWaterRev)}</strong>. (Remaining Surplus: <strong className="font-mono">{formatKes(stats.waterReserve)}</strong>).
                       </p>
                     </div>
@@ -1266,7 +1339,7 @@ export default function App() {
                   <div className={`p-6 rounded-2xl border shadow-sm transition-all duration-300 hover:-translate-y-1 hover:shadow-lg ${theme === 'dark' ? 'bg-emerald-950/20 border-emerald-800' : 'bg-emerald-50/50 border-emerald-200'}`}>
                     <p className={`text-sm font-bold mb-1 ${theme === 'dark' ? 'text-emerald-500' : 'text-emerald-700'}`}>Total Rent Collected</p>
                     <h3 className={`text-2xl font-extrabold ${theme === 'dark' ? 'text-emerald-400' : 'text-emerald-600'}`}>{formatKes(stats.collectedRentRev)}</h3>
-                    <p className={`text-[10px] mt-1 font-bold ${theme === 'dark' ? 'text-emerald-500' : 'text-emerald-700'}`}>All-Time Expected: {formatKes(stats.expectedRentRev)}</p>
+                    <p className={`text-[10px] mt-1 font-bold ${theme === 'dark' ? 'text-emerald-500' : 'text-emerald-700'}`}>Total areas: {stats.totalUnits}</p>
                   </div>
 
                   <div className={`p-6 rounded-2xl border shadow-sm flex flex-col justify-between transition-all duration-300 hover:-translate-y-1 hover:shadow-lg ${theme === 'dark' ? 'bg-cyan-950/20 border-cyan-800' : 'bg-cyan-50/50 border-cyan-200'}`}>
@@ -1277,9 +1350,14 @@ export default function App() {
                       <h3 className={`text-2xl font-extrabold ${theme === 'dark' ? 'text-cyan-300' : 'text-cyan-500'}`}>{formatKes(stats.collectedWaterRev)}</h3>
                     </div>
                     <div className={`mt-3 pt-3 border-t ${theme === 'dark' ? 'border-cyan-900/40' : 'border-cyan-200'}`}>
-                      <button onClick={() => { setModalError(''); setIsWaterBillModalOpen(true); }} className={`w-full text-white text-[10px] font-bold py-2 rounded-lg transition ${theme === 'dark' ? 'bg-cyan-600 hover:bg-cyan-700' : 'bg-cyan-700 hover:bg-cyan-800'}`}>
-                        Log RUJWASCO Invoice
-                      </button>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button onClick={() => { setModalError(''); setIsWaterBillModalOpen(true); }} className={`w-full text-white text-[10px] font-bold py-2 rounded-lg transition ${theme === 'dark' ? 'bg-cyan-600 hover:bg-cyan-700' : 'bg-cyan-700 hover:bg-cyan-800'}`}>
+                          Log Invoice
+                        </button>
+                        <button onClick={handleResetWaterVault} disabled={isProcessing} className={`w-full text-[10px] font-bold py-2 rounded-lg border transition disabled:opacity-50 flex items-center justify-center gap-1 ${theme === 'dark' ? 'text-cyan-200 border-cyan-700 hover:bg-cyan-900/40' : 'text-cyan-800 border-cyan-300 hover:bg-cyan-100'}`}>
+                          <RotateCcw size={12}/> Reset Vault
+                        </button>
+                      </div>
                     </div>
                   </div>
 
@@ -1380,7 +1458,7 @@ export default function App() {
 
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
                   {houses.length === 0 && <p className="text-gray-500 font-medium">No houses registered yet.</p>}
-                  {filteredHouses.map(house => {
+                  {sortedHouses.map(house => {
                     const isVacant = house.status === 'VACANT' && !occupiedHouseIds.has(house.id);
                     const isUnderRepair = house.status === 'UNDER_REPAIR';
                     const isOccupied = house.status === 'OCCUPIED' || occupiedHouseIds.has(house.id);
@@ -1451,7 +1529,7 @@ export default function App() {
                       {tenants.length === 0 && (
                         <tr><td colSpan="4" className="p-8 text-center text-gray-500 font-medium">No tenants registered.</td></tr>
                       )}
-                      {filteredTenants.map(tenant => {
+                      {sortedTenants.map(tenant => {
                         const house = houses.find(h => h.id === tenant.houseId);
                         const owesMoney = (tenant.expectedRent - tenant.paidRent) > 0 || (tenant.expectedWater - tenant.paidWater) > 0;
                         return (
@@ -1480,7 +1558,7 @@ export default function App() {
                 <div>
                   <h3 className="text-lg font-bold mb-4 font-mono uppercase tracking-wider text-gray-500">Tenant Billing Profiles</h3>
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                    {filteredTenants.map(tenant => {
+                    {sortedTenants.map(tenant => {
                       const house = houses.find(h => h.id === tenant.houseId);
                       const rentBal = (tenant.expectedRent || 0) - (tenant.paidRent || 0);
                       const waterBal = (tenant.expectedWater || 0) - (tenant.paidWater || 0);
@@ -1588,7 +1666,7 @@ export default function App() {
                         {payments.length === 0 && (
                           <tr><td colSpan="7" className="p-8 text-center text-gray-500 font-medium">No payments recorded.</td></tr>
                         )}
-                        {filteredPayments.map(payment => (
+                        {sortedPayments.map(payment => (
                           <tr key={payment.id} className={`transition ${theme === 'dark' ? 'hover:bg-slate-950/40' : 'hover:bg-[#FDFBF7]'}`}>
                             <td className="p-4 text-gray-500 font-medium">{new Date(payment.date).toLocaleDateString()}</td>
                             <td className={`p-4 font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{payment.tenantName}</td>
@@ -1626,8 +1704,8 @@ export default function App() {
 
             {activeTab === 'utilities' && (
               <div className="space-y-6">
-                <div><p className="text-sm text-gray-500">Water provider invoices and collection coverage.</p><h3 className={`text-xl font-semibold mt-1 ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Utilities</h3></div>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-3"><div className={`p-4 border rounded-lg ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}><p className="text-xs text-gray-500">Tenant water collected</p><p className="text-2xl font-semibold mt-1">{formatKes(stats.collectedWaterRev)}</p></div><div className={`p-4 border rounded-lg ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}><p className="text-xs text-gray-500">Provider bills</p><p className="text-2xl font-semibold mt-1">{formatKes(stats.totalMasterWaterBills)}</p></div><div className={`p-4 border rounded-lg ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}><p className="text-xs text-gray-500">Unallocated reserve</p><p className={`text-2xl font-semibold mt-1 ${stats.waterReserve < 0 ? 'text-rose-700 dark:text-rose-400' : 'text-emerald-700 dark:text-emerald-400'}`}>{formatKes(stats.waterReserve)}</p></div></div>
+                <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3"><div><p className="text-sm text-gray-500">Water provider invoices and collection coverage.</p><h3 className={`text-xl font-semibold mt-1 ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Utilities</h3></div>{role === ROLES.LANDLORD && <button onClick={handleResetWaterVault} disabled={isProcessing} className={`px-4 py-2 rounded-lg text-sm font-semibold border flex items-center gap-2 disabled:opacity-50 ${theme === 'dark' ? 'border-cyan-800 text-cyan-300 hover:bg-cyan-950/40' : 'border-cyan-300 text-cyan-800 hover:bg-cyan-50'}`}><RotateCcw size={15}/> Reset water vault</button>}</div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3"><div className={`p-4 border rounded-lg ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}><p className="text-xs text-gray-500">Tenant water collected</p><p className="text-2xl font-semibold mt-1">{formatKes(stats.collectedWaterRev)}</p></div><div className={`p-4 border rounded-lg ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}><p className="text-xs text-gray-500">Provider bills this period</p><p className="text-2xl font-semibold mt-1">{formatKes(stats.totalWaterBillsSinceReset)}</p></div><div className={`p-4 border rounded-lg ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}><p className="text-xs text-gray-500">Unallocated reserve</p><p className={`text-2xl font-semibold mt-1 ${stats.waterReserve < 0 ? 'text-rose-700 dark:text-rose-400' : 'text-emerald-700 dark:text-emerald-400'}`}>{formatKes(stats.waterReserve)}</p></div></div>
                 <div className={`border rounded-lg overflow-hidden ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}><div className="p-4 border-b border-inherit flex items-center justify-between"><h3 className="font-semibold">Provider bills</h3>{role === ROLES.LANDLORD && <button onClick={() => setIsWaterBillModalOpen(true)} className="text-sm text-amber-700 dark:text-amber-400 font-semibold">Log bill</button>}</div><div className="overflow-x-auto"><table className="w-full text-left text-sm"><thead className={`${theme === 'dark' ? 'bg-[#111111] text-[#A3A3A3]' : 'bg-[#F7F7F5] text-gray-500'}`}><tr><th className="p-3">Billing period</th><th className="p-3">Amount</th><th className="p-3">Recorded</th></tr></thead><tbody className="divide-y divide-inherit">{masterWaterBills.length === 0 ? <tr><td colSpan="3" className="p-8 text-center text-gray-500">No utility bills have been logged yet.</td></tr> : masterWaterBills.map(bill => <tr key={bill.id}><td className="p-3 font-medium">{bill.month}</td><td className="p-3 font-semibold">{formatKes(bill.amount)}</td><td className="p-3 text-gray-500">{bill.date ? new Date(bill.date).toLocaleDateString() : '—'}</td></tr>)}</tbody></table></div></div>
               </div>
             )}
