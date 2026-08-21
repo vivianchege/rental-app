@@ -27,6 +27,10 @@ service cloud.firestore {
       ];
     }
 
+    function isLegacyAccount() {
+      return isLegacyLandlord() || isLegacyManager();
+    }
+
     function profile() {
       return get(profilePath()).data;
     }
@@ -49,8 +53,8 @@ service cloud.firestore {
 
     function sameWorkspace(data) {
       return data.workspaceId is string && (
-        (hasProfile() && profile().workspaceId is string && data.workspaceId == profile().workspaceId) ||
-        ((isLegacyLandlord() || isLegacyManager()) && data.workspaceId == 'main-workspace')
+        (isLegacyAccount() && data.workspaceId == 'main-workspace') ||
+        (!isLegacyAccount() && hasProfile() && profile().workspaceId is string && data.workspaceId == profile().workspaceId)
       );
     }
 
@@ -59,7 +63,7 @@ service cloud.firestore {
     }
 
     function legacyRecord(data) {
-      return !(data.workspaceId is string) && (isLegacyLandlord() || isLegacyManager());
+      return isLegacyAccount() && (!(data.workspaceId is string) || data.workspaceId == 'main-workspace');
     }
 
     function managerCollectionAllowed(collectionName) {

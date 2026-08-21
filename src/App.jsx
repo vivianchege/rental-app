@@ -137,7 +137,10 @@ export default function App() {
   const [selectedTenant, setSelectedTenant] = useState(null); 
   const [selectedTenantForDetails, setSelectedTenantForDetails] = useState(null); 
   const [selectedRepair, setSelectedRepair] = useState(null); 
-  const workspaceId = userProfile?.workspaceId || (LEGACY_ROLE_BY_UID[user?.uid] ? DEFAULT_WORKSPACE_ID : user?.uid || '');
+  // The three existing production accounts belong to the original single
+  // workspace. Keep their scope stable even if an old users/{uid} profile has
+  // a stale or incompatible workspaceId value.
+  const workspaceId = LEGACY_ROLE_BY_UID[user?.uid] ? DEFAULT_WORKSPACE_ID : userProfile?.workspaceId || user?.uid || '';
 
   useEffect(() => {
     localStorage.setItem('ruiru_theme', theme);
@@ -162,7 +165,11 @@ export default function App() {
           if (!resolvedRole) throw new Error('Account permissions could not be verified.');
 
           setUser(currentUser);
-          setUserProfile({ ...profile, uid: currentUser.uid, workspaceId: profile.workspaceId || (LEGACY_ROLE_BY_UID[currentUser.uid] ? DEFAULT_WORKSPACE_ID : profile.workspaceId) });
+          setUserProfile({
+            ...profile,
+            uid: currentUser.uid,
+            workspaceId: LEGACY_ROLE_BY_UID[currentUser.uid] ? DEFAULT_WORKSPACE_ID : profile.workspaceId,
+          });
           setRole(resolvedRole);
           setActiveTab('dashboard');
           if (db) {
