@@ -1,0 +1,131 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function profilePath() {
+      return /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+
+    function hasProfile() {
+      return signedIn() && exists(profilePath());
+    }
+
+    // Temporary compatibility bridge for the existing live accounts. Remove these
+    // UID checks after creating users/{uid} role profiles for all three accounts.
+    function isLegacyLandlord() {
+      return signedIn() && request.auth.uid == 'b4HMBcL0WXT3Qg2vunj5ITZOVb72';
+    }
+
+    function isLegacyManager() {
+      return signedIn() && request.auth.uid in [
+        'CG6wl2NaTcdLHyGlXHk4w9eCU653',
+        'N8wEpIJvUZRmD6WoYYxqpUiiLhj2'
+      ];
+    }
+
+    function profile() {
+      return get(profilePath()).data;
+    }
+
+    function isLandlord() {
+      return signedIn() && (
+        request.auth.token.role == 'LANDLORD' ||
+        isLegacyLandlord() ||
+        (hasProfile() && profile().role == 'LANDLORD')
+      );
+    }
+
+    function isManager() {
+      return signedIn() && (
+        request.auth.token.role == 'MANAGER' ||
+        isLegacyManager() ||
+        (hasProfile() && profile().role == 'MANAGER')
+      );
+    }
+
+    function sameWorkspace(data) {
+      return data.workspaceId is string && (
+        (hasProfile() && profile().workspaceId is string && data.workspaceId == profile().workspaceId) ||
+        ((isLegacyLandlord() || isLegacyManager()) && data.workspaceId == 'main-workspace')
+      );
+    }
+
+    function landlordCanAccess(data) {
+      return isLandlord() && (!(data.workspaceId is string) || sameWorkspace(data));
+    }
+
+    function legacyRecord(data) {
+      return !(data.workspaceId is string) && (isLegacyLandlord() || isLegacyManager());
+    }
+
+    function managerCollectionAllowed(collectionName) {
+      return collectionName in [
+        'houses',
+        'tenants',
+        'payments',
+        'repairs',
+        'septicLogs',
+        'masterWaterBills',
+        'expenses',
+        'notifications',
+        'paymentReferences'
+      ];
+    }
+
+    function managerCanCreate(collectionName) {
+      return managerCollectionAllowed(collectionName) || collectionName == 'auditLogs';
+    }
+
+    match /users/{userId} {
+      // A user may read their own role profile. Landlords may read manager profiles.
+      allow read: if signedIn() && (request.auth.uid == userId || isLandlord());
+
+      // A landlord may provision/update managers, but cannot create or promote another landlord.
+      allow create, update: if isLandlord() &&
+        request.resource.data.role == 'MANAGER' &&
+        request.resource.data.workspaceId is string;
+
+      allow delete: if false;
+    }
+
+    match /artifacts/{appId}/public/data/{collectionName}/{recordId} {
+      // Landlords can read all records in their authenticated workspace.
+      // Managers only receive operational/collection data, never audit history or settings.
+      allow read: if landlordCanAccess(resource.data) || (
+        isManager() &&
+        managerCollectionAllowed(collectionName) &&
+        (sameWorkspace(resource.data) || (isLegacyManager() && legacyRecord(resource.data)))
+      );
+
+      // Every new record must identify its workspace and creating user.
+      allow create: if isLandlord() &&
+        sameWorkspace(request.resource.data) &&
+        request.resource.data.createdBy == request.auth.uid &&
+        request.resource.data.workspaceId is string;
+
+      allow create: if isManager() &&
+        managerCanCreate(collectionName) &&
+        sameWorkspace(request.resource.data) &&
+        request.resource.data.createdBy == request.auth.uid;
+
+      // Updates are allowed only to an authenticated actor. Normal UI workflows use
+      // archival/status changes instead of deleting financial records.
+      allow update: if isLandlord() &&
+        (sameWorkspace(resource.data) || (isLegacyLandlord() && legacyRecord(resource.data))) &&
+        (sameWorkspace(request.resource.data) || (isLegacyLandlord() && legacyRecord(request.resource.data))) &&
+        request.resource.data.updatedBy == request.auth.uid;
+
+      allow update: if isManager() &&
+        managerCollectionAllowed(collectionName) &&
+        (sameWorkspace(resource.data) || (isLegacyManager() && legacyRecord(resource.data))) &&
+        (sameWorkspace(request.resource.data) || (isLegacyManager() && legacyRecord(request.resource.data))) &&
+        request.resource.data.updatedBy == request.auth.uid;
+
+      allow delete: if false;
+    }
+  }
+}

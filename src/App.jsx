@@ -1,11 +1,15 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { 
   Users, Home, Wallet, Wrench, LayoutDashboard, LogOut, 
-  CheckCircle2, Plus, AlertCircle, Phone, X, ShieldCheck, UserCog, 
+  CheckCircle2, Plus, AlertCircle, Phone, X, ShieldCheck,
   Check, Clock, FileText, Calendar, Edit, Info, Coins, ListOrdered,
-  Droplet, Truck, Sun, Moon, BellRing, ChevronRight, Menu,
-  Eye, EyeOff, Download
+  Droplet, Truck, Sun, Moon, BellRing, Menu,
+  Eye, EyeOff, Download, Search, ReceiptText, FileBarChart,
+  Settings, ShieldAlert, Bell, Building2, Activity,
+  SlidersHorizontal, Database, ArrowUpRight
 } from 'lucide-react';
+import { allocatePayment, parseMoney } from './lib/money';
+import { hasPermission, normalizeRole, PERMISSIONS, ROLES } from './lib/permissions';
 
 // --- FIREBASE IMPORTS ---
 import { initializeApp, getApps, getApp } from 'firebase/app';
@@ -15,6 +19,7 @@ import {
   onAuthStateChanged, 
   signOut, 
   sendPasswordResetEmail,
+  getIdTokenResult,
   GoogleAuthProvider,
   signInWithPopup
 } from 'firebase/auth';
@@ -23,44 +28,48 @@ import {
   collection, 
   onSnapshot, 
   doc, 
-  setDoc, 
   addDoc, 
   updateDoc, 
-  deleteDoc,
+  getDoc,
+  runTransaction,
+  query,
+  where,
   enableIndexedDbPersistence 
 } from 'firebase/firestore';
 
 // --- FIREBASE SETUP ---
 const firebaseConfig = {
-  apiKey: "AIzaSyB4ng6GdlLHnFj-ht0UbWGQi-PfHkM_4jE",
-  authDomain: "hse-app-b1d2b.firebaseapp.com",
-  projectId: "hse-app-b1d2b",
-  storageBucket: "hse-app-b1d2b.firebasestorage.app",
-  messagingSenderId: "385727030262",
-  appId: "1:385727030262:web:07a4728292a2d1d3905dd7"
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY || '',
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || '',
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || '',
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || '',
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || '',
+  appId: import.meta.env.VITE_FIREBASE_APP_ID || ''
 };
 
-const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
-const auth = getAuth(app);
-const db = getFirestore(app);
-const appId = "hse-app-b1d2b"; 
+const isFirebaseConfigured = Object.values(firebaseConfig).every(Boolean);
+const app = isFirebaseConfigured ? (getApps().length === 0 ? initializeApp(firebaseConfig) : getApp()) : null;
+const auth = app ? getAuth(app) : null;
+const db = app ? getFirestore(app) : null;
+const appId = firebaseConfig.projectId || 'house-management-portal';
+const DEFAULT_CURRENCY = import.meta.env.VITE_DEFAULT_CURRENCY || 'KES';
+const DEFAULT_TIMEZONE = import.meta.env.VITE_DEFAULT_TIMEZONE || 'Africa/Nairobi';
+const DEFAULT_WORKSPACE_ID = import.meta.env.VITE_DEFAULT_WORKSPACE_ID || 'main-workspace';
+
+// Temporary compatibility bridge for the existing live accounts. Create users/{uid}
+// profiles and remove this bridge after the migration is complete.
+const LEGACY_ROLE_BY_UID = {
+  [import.meta.env.VITE_LEGACY_LANDLORD_UID || 'b4HMBcL0WXT3Qg2vunj5ITZOVb72']: ROLES.LANDLORD,
+  [import.meta.env.VITE_LEGACY_MANAGER_UID_1 || 'CG6wl2NaTcdLHyGlXHk4w9eCU653']: ROLES.MANAGER,
+  [import.meta.env.VITE_LEGACY_MANAGER_UID_2 || 'N8wEpIJvUZRmD6WoYYxqpUiiLhj2']: ROLES.MANAGER,
+};
 
 // FORCE FRESH DATA SYNC
-enableIndexedDbPersistence(db).catch((err) => {
-    if (err.code === 'failed-precondition') {
-        console.warn("Persistence failed: Multiple tabs open.");
-    }
-});
-
-// --- CONFIGURE YOUR EMAILS AND ROLES HERE ---
-const LANDLORD_EMAIL = "pngikunju671@gmail.com";
-const LANDLORD_UID = "b4HMBcL0WXT3Qg2vunj5ITZOVb72";
-
-// Add approved manager emails here. Anyone logging in via Google must be in this list to access the Manager Portal!
-const AUTHORIZED_MANAGERS = [
-  "nganga137peter@gmail.com",
-  "josephmalkovich99@gmail.com"
-];
+if (db) {
+  enableIndexedDbPersistence(db).catch(() => {
+    // Offline persistence is optional. The live session remains usable when another tab owns the cache.
+  });
+}
 
 // Safe database timeout wrapper to prevent sandbox freezes
 const promiseTimeout = (promise, ms = 15000) => {
@@ -70,13 +79,23 @@ const promiseTimeout = (promise, ms = 15000) => {
   ]);
 };
 
+const escapeHtml = (value) => String(value ?? '')
+  .replaceAll('&', '&amp;')
+  .replaceAll('<', '&lt;')
+  .replaceAll('>', '&gt;')
+  .replaceAll('"', '&quot;')
+  .replaceAll("'", '&#039;');
+
 export default function App() {
   const [theme, setTheme] = useState(() => localStorage.getItem('ruiru_theme') || 'light');
   const [user, setUser] = useState(null);
   const [role, setRole] = useState(null);
+  const [userProfile, setUserProfile] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [loading, setLoading] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [globalSearch, setGlobalSearch] = useState('');
+  const [dataError, setDataError] = useState('');
 
   // Global states for errors and visual loading states
   const [isProcessing, setIsProcessing] = useState(false);
@@ -97,6 +116,9 @@ export default function App() {
   const [repairs, setRepairs] = useState([]);
   const [septicLogs, setSepticLogs] = useState([]);
   const [masterWaterBills, setMasterWaterBills] = useState([]);
+  const [expenses, setExpenses] = useState([]);
+  const [activityLogs, setActivityLogs] = useState([]);
+  const [notifications, setNotifications] = useState([]);
 
   // Modals Visibility Controllers
   const [isHouseModalOpen, setIsHouseModalOpen] = useState(false);
@@ -109,45 +131,68 @@ export default function App() {
   const [isSepticModalOpen, setIsSepticModalOpen] = useState(false);
   const [isWaterBillModalOpen, setIsWaterBillModalOpen] = useState(false);
   const [isEditTenantModalOpen, setIsEditTenantModalOpen] = useState(false);
+  const [isExpenseModalOpen, setIsExpenseModalOpen] = useState(false);
   
   // Selection Targets
   const [selectedTenant, setSelectedTenant] = useState(null); 
   const [selectedTenantForDetails, setSelectedTenantForDetails] = useState(null); 
   const [selectedRepair, setSelectedRepair] = useState(null); 
+  const workspaceId = userProfile?.workspaceId || (LEGACY_ROLE_BY_UID[user?.uid] ? DEFAULT_WORKSPACE_ID : user?.uid || '');
 
   useEffect(() => {
     localStorage.setItem('ruiru_theme', theme);
+    document.documentElement.dataset.theme = theme;
   }, [theme]);
 
-  // Auth state listener with strict post-authentication email guards
+  // Authentication is intentionally role-agnostic in the client. The role is resolved
+  // from a protected profile/custom claim instead of a hard-coded email allowlist.
   useEffect(() => {
+    if (!auth) {
+      setLoading(false);
+      setLoginError('The portal is not configured yet. Add the Firebase values from .env.example.');
+      return undefined;
+    }
+
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       if (currentUser) {
-        const userEmail = currentUser.email?.toLowerCase();
-        const isLandlord = userEmail === LANDLORD_EMAIL.toLowerCase() || currentUser.uid === LANDLORD_UID;
-        const isAuthorizedManager = AUTHORIZED_MANAGERS.map(e => e.toLowerCase()).includes(userEmail);
+        try {
+          const token = await getIdTokenResult(currentUser);
+          const profileSnapshot = db ? await getDoc(doc(db, 'users', currentUser.uid)) : null;
+          const profile = profileSnapshot?.exists() ? profileSnapshot.data() : {};
+          const resolvedRole = normalizeRole(token.claims.role || profile.role || LEGACY_ROLE_BY_UID[currentUser.uid]);
 
-        if (isLandlord) {
+          if (!resolvedRole) throw new Error('Account permissions could not be verified.');
+
           setUser(currentUser);
-          setRole('LANDLORD');
+          setUserProfile({ ...profile, uid: currentUser.uid, workspaceId: profile.workspaceId || (LEGACY_ROLE_BY_UID[currentUser.uid] ? DEFAULT_WORKSPACE_ID : profile.workspaceId) });
+          setRole(resolvedRole);
           setActiveTab('dashboard');
+          if (db) {
+            void addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'auditLogs'), {
+              workspaceId: profile.workspaceId || (LEGACY_ROLE_BY_UID[currentUser.uid] ? DEFAULT_WORKSPACE_ID : currentUser.uid),
+              createdBy: currentUser.uid,
+              updatedBy: currentUser.uid,
+              actorId: currentUser.uid,
+              actorRole: resolvedRole,
+              action: 'LOGIN',
+              entity: 'session',
+              entityId: currentUser.uid,
+              timestamp: new Date().toISOString(),
+            });
+          }
           setLoading(false);
-        } else if (isAuthorizedManager) {
-          setUser(currentUser);
-          setRole('MANAGER');
-          setActiveTab('houses');
-          setLoading(false);
-        } else {
-          // If authenticated but email is not on whitelist, force logout and flag access error
-          setLoginError("Unauthorized Access: This Google account or email is not whitelisted.");
+        } catch {
+          setLoginError('Your Firebase account was found, but it has no verified portal role. Create a users/{UID} profile with role LANDLORD or MANAGER, then sign in again.');
           await signOut(auth);
           setUser(null);
           setRole(null);
+          setUserProfile(null);
           setLoading(false);
         }
       } else {
         setUser(null);
         setRole(null);
+        setUserProfile(null);
         setLoading(false);
       }
     });
@@ -155,13 +200,17 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    console.log("DEBUG: Connection effect triggered. User exists:", !!user);
-    if (!user) return;
+    if (!user || !db) return undefined;
+    setDataError('');
     
-    const getColRef = (colName) => collection(db, 'artifacts', appId, 'public', 'data', colName);
+    const getColRef = (colName) => {
+      const ref = collection(db, 'artifacts', appId, 'public', 'data', colName);
+      const isLegacyManager = role === ROLES.MANAGER && LEGACY_ROLE_BY_UID[user?.uid] === ROLES.MANAGER;
+      return role === ROLES.MANAGER && !isLegacyManager ? query(ref, where('workspaceId', '==', workspaceId)) : ref;
+    };
+    const handleSnapshotError = () => setDataError('Some records could not be loaded. Check your connection or access permissions.');
 
     const unsubHouses = onSnapshot(getColRef('houses'), (snap) => {
-        console.log("SYNC CHECK: Houses update received. Documents:", snap.size);
         const fetchedHouses = snap.docs.map(d => ({ id: d.id, ...d.data() }));
         
         // Natural alphanumeric sort (e.g., "House 2" comes before "House 10")
@@ -170,53 +219,85 @@ export default function App() {
         );
         
         setHouses(fetchedHouses);
-    }, (err) => console.error("Snapshot Error (Houses):", err));
+    }, handleSnapshotError);
 
     const unsubTenants = onSnapshot(getColRef('tenants'), (snap) => {
         setTenants(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    }, console.error);
+    }, handleSnapshotError);
 
     const unsubPayments = onSnapshot(getColRef('payments'), (snap) => {
-        setPayments(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
-    }, console.error);
+      setPayments(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
+    }, handleSnapshotError);
 
     const unsubRepairs = onSnapshot(getColRef('repairs'), (snap) => {
-        setRepairs(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
-    }, console.error);
+      setRepairs(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
+    }, handleSnapshotError);
 
     const unsubSeptic = onSnapshot(getColRef('septicLogs'), (snap) => {
-        setSepticLogs(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
-    }, console.error);
+      setSepticLogs(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
+    }, handleSnapshotError);
 
     const unsubWaterBills = onSnapshot(getColRef('masterWaterBills'), (snap) => {
-        setMasterWaterBills(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
-    }, console.error);
+      setMasterWaterBills(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
+    }, handleSnapshotError);
+
+    const unsubExpenses = onSnapshot(getColRef('expenses'), (snap) => {
+      setExpenses(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
+    }, handleSnapshotError);
+
+    const unsubActivity = role === ROLES.LANDLORD
+      ? onSnapshot(getColRef('auditLogs'), (snap) => {
+        setActivityLogs(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)));
+      }, handleSnapshotError)
+      : () => {};
+
+    const unsubNotifications = onSnapshot(getColRef('notifications'), (snap) => {
+      setNotifications(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)));
+    }, handleSnapshotError);
 
     return () => { 
-        unsubHouses(); unsubTenants(); unsubPayments(); 
-        unsubRepairs(); unsubSeptic(); unsubWaterBills(); 
+      unsubHouses(); unsubTenants(); unsubPayments();
+      unsubRepairs(); unsubSeptic(); unsubWaterBills(); unsubExpenses();
+      unsubActivity(); unsubNotifications();
     };
-  }, [user]);
+  }, [user, role, workspaceId]);
 
   // Derived occupancies
+  const activeTenants = useMemo(() => tenants.filter(t => t.status !== 'ARCHIVED' && !t.archivedAt), [tenants]);
   const occupiedHouseIds = useMemo(() => {
-    return new Set(tenants.map(t => t.houseId).filter(Boolean));
-  }, [tenants]);
+    return new Set(activeTenants.map(t => t.houseId).filter(Boolean));
+  }, [activeTenants]);
+
+  const recordDefaults = () => ({ workspaceId, createdBy: user?.uid || '', updatedBy: user?.uid || '' });
+
+  const recordAudit = async (action, entity, entityId, metadata = {}) => {
+    if (!db || !user) return;
+    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'auditLogs'), {
+      ...recordDefaults(),
+      action,
+      entity,
+      entityId,
+      actorId: user.uid,
+      actorRole: role,
+      timestamp: new Date().toISOString(),
+      metadata,
+    });
+  };
 
   // Handle standard email password sign in
   const handleLoginSubmit = async (e) => {
     e.preventDefault();
     setLoginError('');
-    if (loginTab === 'landlord' && email.trim().toLowerCase() !== LANDLORD_EMAIL.toLowerCase()) {
-      setLoginError("Please use Super Admin's email to login.");
+    if (!auth) {
+      setLoginError('The portal is not configured yet. Add the Firebase values from .env.example.');
       return;
     }
     setIsProcessing(true);
     try {
       await signInWithEmailAndPassword(auth, email, password);
       triggerWelcome();
-    } catch (error) {
-      setLoginError(error.message.replace("Firebase: ", ""));
+    } catch {
+      setLoginError('Invalid credentials.');
     } finally {
       setIsProcessing(false);
     }
@@ -225,21 +306,17 @@ export default function App() {
   // Google Single-Sign On (SSO) Popup handler
   const handleGoogleSignIn = async () => {
     setLoginError('');
+    if (!auth) {
+      setLoginError('The portal is not configured yet. Add the Firebase values from .env.example.');
+      return;
+    }
     setIsProcessing(true);
     const provider = new GoogleAuthProvider();
     try {
-      const result = await signInWithPopup(auth, provider);
-      const loggedEmail = result.user.email?.toLowerCase();
-      
-      const isLandlord = loggedEmail === LANDLORD_EMAIL.toLowerCase();
-      const isAuthorizedManager = AUTHORIZED_MANAGERS.map(e => e.toLowerCase()).includes(loggedEmail);
-      
-      if (!isLandlord && !isAuthorizedManager) {
-        throw new Error("Access Denied: This email is not registered inside Ruiru Rentals database.");
-      }
+      await signInWithPopup(auth, provider);
       triggerWelcome();
-    } catch (error) {
-      setLoginError(error.message.replace("Firebase: ", ""));
+    } catch {
+      setLoginError('Invalid credentials.');
       await signOut(auth);
     } finally {
       setIsProcessing(false);
@@ -254,23 +331,33 @@ export default function App() {
   };
 
   const handleForgotPassword = async () => {
-    if (!email) {
-      setLoginError("Please enter your email address above first to reset your password.");
+    if (!auth || !email) {
+      setLoginError('If an account matches that address, a reset link will be sent.');
       return;
     }
     setIsProcessing(true);
     try {
       await sendPasswordResetEmail(auth, email);
-      setLoginError("Password reset email sent! Please check your inbox.");
-    } catch (error) {
-      setLoginError(error.message.replace("Firebase: ", ""));
+      setLoginError('If an account matches that address, a reset link will be sent.');
+    } catch {
+      // Do not disclose whether the email exists.
+      setLoginError('If an account matches that address, a reset link will be sent.');
     } finally {
       setIsProcessing(false);
     }
   };
 
   const handleLogout = async () => {
-    try { await signOut(auth); setRole(null); } catch (error) { console.error(error); }
+    try {
+      if (db && user) {
+        await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'auditLogs'), {
+          ...recordDefaults(), actorId: user.uid, actorRole: role, action: 'LOGOUT', entity: 'session', entityId: user.uid, timestamp: new Date().toISOString()
+        });
+      }
+      if (auth) await signOut(auth);
+      setRole(null);
+      setUserProfile(null);
+    } catch { setLoginError('Unable to sign out cleanly.'); }
   };
 
   const closeAnyModal = (setter) => {
@@ -278,11 +365,19 @@ export default function App() {
     setModalError('');
   };
 
-  const formatKes = (amount) => `KES ${Number(amount || 0).toLocaleString('en-KE')}`;
+  const formatKes = (amount) => new Intl.NumberFormat('en-KE', {
+    style: 'currency',
+    currency: DEFAULT_CURRENCY,
+    maximumFractionDigits: 2,
+  }).format(Number(amount || 0));
 
   // --- PROFESSIONAL PDF / PRINTING ENGINE ---
   const printReceipt = (payment, tenant) => {
     const printWindow = window.open('', '_blank');
+    if (!printWindow) {
+      setModalError('Allow pop-ups to print a receipt.');
+      return;
+    }
     const house = houses.find(h => h.id === tenant.houseId);
     const houseName = house ? house.name : 'Unassigned';
     
@@ -293,7 +388,7 @@ export default function App() {
       <!DOCTYPE html>
       <html>
         <head>
-          <title>Receipt - ${payment.messageCode || 'N/A'}</title>
+          <title>Receipt - ${escapeHtml(payment.messageCode || 'N/A')}</title>
           <style>
             @media print {
               body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
@@ -388,15 +483,15 @@ export default function App() {
           <div class="details">
             <div>
               <strong>Tenant Details:</strong><br/>
-              Name: <span style="font-weight: 600;">${tenant.name}</span><br/>
-              Unit/House: <span style="font-weight: 800; color: #0f172a;">${houseName}</span><br/>
-              Phone: ${tenant.phone}
+              Name: <span style="font-weight: 600;">${escapeHtml(tenant.name)}</span><br/>
+              Unit/House: <span style="font-weight: 800; color: #0f172a;">${escapeHtml(houseName)}</span><br/>
+              Phone: ${escapeHtml(tenant.phone)}
             </div>
             <div style="text-align: right;">
               <strong>Transaction Info:</strong><br/>
               Date: <span style="font-weight: 600;">${new Date(payment.date).toLocaleString()}</span><br/>
-              Method: ${payment.method}<br/>
-              Ref Code: <span style="font-family: monospace; font-weight: bold; background: #f1f5f9; padding: 2px 6px; border-radius: 4px;">${payment.messageCode || 'N/A'}</span>
+              Method: ${escapeHtml(payment.method)}<br/>
+              Ref Code: <span style="font-family: monospace; font-weight: bold; background: #f1f5f9; padding: 2px 6px; border-radius: 4px;">${escapeHtml(payment.messageCode || 'N/A')}</span>
             </div>
           </div>
 
@@ -409,7 +504,7 @@ export default function App() {
             </thead>
             <tbody>
               <tr>
-                <td>${payment.type === 'COMBINED' ? 'Rent & Water Combined Payment' : payment.type + ' Payment'}</td>
+                <td>${escapeHtml(payment.type === 'COMBINED' ? 'Rent & Water Combined Payment' : payment.type + ' Payment')}</td>
                 <td style="text-align: right; font-family: monospace; font-weight: bold; font-size: 16px;">${formatKes(payment.amount)}</td>
               </tr>
             </tbody>
@@ -430,6 +525,10 @@ export default function App() {
 
   const printLedgerReport = () => {
     const printWindow = window.open('', '_blank');
+    if (!printWindow) {
+      setModalError('Allow pop-ups to print the ledger.');
+      return;
+    }
     const baseUrl = window.location.origin;
 
     const html = `
@@ -492,11 +591,11 @@ export default function App() {
               ${payments.map(p => `
                 <tr>
                   <td>${new Date(p.date).toLocaleDateString()}</td>
-                  <td><strong>${p.tenantName}</strong></td>
-                  <td style="font-family: monospace;">${p.messageCode || 'N/A'}</td>
-                  <td>${p.type === 'COMBINED' ? 'Rent & Water' : p.type}</td>
+                  <td><strong>${escapeHtml(p.tenantName)}</strong></td>
+                  <td style="font-family: monospace;">${escapeHtml(p.messageCode || 'N/A')}</td>
+                  <td>${escapeHtml(p.type === 'COMBINED' ? 'Rent & Water' : p.type)}</td>
                   <td style="font-family: monospace; font-weight: bold; font-size: 14px;">${formatKes(p.amount)}</td>
-                  <td><span class="badge ${p.status === 'CONFIRMED' ? 'badge-confirmed' : ''}">${p.status}</span></td>
+                  <td><span class="badge ${p.status === 'CONFIRMED' ? 'badge-confirmed' : ''}">${escapeHtml(p.status)}</span></td>
                 </tr>
               `).join('')}
             </tbody>
@@ -517,12 +616,13 @@ export default function App() {
   // --- REBUILT IMMUNE CRUD OPERATIONS ---
   const handleAddHouse = async (e) => {
     e.preventDefault();
-    if (!user || isProcessing) return;
+    if (!user || !db || isProcessing) return;
     setIsProcessing(true);
     setModalError('');
     try {
       const formData = new FormData(e.target);
       const rawHouseName = formData.get('name').trim();
+      const rent = parseMoney(formData.get('rent'), { allowZero: true });
 
       if (!rawHouseName) throw new Error("Unit name cannot be blank.");
       if (houses.some(h => h.name.trim().toLowerCase() === rawHouseName.toLowerCase())) {
@@ -530,71 +630,94 @@ export default function App() {
       }
 
       const addPromise = addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'houses'), {
-        name: rawHouseName, type: formData.get('type'), rent: Number(formData.get('rent')),
-        status: 'VACANT', repairStatus: 'GOOD'
+        ...recordDefaults(),
+        name: rawHouseName, type: formData.get('type'), rent,
+        status: 'VACANT', repairStatus: 'GOOD', createdAt: new Date().toISOString()
       });
-      await promiseTimeout(addPromise, 5000);
+      const created = await promiseTimeout(addPromise, 5000);
+      await recordAudit('UNIT_CREATED', 'unit', created.id, { name: rawHouseName });
       closeAnyModal(setIsHouseModalOpen);
     } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
   const handleToggleHouseRepairMode = async (house) => {
-    if (!user || isProcessing) return;
+    if (!user || !db || isProcessing) return;
     setIsProcessing(true);
     try {
       const newStatus = house.status === 'UNDER_REPAIR' ? 'VACANT' : 'UNDER_REPAIR';
-      const updatePromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', house.id), { status: newStatus });
+      const updatePromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', house.id), { status: newStatus, updatedBy: user.uid, updatedAt: new Date().toISOString() });
       await promiseTimeout(updatePromise, 5000);
+      await recordAudit('UNIT_STATUS_CHANGED', 'unit', house.id, { status: newStatus });
     } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
   const handleAddTenant = async (e) => {
     e.preventDefault();
-    if (!user || isProcessing) return;
+    if (!user || !db || isProcessing) return;
     setIsProcessing(true);
     setModalError('');
     try {
       const formData = new FormData(e.target);
       const houseId = formData.get('houseId');
+      const expectedRent = parseMoney(formData.get('expectedRent'), { allowZero: true });
+      const expectedWater = parseMoney(formData.get('expectedWater'), { allowZero: true });
       
       if (!houseId) throw new Error("Please select an available vacant house unit.");
       if (occupiedHouseIds.has(houseId)) throw new Error("That house unit has just been occupied.");
 
-      const tenantPromise = addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'tenants'), {
-        name: formData.get('name'), phone: formData.get('phone'), contactPref: formData.get('contactPref'),
-        houseId: houseId, expectedRent: Number(formData.get('expectedRent')), expectedWater: Number(formData.get('expectedWater')),
-        paidRent: 0, paidWater: 0, dateEntered: new Date().toISOString()
-      });
-      await promiseTimeout(tenantPromise, 5000);
-
-      const houseUpdatePromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', houseId), { status: 'OCCUPIED' });
-      await promiseTimeout(houseUpdatePromise, 5000);
+      const tenantRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'tenants'));
+      await promiseTimeout(runTransaction(db, async (transaction) => {
+        const houseRef = doc(db, 'artifacts', appId, 'public', 'data', 'houses', houseId);
+        const houseSnapshot = await transaction.get(houseRef);
+        if (!houseSnapshot.exists() || houseSnapshot.data().status === 'ARCHIVED') throw new Error('That unit is no longer available.');
+        transaction.set(tenantRef, {
+          ...recordDefaults(),
+          name: formData.get('name').trim(), phone: formData.get('phone').trim(), contactPref: formData.get('contactPref'),
+          houseId, expectedRent, expectedWater, paidRent: 0, paidWater: 0,
+          status: 'ACTIVE', dateEntered: new Date().toISOString(), createdAt: new Date().toISOString()
+        });
+        transaction.update(houseRef, { status: 'OCCUPIED', updatedBy: user.uid, updatedAt: new Date().toISOString() });
+      }), 5000);
+      await recordAudit('TENANT_CREATED', 'tenant', tenantRef.id, { houseId });
       closeAnyModal(setIsTenantModalOpen);
     } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
   const handleEditTenant = async (e) => {
     e.preventDefault();
-    if (!user || role !== 'LANDLORD' || !selectedTenantForDetails || isProcessing) return;
+    if (!user || !db || role !== ROLES.LANDLORD || !selectedTenantForDetails || isProcessing) return;
     setIsProcessing(true);
     setModalError('');
     try {
       const formData = new FormData(e.target);
       const newHouseId = formData.get('houseId');
       const oldHouseId = selectedTenantForDetails.houseId;
+      const expectedRent = parseMoney(formData.get('expectedRent'), { allowZero: true });
+      const expectedWater = parseMoney(formData.get('expectedWater'), { allowZero: true });
 
       if (newHouseId && newHouseId !== oldHouseId) {
          if (occupiedHouseIds.has(newHouseId)) throw new Error("Target house unit is already occupied.");
-         await promiseTimeout(updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', newHouseId), { status: 'OCCUPIED' }), 5000);
-         if (oldHouseId) await promiseTimeout(updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', oldHouseId), { status: 'VACANT' }), 5000);
       }
 
-      const editPromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tenants', selectedTenantForDetails.id), {
-        name: formData.get('name'), phone: formData.get('phone'), contactPref: formData.get('contactPref'),
-        expectedRent: Number(formData.get('expectedRent')), expectedWater: Number(formData.get('expectedWater')),
-        houseId: newHouseId || oldHouseId
-      });
-      await promiseTimeout(editPromise, 5000);
+      await promiseTimeout(runTransaction(db, async (transaction) => {
+        const tenantRef = doc(db, 'artifacts', appId, 'public', 'data', 'tenants', selectedTenantForDetails.id);
+        const tenantSnapshot = await transaction.get(tenantRef);
+        if (!tenantSnapshot.exists() || tenantSnapshot.data().status === 'ARCHIVED') throw new Error('This tenant record is no longer active.');
+        if (newHouseId && newHouseId !== oldHouseId) {
+          const newHouseRef = doc(db, 'artifacts', appId, 'public', 'data', 'houses', newHouseId);
+          const oldHouseRef = oldHouseId ? doc(db, 'artifacts', appId, 'public', 'data', 'houses', oldHouseId) : null;
+          const newHouseSnapshot = await transaction.get(newHouseRef);
+          if (!newHouseSnapshot.exists() || newHouseSnapshot.data().status === 'ARCHIVED') throw new Error('Target unit is no longer available.');
+          transaction.update(newHouseRef, { status: 'OCCUPIED', updatedBy: user.uid, updatedAt: new Date().toISOString() });
+          if (oldHouseRef) transaction.update(oldHouseRef, { status: 'VACANT', updatedBy: user.uid, updatedAt: new Date().toISOString() });
+        }
+        transaction.update(tenantRef, {
+          name: formData.get('name').trim(), phone: formData.get('phone').trim(), contactPref: formData.get('contactPref'),
+          expectedRent, expectedWater, houseId: newHouseId || oldHouseId,
+          updatedBy: user.uid, updatedAt: new Date().toISOString()
+        });
+      }), 5000);
+      await recordAudit('TENANT_UPDATED', 'tenant', selectedTenantForDetails.id, { houseId: newHouseId || oldHouseId });
       closeAnyModal(setIsEditTenantModalOpen);
       setSelectedTenantForDetails(null);
     } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
@@ -602,54 +725,57 @@ export default function App() {
 
   const handleLogPayment = async (e) => {
     e.preventDefault();
-    if (!user || !selectedTenant || isProcessing) return;
+    if (!user || !db || !selectedTenant || isProcessing) return;
     setIsProcessing(true);
     setModalError('');
     try {
       const formData = new FormData(e.target);
-      const amount = Number(formData.get('amount'));
+      const amount = parseMoney(formData.get('amount'));
       const type = formData.get('type');
       const messageCode = formData.get('messageCode').trim().toUpperCase();
       const method = formData.get('method');
 
-      if (messageCode && messageCode !== 'CASH' && messageCode !== 'N/A') {
-        if (payments.some(p => p.messageCode?.toUpperCase() === messageCode)) {
-          throw new Error(`Transaction reference "${messageCode}" has already been processed.`);
-        }
-      }
+      const paymentRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'payments'));
+      const referenceRef = messageCode && method !== 'CASH' && messageCode !== 'N/A'
+        ? doc(db, 'artifacts', appId, 'public', 'data', 'paymentReferences', encodeURIComponent(messageCode))
+        : null;
+      const isConfirmed = role === ROLES.LANDLORD;
 
-      const rentArrears = Math.max(0, selectedTenant.expectedRent - selectedTenant.paidRent);
-      const waterArrears = Math.max(0, selectedTenant.expectedWater - selectedTenant.paidWater);
+      await promiseTimeout(runTransaction(db, async (transaction) => {
+        const tenantRef = doc(db, 'artifacts', appId, 'public', 'data', 'tenants', selectedTenant.id);
+        const tenantSnapshot = await transaction.get(tenantRef);
+        const referenceSnapshot = referenceRef ? await transaction.get(referenceRef) : null;
+        if (!tenantSnapshot.exists() || tenantSnapshot.data().status === 'ARCHIVED') throw new Error('This tenant record is no longer active.');
+        if (referenceSnapshot?.exists()) throw new Error('That payment reference has already been recorded.');
 
-      let appliedRent = 0; let appliedWater = 0; let excessAmount = 0;
-
-      if (type === 'RENT') {
-        appliedRent = Math.min(amount, rentArrears); excessAmount = amount - appliedRent;
-      } else if (type === 'WATER') {
-        appliedWater = Math.min(amount, waterArrears); excessAmount = amount - appliedWater;
-      } else if (type === 'COMBINED') {
-        appliedRent = Math.min(amount, rentArrears);
-        const remainingAfterRent = amount - appliedRent;
-        appliedWater = Math.min(remainingAfterRent, waterArrears);
-        excessAmount = remainingAfterRent - appliedWater;
-      }
-
-      const isConfirmed = role === 'LANDLORD';
-
-      const paymentPromise = addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'payments'), {
-        tenantId: selectedTenant.id, tenantName: selectedTenant.name,
-        amount, appliedRent, appliedWater, excessAmount, type, method, messageCode,
-        status: isConfirmed ? 'CONFIRMED' : 'PENDING',
-        date: new Date().toISOString(), loggedBy: role
-      });
-      await promiseTimeout(paymentPromise, 5000);
-
-      if (isConfirmed) {
-        const updateBalancePromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tenants', selectedTenant.id), { 
-          paidRent: selectedTenant.paidRent + appliedRent, paidWater: selectedTenant.paidWater + appliedWater
+        const currentTenant = tenantSnapshot.data();
+        const allocation = allocatePayment(
+          amount,
+          type,
+          Number(currentTenant.expectedRent || 0) - Number(currentTenant.paidRent || 0),
+          Number(currentTenant.expectedWater || 0) - Number(currentTenant.paidWater || 0)
+        );
+        const now = new Date().toISOString();
+        transaction.set(paymentRef, {
+          ...recordDefaults(),
+          tenantId: selectedTenant.id, tenantName: currentTenant.name,
+          amount, appliedRent: isConfirmed ? allocation.appliedRent : 0,
+          appliedWater: isConfirmed ? allocation.appliedWater : 0,
+          excessAmount: isConfirmed ? allocation.excessAmount : 0,
+          pendingAllocation: isConfirmed ? null : allocation,
+          type, method, messageCode, status: isConfirmed ? 'CONFIRMED' : 'PENDING',
+          date: now, createdAt: now, loggedBy: role, loggedByUserId: user.uid
         });
-        await promiseTimeout(updateBalancePromise, 5000);
-      }
+        if (referenceRef) transaction.set(referenceRef, { ...recordDefaults(), paymentId: paymentRef.id, reference: messageCode, createdAt: now });
+        if (isConfirmed) {
+          transaction.update(tenantRef, {
+            paidRent: Number(currentTenant.paidRent || 0) + allocation.appliedRent,
+            paidWater: Number(currentTenant.paidWater || 0) + allocation.appliedWater,
+            updatedBy: user.uid, updatedAt: now
+          });
+        }
+      }), 5000);
+      await recordAudit('PAYMENT_RECORDED', 'payment', paymentRef.id, { tenantId: selectedTenant.id, amount, status: isConfirmed ? 'CONFIRMED' : 'PENDING' });
 
       closeAnyModal(setIsPaymentModalOpen);
       setSelectedTenant(null);
@@ -657,65 +783,92 @@ export default function App() {
   };
 
   const handleConfirmPayment = async (payment) => {
-    if (!user || role !== 'LANDLORD' || isProcessing) return;
+    if (!user || !db || role !== ROLES.LANDLORD || isProcessing) return;
     setIsProcessing(true);
     try {
-      const tenant = tenants.find(t => t.id === payment.tenantId);
-      if (!tenant) throw new Error("Tenant is no longer in the directory.");
+      const paymentRef = doc(db, 'artifacts', appId, 'public', 'data', 'payments', payment.id);
+      const tenantRef = doc(db, 'artifacts', appId, 'public', 'data', 'tenants', payment.tenantId);
+      await promiseTimeout(runTransaction(db, async (transaction) => {
+        const paymentSnapshot = await transaction.get(paymentRef);
+        const tenantSnapshot = await transaction.get(tenantRef);
+        if (!paymentSnapshot.exists() || paymentSnapshot.data().status !== 'PENDING') throw new Error('This payment has already been reviewed.');
+        if (!tenantSnapshot.exists() || tenantSnapshot.data().status === 'ARCHIVED') throw new Error('Tenant is no longer in the directory.');
+        const currentPayment = paymentSnapshot.data();
+        const currentTenant = tenantSnapshot.data();
+        const allocation = allocatePayment(
+          currentPayment.amount,
+          currentPayment.type,
+          Number(currentTenant.expectedRent || 0) - Number(currentTenant.paidRent || 0),
+          Number(currentTenant.expectedWater || 0) - Number(currentTenant.paidWater || 0)
+        );
+        const now = new Date().toISOString();
+        transaction.update(paymentRef, { status: 'CONFIRMED', ...allocation, reviewedBy: user.uid, reviewedAt: now, updatedBy: user.uid, updatedAt: now });
+        transaction.update(tenantRef, {
+          paidRent: Number(currentTenant.paidRent || 0) + allocation.appliedRent,
+          paidWater: Number(currentTenant.paidWater || 0) + allocation.appliedWater,
+          updatedBy: user.uid, updatedAt: now
+        });
+      }), 5000);
+      await recordAudit('PAYMENT_CONFIRMED', 'payment', payment.id, { tenantId: payment.tenantId, amount: payment.amount });
+    } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
+  };
 
-      const rentArrears = Math.max(0, tenant.expectedRent - tenant.paidRent);
-      const waterArrears = Math.max(0, tenant.expectedWater - tenant.paidWater);
-
-      let appliedRent = 0; let appliedWater = 0; let excessAmount = 0;
-
-      if (payment.type === 'RENT') {
-        appliedRent = Math.min(payment.amount, rentArrears); excessAmount = payment.amount - appliedRent;
-      } else if (payment.type === 'WATER') {
-        appliedWater = Math.min(payment.amount, waterArrears); excessAmount = payment.amount - appliedWater;
-      } else if (payment.type === 'COMBINED') {
-        appliedRent = Math.min(payment.amount, rentArrears);
-        const remainingAfterRent = payment.amount - appliedRent;
-        appliedWater = Math.min(remainingAfterRent, waterArrears);
-        excessAmount = remainingAfterRent - appliedWater;
-      }
-
-      const confirmPromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'payments', payment.id), { 
-        status: 'CONFIRMED', appliedRent, appliedWater, excessAmount 
-      });
-      await promiseTimeout(confirmPromise, 5000);
-
-      const balancePromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tenants', tenant.id), { 
-        paidRent: (tenant.paidRent || 0) + appliedRent, paidWater: (tenant.paidWater || 0) + appliedWater
-      });
-      await promiseTimeout(balancePromise, 5000);
-    } catch (err) { alert(err.message); } finally { setIsProcessing(false); }
+  const handleAddExpense = async (e) => {
+    e.preventDefault();
+    if (!user || !db || isProcessing) return;
+    setIsProcessing(true);
+    setModalError('');
+    try {
+      const formData = new FormData(e.target);
+      const amount = parseMoney(formData.get('amount'));
+      const date = formData.get('date') || new Date().toISOString().slice(0, 10);
+      const created = await promiseTimeout(addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'expenses'), {
+        ...recordDefaults(),
+        category: formData.get('category'), description: formData.get('description').trim(), amount,
+        date, paymentMethod: formData.get('paymentMethod'), vendor: formData.get('vendor').trim(),
+        status: role === ROLES.LANDLORD ? 'APPROVED' : 'PENDING',
+        recordedBy: user.uid, createdAt: new Date().toISOString()
+      }), 5000);
+      await recordAudit('EXPENSE_CREATED', 'expense', created.id, { amount, category: formData.get('category') });
+      closeAnyModal(setIsExpenseModalOpen);
+    } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
   const handleLogRepair = async (e) => {
     e.preventDefault();
-    if (!user || isProcessing) return;
+    if (!user || !db || isProcessing) return;
     setIsProcessing(true);
     try {
       const formData = new FormData(e.target);
       const houseId = formData.get('houseId');
       const repairPromise = addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'repairs'), {
-        description: formData.get('description'), houseId: houseId, status: 'OPEN', cost: 0,
-        date: new Date().toISOString(), loggedBy: role
+        ...recordDefaults(),
+        description: formData.get('description').trim(), houseId, status: 'OPEN', cost: 0,
+        date: new Date().toISOString(), createdAt: new Date().toISOString(), loggedBy: role, loggedByUserId: user.uid
       });
-      await promiseTimeout(repairPromise, 5000);
-      await promiseTimeout(updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', houseId), { repairStatus: 'NEEDS_REPAIR' }), 5000);
+      const created = await promiseTimeout(repairPromise, 5000);
+      await promiseTimeout(updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', houseId), { repairStatus: 'NEEDS_REPAIR', updatedBy: user.uid, updatedAt: new Date().toISOString() }), 5000);
+      await recordAudit('MAINTENANCE_CREATED', 'maintenance', created.id, { houseId });
       closeAnyModal(setIsRepairModalOpen);
     } catch(err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
   const handleResolveRepairSubmit = async (e) => {
     e.preventDefault();
-    if (!user || !selectedRepair || isProcessing) return;
+    if (!user || !db || !selectedRepair || isProcessing) return;
     setIsProcessing(true);
     try {
-      const cost = Number(new FormData(e.target).get('cost')) || 0;
-      await promiseTimeout(updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'repairs', selectedRepair.id), { status: 'RESOLVED', cost: cost, resolvedAt: new Date().toISOString() }), 5000);
-      await promiseTimeout(updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', selectedRepair.houseId), { repairStatus: 'GOOD' }), 5000);
+      const cost = parseMoney(new FormData(e.target).get('cost'), { allowZero: true });
+      const now = new Date().toISOString();
+      await promiseTimeout(runTransaction(db, async (transaction) => {
+        const repairRef = doc(db, 'artifacts', appId, 'public', 'data', 'repairs', selectedRepair.id);
+        const houseRef = doc(db, 'artifacts', appId, 'public', 'data', 'houses', selectedRepair.houseId);
+        const repairSnapshot = await transaction.get(repairRef);
+        if (!repairSnapshot.exists() || repairSnapshot.data().status !== 'OPEN') throw new Error('This maintenance ticket has already been updated.');
+        transaction.update(repairRef, { status: 'RESOLVED', cost, resolvedAt: now, updatedBy: user.uid, updatedAt: now });
+        transaction.update(houseRef, { repairStatus: 'GOOD', updatedBy: user.uid, updatedAt: now });
+      }), 5000);
+      await recordAudit('MAINTENANCE_COMPLETED', 'maintenance', selectedRepair.id, { cost });
       closeAnyModal(setIsResolveRepairModalOpen);
       setSelectedRepair(null);
     } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
@@ -723,55 +876,68 @@ export default function App() {
 
   const handleLogSeptic = async (e) => {
     e.preventDefault();
-    if (!user || isProcessing) return;
+    if (!user || !db || isProcessing) return;
     setIsProcessing(true);
     try {
       const optionRaw = new FormData(e.target).get('provider');
       const [provider, costStr] = optionRaw.split('|');
-      await promiseTimeout(addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'septicLogs'), {
-        provider: provider, cost: Number(costStr), date: new Date().toISOString(), loggedBy: role
+      const created = await promiseTimeout(addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'septicLogs'), {
+        ...recordDefaults(), provider, cost: parseMoney(costStr, { allowZero: true }), date: new Date().toISOString(), loggedBy: role
       }), 5000);
+      await recordAudit('EXPENSE_CREATED', 'septic', created.id, { provider, cost: Number(costStr) });
       closeAnyModal(setIsSepticModalOpen);
     } catch(err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
   const handleLogWaterBill = async (e) => {
     e.preventDefault();
-    if (!user || isProcessing) return;
+    if (!user || !db || isProcessing) return;
     setIsProcessing(true);
     try {
       const formData = new FormData(e.target);
-      await promiseTimeout(addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'masterWaterBills'), {
-        month: formData.get('month'), amount: Number(formData.get('amount')), date: new Date().toISOString(), loggedBy: role
+      const amount = parseMoney(formData.get('amount'));
+      const created = await promiseTimeout(addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'masterWaterBills'), {
+        ...recordDefaults(), month: formData.get('month').trim(), amount, date: new Date().toISOString(), loggedBy: role
       }), 5000);
+      await recordAudit('UTILITY_BILL_CREATED', 'utility_bill', created.id, { amount });
       closeAnyModal(setIsWaterBillModalOpen);
     } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
   const handleUpdateBills = async (e) => {
     e.preventDefault();
-    if (!user || !selectedTenant || isProcessing) return;
+    if (!user || !db || !selectedTenant || isProcessing) return;
     setIsProcessing(true);
     try {
       const formData = new FormData(e.target);
+      const addRent = parseMoney(formData.get('addRent'), { allowZero: true });
+      const addWater = parseMoney(formData.get('addWater'), { allowZero: true });
       await promiseTimeout(updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tenants', selectedTenant.id), {
-        expectedRent: selectedTenant.expectedRent + Number(formData.get('addRent')),
-        expectedWater: selectedTenant.expectedWater + Number(formData.get('addWater'))
+        expectedRent: Number(selectedTenant.expectedRent || 0) + addRent,
+        expectedWater: Number(selectedTenant.expectedWater || 0) + addWater,
+        updatedBy: user.uid, updatedAt: new Date().toISOString(), lastAdjustment: { addRent, addWater, by: user.uid, at: new Date().toISOString() }
       }), 5000);
+      await recordAudit('TENANT_CHARGES_ADJUSTED', 'tenant', selectedTenant.id, { addRent, addWater });
       closeAnyModal(setIsBillingModalOpen);
       setSelectedTenant(null);
     } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
   const handleDeleteTenant = async (tenant) => {
-    if (!user || role !== 'LANDLORD' || !tenant || isProcessing) return;
-    if (window.confirm(`Are you sure you want to completely remove tenant ${tenant.name}?`)) {
+    if (!user || !db || role !== ROLES.LANDLORD || !tenant || isProcessing) return;
+    if (window.confirm(`Archive ${tenant.name}'s record? Financial history will remain available for audit.`)) {
        setIsProcessing(true);
        try {
-         await promiseTimeout(deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tenants', tenant.id)), 5000);
-         if (tenant.houseId) await promiseTimeout(updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', tenant.houseId), { status: 'VACANT' }), 5000);
+         await promiseTimeout(runTransaction(db, async (transaction) => {
+           const tenantRef = doc(db, 'artifacts', appId, 'public', 'data', 'tenants', tenant.id);
+           const tenantSnapshot = await transaction.get(tenantRef);
+           if (!tenantSnapshot.exists()) throw new Error('Tenant record no longer exists.');
+           transaction.update(tenantRef, { status: 'ARCHIVED', archivedAt: new Date().toISOString(), archivedBy: user.uid, updatedBy: user.uid });
+           if (tenant.houseId) transaction.update(doc(db, 'artifacts', appId, 'public', 'data', 'houses', tenant.houseId), { status: 'VACANT', updatedBy: user.uid, updatedAt: new Date().toISOString() });
+         }), 5000);
+         await recordAudit('TENANT_ARCHIVED', 'tenant', tenant.id, { houseId: tenant.houseId });
          setSelectedTenantForDetails(null);
-       } catch (err) { console.error(err); alert("Could not remove tenant safely."); } finally { setIsProcessing(false); }
+       } catch (err) { setModalError(err.message || 'Could not archive tenant safely.'); } finally { setIsProcessing(false); }
     }
   };
 
@@ -790,7 +956,7 @@ export default function App() {
     });
 
     let activeRentArrears = 0, activeWaterArrears = 0;
-    tenants.forEach(t => {
+    activeTenants.forEach(t => {
       const rBal = (t.expectedRent || 0) - (t.paidRent || 0);
       const wBal = (t.expectedWater || 0) - (t.paidWater || 0);
       if (rBal > 0) activeRentArrears += rBal;
@@ -803,27 +969,52 @@ export default function App() {
     repairs.forEach(r => { if (r.status === 'RESOLVED' && r.cost) totalRepairExpenses += r.cost; });
     septicLogs.forEach(s => { if (s.cost) totalSepticExpenses += s.cost; });
     masterWaterBills.forEach(m => { if (m.amount) totalMasterWaterBills += m.amount; });
-
     const waterReserve = collectedWaterRev - totalMasterWaterBills;
-    const totalOperatingExpenses = totalRepairExpenses + totalSepticExpenses;
+    const occupiedUnits = houses.filter(h => h.status === 'OCCUPIED' || occupiedHouseIds.has(h.id)).length;
+    const totalOperatingExpensesWithRecords = totalRepairExpenses + totalSepticExpenses + expenses
+      .filter(expense => expense.status !== 'REJECTED')
+      .reduce((sum, expense) => sum + Number(expense.amount || 0), 0);
 
     return {
       expectedRentRev, collectedRentRev, expectedWaterRev, collectedWaterRev,
-      pendingPaymentsCount, totalJosephBonus, totalOperatingExpenses, totalMasterWaterBills, waterReserve,
+      pendingPaymentsCount, totalJosephBonus, totalOperatingExpenses: totalOperatingExpensesWithRecords, totalMasterWaterBills, waterReserve,
       vacantHouses: houses.filter(h => h.status === 'VACANT' && !occupiedHouseIds.has(h.id)).length,
       openRepairs: repairs.filter(r => r.status === 'OPEN').length,
-      totalRepairExpenses, totalSepticExpenses
+      totalRepairExpenses, totalSepticExpenses, totalUnits: houses.length, occupiedUnits,
+      occupancyRate: houses.length ? Math.round((occupiedUnits / houses.length) * 100) : 0,
+      netOperatingResult: collectedRentRev - totalOperatingExpensesWithRecords,
     };
-  }, [tenants, houses, repairs, payments, septicLogs, masterWaterBills, occupiedHouseIds]);
+  }, [activeTenants, houses, repairs, payments, septicLogs, masterWaterBills, expenses, occupiedHouseIds]);
 
   const tenantPaymentHistory = useMemo(() => {
     if (!selectedTenant) return [];
     return payments.filter(p => p.tenantId === selectedTenant.id && p.status === 'CONFIRMED');
   }, [selectedTenant, payments]);
 
-  const isEmailRestrictedForLandlord = useMemo(() => {
-    return loginTab === 'landlord' && email.trim() !== '' && email.trim().toLowerCase() !== LANDLORD_EMAIL.toLowerCase();
-  }, [loginTab, email]);
+  const normalizedSearch = globalSearch.trim().toLowerCase();
+  const filteredHouses = useMemo(() => houses.filter(house => !normalizedSearch || `${house.name} ${house.type}`.toLowerCase().includes(normalizedSearch)), [houses, normalizedSearch]);
+  const filteredTenants = useMemo(() => activeTenants.filter(tenant => {
+    const house = houses.find(h => h.id === tenant.houseId);
+    return !normalizedSearch || `${tenant.name} ${tenant.phone} ${house?.name || ''}`.toLowerCase().includes(normalizedSearch);
+  }), [activeTenants, houses, normalizedSearch]);
+  const filteredPayments = useMemo(() => payments.filter(payment => !normalizedSearch || `${payment.tenantName} ${payment.messageCode || ''} ${payment.type} ${payment.method}`.toLowerCase().includes(normalizedSearch)), [payments, normalizedSearch]);
+  const filteredRepairs = useMemo(() => repairs.filter(repair => !normalizedSearch || `${repair.description} ${houses.find(h => h.id === repair.houseId)?.name || ''}`.toLowerCase().includes(normalizedSearch)), [repairs, houses, normalizedSearch]);
+
+  const can = (permission) => hasPermission(role, permission, userProfile?.permissions);
+  const paymentMethods = userProfile?.paymentMethods || ['M-Pesa', 'Bank Transfer', 'Cash', 'Other'];
+
+  const navItems = [
+    { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, permission: PERMISSIONS.VIEW_DASHBOARD },
+    { id: 'houses', label: 'Houses & Units', icon: Building2, permission: PERMISSIONS.VIEW_PROPERTIES },
+    { id: 'tenants', label: 'Tenants', icon: Users, permission: PERMISSIONS.VIEW_TENANTS },
+    { id: 'billing', label: 'Rent & Payments', icon: Wallet, permission: PERMISSIONS.VIEW_RENT, badge: stats.pendingPaymentsCount },
+    { id: 'expenses', label: 'Expenses', icon: ReceiptText, permission: PERMISSIONS.VIEW_EXPENSES },
+    { id: 'repairs', label: 'Maintenance', icon: Wrench, permission: PERMISSIONS.VIEW_MAINTENANCE, badge: stats.openRepairs },
+    { id: 'utilities', label: 'Utilities', icon: Droplet, permission: PERMISSIONS.VIEW_EXPENSES },
+    { id: 'reports', label: 'Reports', icon: FileBarChart, permission: PERMISSIONS.VIEW_REPORTS },
+    { id: 'activity', label: 'Activity', icon: Activity, permission: PERMISSIONS.VIEW_REPORTS },
+    { id: 'settings', label: 'Settings', icon: Settings, permission: PERMISSIONS.MANAGE_SETTINGS },
+  ];
 
 
   if (loading) {
@@ -885,28 +1076,21 @@ export default function App() {
             </div>
           )}
 
-          {isEmailRestrictedForLandlord && (
-            <div className="bg-amber-500/10 border border-amber-500/20 text-amber-400 p-3 rounded-lg text-xs font-semibold mb-4 flex items-start gap-2">
-              <AlertCircle size={16} className="shrink-0 mt-0.5" />
-              <p>Please use Super Admin's email to login.</p>
-            </div>
-          )}
-
           <form onSubmit={handleLoginSubmit} className="space-y-4">
             <div>
               <label className="block text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Account Email</label>
               <input 
                 required type="email" value={email} onChange={e => setEmail(e.target.value)} 
                 placeholder={loginTab === 'landlord' ? "Super Admin email address" : "Manager email address"} 
-                className={`w-full bg-slate-950 border focus:border-gray-500 rounded-xl p-3 outline-none text-white text-sm transition-all ${isEmailRestrictedForLandlord ? 'border-amber-500/50' : 'border-gray-800'}`} 
+                className="w-full bg-slate-950 border border-gray-800 focus:border-gray-500 rounded-xl p-3 outline-none text-white text-sm transition-all"
               />
             </div>
             <div>
               <label className="block text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Secure Password</label>
               <div className="relative">
                 <input 
-                  required type={showPassword ? "text" : "password"} value={password} onChange={e => setPassword(e.target.value)} disabled={isEmailRestrictedForLandlord} placeholder="••••••••" 
-                  className={`w-full bg-slate-950 border border-gray-800 focus:border-gray-500 rounded-xl p-3 pr-10 outline-none text-white text-sm disabled:opacity-30 disabled:cursor-not-allowed`} 
+                  required type={showPassword ? "text" : "password"} value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••"
+                  className="w-full bg-slate-950 border border-gray-800 focus:border-gray-500 rounded-xl p-3 pr-10 outline-none text-white text-sm"
                 />
                 <button 
                   type="button" 
@@ -927,7 +1111,7 @@ export default function App() {
               </div>
             </div>
             <button 
-              type="submit" disabled={isProcessing || isEmailRestrictedForLandlord} 
+              type="submit" disabled={isProcessing}
               className="w-full bg-gray-800 hover:bg-gray-700 disabled:bg-gray-900 disabled:text-gray-600 disabled:cursor-not-allowed text-white font-bold py-3 rounded-xl transition-all hover:shadow-lg flex items-center justify-center gap-2 mt-2"
             >
               {isProcessing ? <div className="animate-spin rounded-full h-5 w-5 border-2 border-white border-t-transparent"></div> : 'Verify Credentials & Sign In'}
@@ -960,7 +1144,7 @@ export default function App() {
   }
 
   return (
-    <div className={`min-h-screen flex flex-col md:flex-row font-sans transition-colors duration-200 ${theme === 'dark' ? 'dark bg-slate-950 text-slate-100' : 'bg-[#FDFBF7] text-gray-900'}`}>
+    <div className={`app-shell min-h-screen flex flex-col md:flex-row font-sans transition-colors duration-200 ${theme === 'dark' ? 'dark bg-black text-slate-100' : 'light bg-[#F7F7F5] text-gray-900'}`}>
       
       {/* MOBILE HEADER */}
       <div className={`md:hidden flex items-center justify-between p-4 z-40 relative shadow-sm ${theme === 'dark' ? 'bg-slate-900 border-b border-slate-800' : 'bg-[#F4EFE6] border-b border-[#E8DFCE]'}`}>
@@ -996,30 +1180,16 @@ export default function App() {
           </div>
         </div>
         
-        <nav className="flex-1 p-4 space-y-1.5 overflow-y-auto">
-          {role === 'LANDLORD' && (
-            <button onClick={() => { setActiveTab('dashboard'); setSidebarOpen(false); }} className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all ${activeTab === 'dashboard' ? 'bg-gray-800 text-white shadow-md' : theme === 'dark' ? 'hover:bg-slate-800 text-slate-400' : 'hover:bg-[#E8DFCE] text-gray-600'}`}>
-              <LayoutDashboard size={18} /> Financial Dashboard
-            </button>
-          )}
-          <button onClick={() => { setActiveTab('houses'); setSidebarOpen(false); }} className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all ${activeTab === 'houses' ? 'bg-gray-800 text-white shadow-md' : theme === 'dark' ? 'hover:bg-slate-800 text-slate-400' : 'hover:bg-[#E8DFCE] text-gray-600'}`}>
-            <Home size={18} /> Houses & Units
-          </button>
-          <button onClick={() => { setActiveTab('tenants'); setSidebarOpen(false); }} className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all ${activeTab === 'tenants' ? 'bg-gray-800 text-white shadow-md' : theme === 'dark' ? 'hover:bg-slate-800 text-slate-400' : 'hover:bg-[#E8DFCE] text-gray-600'}`}>
-            <Users size={18} /> Tenants Directory
-          </button>
-          <button onClick={() => { setActiveTab('billing'); setSidebarOpen(false); }} className={`w-full flex items-center justify-between px-4 py-3 rounded-xl text-sm font-bold transition-all ${activeTab === 'billing' ? 'bg-gray-800 text-white shadow-md' : theme === 'dark' ? 'hover:bg-slate-800 text-slate-400' : 'hover:bg-[#E8DFCE] text-gray-600'}`}>
-            <div className="flex items-center gap-3"><Wallet size={18} /> Billing & Payments</div>
-            {stats.pendingPaymentsCount > 0 && role === 'LANDLORD' && (
-              <span className="bg-rose-500 text-white text-[10px] px-2 py-0.5 rounded-full font-bold">{stats.pendingPaymentsCount}</span>
-            )}
-          </button>
-          <button onClick={() => { setActiveTab('repairs'); setSidebarOpen(false); }} className={`w-full flex items-center justify-between px-4 py-3 rounded-xl text-sm font-bold transition-all ${activeTab === 'repairs' ? 'bg-gray-800 text-white shadow-md' : theme === 'dark' ? 'hover:bg-slate-800 text-slate-400' : 'hover:bg-[#E8DFCE] text-gray-600'}`}>
-            <div className="flex items-center gap-3"><Wrench size={18} /> Repairs & Operations</div>
-            {stats.openRepairs > 0 && (
-              <span className="bg-amber-500 text-white text-[10px] px-2 py-0.5 rounded-full font-bold">{stats.openRepairs}</span>
-            )}
-          </button>
+        <nav className="flex-1 p-4 space-y-1 overflow-y-auto" aria-label="Main navigation">
+          {navItems.filter(item => can(item.permission)).map(item => {
+            const Icon = item.icon;
+            return (
+              <button key={item.id} onClick={() => { setActiveTab(item.id); setSidebarOpen(false); }} className={`w-full flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg text-sm font-semibold transition-all ${activeTab === item.id ? 'bg-gray-800 text-white shadow-sm' : theme === 'dark' ? 'hover:bg-slate-800 text-slate-400' : 'hover:bg-[#E8DFCE] text-gray-600'}`} aria-current={activeTab === item.id ? 'page' : undefined}>
+                <span className="flex items-center gap-3"><Icon size={17} aria-hidden="true" /> {item.label}</span>
+                {item.badge > 0 && <span className="bg-amber-600 text-white text-[10px] px-1.5 py-0.5 rounded-full font-bold">{item.badge}</span>}
+              </button>
+            );
+          })}
         </nav>
         <div className={`p-4 border-t ${theme === 'dark' ? 'border-slate-800' : 'border-black/5'}`}>
           <button onClick={handleLogout} className="w-full flex items-center gap-2 text-sm font-bold text-gray-500 hover:text-rose-500 hover:bg-rose-500/10 p-3 rounded-xl transition-all">
@@ -1031,6 +1201,25 @@ export default function App() {
       {/* MAIN CONTENT AREA */}
       <div className="flex-1 flex flex-col h-screen overflow-hidden">
         <main className="flex-1 p-6 md:p-8 overflow-y-auto w-full transition-all duration-300 ease-in-out flex flex-col">
+          <header className={`flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-6 mb-6 border-b ${theme === 'dark' ? 'border-[#262626]' : 'border-[#E5E5E5]'}`}>
+            <div>
+              <p className="text-[11px] uppercase tracking-[0.18em] text-gray-500 font-semibold">{role === ROLES.LANDLORD ? 'Landlord workspace' : 'Operations workspace'}</p>
+              <h2 className={`text-2xl font-semibold mt-1 ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{navItems.find(item => item.id === activeTab)?.label || 'Dashboard'}</h2>
+            </div>
+            <div className="flex items-center gap-2 w-full lg:w-auto">
+              <label className={`relative flex-1 lg:w-80 ${theme === 'dark' ? 'text-slate-400' : 'text-gray-500'}`}>
+                <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2" aria-hidden="true" />
+                <span className="sr-only">Search tenants, units, payments, or maintenance</span>
+                <input value={globalSearch} onChange={e => setGlobalSearch(e.target.value)} placeholder="Search records" className={`w-full pl-9 pr-3 py-2.5 rounded-lg border text-sm outline-none focus:ring-2 focus:ring-amber-600/40 ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#303030] text-white placeholder:text-[#737373]' : 'bg-white border-[#E5E5E5] text-gray-900 placeholder:text-gray-400'}`} />
+              </label>
+              <button onClick={() => setActiveTab('activity')} className={`relative p-2.5 rounded-lg border transition ${theme === 'dark' ? 'border-[#303030] text-slate-300 hover:bg-[#171717]' : 'border-[#E5E5E5] text-gray-600 hover:bg-white'}`} aria-label="Open activity history">
+                <Bell size={17} aria-hidden="true" />
+                {notifications.filter(notification => !notification.read).length > 0 && <span className="absolute -top-1 -right-1 min-w-4 h-4 px-1 rounded-full bg-amber-600 text-white text-[9px] flex items-center justify-center">{notifications.filter(notification => !notification.read).length}</span>}
+              </button>
+            </div>
+          </header>
+
+          {dataError && <div className={`mb-6 flex items-start gap-3 p-3 rounded-lg border text-sm ${theme === 'dark' ? 'border-amber-700/50 bg-amber-950/30 text-amber-300' : 'border-amber-200 bg-amber-50 text-amber-800'}`} role="status"><ShieldAlert size={18} className="mt-0.5 shrink-0" /><span>{dataError}</span></div>}
           
           <div className="flex-1">
             {activeTab === 'dashboard' && role === 'LANDLORD' && (
@@ -1152,6 +1341,32 @@ export default function App() {
               </div>
             )}
 
+            {activeTab === 'dashboard' && role === ROLES.MANAGER && (
+              <div className="space-y-6">
+                <div className={`p-5 border rounded-lg ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}>
+                  <p className="text-xs uppercase tracking-wider text-gray-500 font-semibold">Today’s operating brief</p>
+                  <h3 className={`text-xl font-semibold mt-1 ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Keep collections and maintenance moving.</h3>
+                  <div className="flex flex-wrap gap-2 mt-4">
+                    <button onClick={() => setActiveTab('billing')} className="bg-gray-800 text-white px-3 py-2 rounded-lg text-sm font-semibold flex items-center gap-2"><Wallet size={15}/> Record payment</button>
+                    <button onClick={() => { setActiveTab('repairs'); setIsRepairModalOpen(true); }} className={`px-3 py-2 rounded-lg text-sm font-semibold border flex items-center gap-2 ${theme === 'dark' ? 'border-[#303030] text-white hover:bg-[#171717]' : 'border-[#E5E5E5] text-gray-800 hover:bg-gray-50'}`}><Wrench size={15}/> Report maintenance</button>
+                    <button onClick={() => setActiveTab('tenants')} className={`px-3 py-2 rounded-lg text-sm font-semibold border flex items-center gap-2 ${theme === 'dark' ? 'border-[#303030] text-white hover:bg-[#171717]' : 'border-[#E5E5E5] text-gray-800 hover:bg-gray-50'}`}><Users size={15}/> View tenants</button>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                  {[
+                    ['Units', stats.totalUnits, Building2],
+                    ['Occupied', stats.occupiedUnits, Home],
+                    ['Occupancy', `${stats.occupancyRate}%`, ArrowUpRight],
+                    ['Open maintenance', stats.openRepairs, Wrench],
+                  ].map(([label, value, Icon]) => <div key={label} className={`p-4 border rounded-lg ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}><Icon size={16} className="text-amber-600 mb-3"/><p className="text-xs text-gray-500">{label}</p><p className={`text-2xl font-semibold mt-1 ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{value}</p></div>)}
+                </div>
+                <div className={`border rounded-lg overflow-hidden ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}>
+                  <div className="p-4 border-b border-inherit flex items-center justify-between"><h3 className="font-semibold">Recent activity</h3><button onClick={() => setActiveTab('activity')} className="text-xs text-amber-700 dark:text-amber-400 font-semibold">View all</button></div>
+                  <div className="divide-y divide-inherit">{activityLogs.slice(0, 5).length === 0 ? <p className="p-5 text-sm text-gray-500">No activity has been recorded yet.</p> : activityLogs.slice(0, 5).map(log => <div key={log.id} className="p-4 flex items-center justify-between gap-4 text-sm"><span className="font-medium">{String(log.action || 'Activity').replaceAll('_', ' ')}</span><time className="text-xs text-gray-500">{log.timestamp ? new Date(log.timestamp).toLocaleString('en-KE', { timeZone: DEFAULT_TIMEZONE }) : '—'}</time></div>)}</div>
+                </div>
+              </div>
+            )}
+
             {activeTab === 'houses' && (
               <div className="space-y-6 animate-in fade-in duration-500">
                 <div className="flex justify-between items-center">
@@ -1165,7 +1380,7 @@ export default function App() {
 
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
                   {houses.length === 0 && <p className="text-gray-500 font-medium">No houses registered yet.</p>}
-                  {houses.map(house => {
+                  {filteredHouses.map(house => {
                     const isVacant = house.status === 'VACANT' && !occupiedHouseIds.has(house.id);
                     const isUnderRepair = house.status === 'UNDER_REPAIR';
                     const isOccupied = house.status === 'OCCUPIED' || occupiedHouseIds.has(house.id);
@@ -1236,7 +1451,7 @@ export default function App() {
                       {tenants.length === 0 && (
                         <tr><td colSpan="4" className="p-8 text-center text-gray-500 font-medium">No tenants registered.</td></tr>
                       )}
-                      {tenants.map(tenant => {
+                      {filteredTenants.map(tenant => {
                         const house = houses.find(h => h.id === tenant.houseId);
                         const owesMoney = (tenant.expectedRent - tenant.paidRent) > 0 || (tenant.expectedWater - tenant.paidWater) > 0;
                         return (
@@ -1265,7 +1480,7 @@ export default function App() {
                 <div>
                   <h3 className="text-lg font-bold mb-4 font-mono uppercase tracking-wider text-gray-500">Tenant Billing Profiles</h3>
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                    {tenants.map(tenant => {
+                    {filteredTenants.map(tenant => {
                       const house = houses.find(h => h.id === tenant.houseId);
                       const rentBal = (tenant.expectedRent || 0) - (tenant.paidRent || 0);
                       const waterBal = (tenant.expectedWater || 0) - (tenant.paidWater || 0);
@@ -1373,7 +1588,7 @@ export default function App() {
                         {payments.length === 0 && (
                           <tr><td colSpan="7" className="p-8 text-center text-gray-500 font-medium">No payments recorded.</td></tr>
                         )}
-                        {payments.map(payment => (
+                        {filteredPayments.map(payment => (
                           <tr key={payment.id} className={`transition ${theme === 'dark' ? 'hover:bg-slate-950/40' : 'hover:bg-[#FDFBF7]'}`}>
                             <td className="p-4 text-gray-500 font-medium">{new Date(payment.date).toLocaleDateString()}</td>
                             <td className={`p-4 font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{payment.tenantName}</td>
@@ -1395,6 +1610,43 @@ export default function App() {
                   </div>
                 </div>
               </div>
+            )}
+
+            {activeTab === 'expenses' && (
+              <div className="space-y-6">
+                <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3">
+                  <div><p className="text-sm text-gray-500">Track property operating costs and approval state.</p><h3 className={`text-xl font-semibold mt-1 ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Expenses</h3></div>
+                  {can(PERMISSIONS.CREATE_EXPENSES) && <button onClick={() => { setModalError(''); setIsExpenseModalOpen(true); }} className="bg-gray-800 text-white px-4 py-2.5 rounded-lg text-sm font-semibold flex items-center gap-2"><Plus size={16}/> Add expense</button>}
+                </div>
+                <div className={`border rounded-lg overflow-hidden ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}>
+                  <div className="overflow-x-auto"><table className="w-full text-left text-sm"><thead className={`${theme === 'dark' ? 'bg-[#111111] text-[#A3A3A3]' : 'bg-[#F7F7F5] text-gray-500'}`}><tr><th className="p-3 font-semibold">Date</th><th className="p-3 font-semibold">Description</th><th className="p-3 font-semibold">Category</th><th className="p-3 font-semibold">Recorded by</th><th className="p-3 font-semibold">Amount</th><th className="p-3 font-semibold">Status</th></tr></thead><tbody className="divide-y divide-inherit">{expenses.length === 0 ? <tr><td colSpan="6" className="p-8 text-center text-gray-500">No expenses have been recorded yet.</td></tr> : expenses.map(expense => <tr key={expense.id} className="hover:bg-black/[0.03] dark:hover:bg-white/[0.03]"><td className="p-3 text-gray-500">{expense.date}</td><td className="p-3 font-medium">{expense.description}</td><td className="p-3 text-gray-500">{expense.category}</td><td className="p-3 text-gray-500">{expense.recordedBy || '—'}</td><td className="p-3 font-semibold">{formatKes(expense.amount)}</td><td className="p-3"><span className={`text-[11px] font-semibold uppercase tracking-wide ${expense.status === 'APPROVED' ? 'text-emerald-700 dark:text-emerald-400' : 'text-amber-700 dark:text-amber-400'}`}>{expense.status || 'PENDING'}</span></td></tr>)}</tbody></table></div>
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'utilities' && (
+              <div className="space-y-6">
+                <div><p className="text-sm text-gray-500">Water provider invoices and collection coverage.</p><h3 className={`text-xl font-semibold mt-1 ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Utilities</h3></div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3"><div className={`p-4 border rounded-lg ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}><p className="text-xs text-gray-500">Tenant water collected</p><p className="text-2xl font-semibold mt-1">{formatKes(stats.collectedWaterRev)}</p></div><div className={`p-4 border rounded-lg ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}><p className="text-xs text-gray-500">Provider bills</p><p className="text-2xl font-semibold mt-1">{formatKes(stats.totalMasterWaterBills)}</p></div><div className={`p-4 border rounded-lg ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}><p className="text-xs text-gray-500">Unallocated reserve</p><p className={`text-2xl font-semibold mt-1 ${stats.waterReserve < 0 ? 'text-rose-700 dark:text-rose-400' : 'text-emerald-700 dark:text-emerald-400'}`}>{formatKes(stats.waterReserve)}</p></div></div>
+                <div className={`border rounded-lg overflow-hidden ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}><div className="p-4 border-b border-inherit flex items-center justify-between"><h3 className="font-semibold">Provider bills</h3>{role === ROLES.LANDLORD && <button onClick={() => setIsWaterBillModalOpen(true)} className="text-sm text-amber-700 dark:text-amber-400 font-semibold">Log bill</button>}</div><div className="overflow-x-auto"><table className="w-full text-left text-sm"><thead className={`${theme === 'dark' ? 'bg-[#111111] text-[#A3A3A3]' : 'bg-[#F7F7F5] text-gray-500'}`}><tr><th className="p-3">Billing period</th><th className="p-3">Amount</th><th className="p-3">Recorded</th></tr></thead><tbody className="divide-y divide-inherit">{masterWaterBills.length === 0 ? <tr><td colSpan="3" className="p-8 text-center text-gray-500">No utility bills have been logged yet.</td></tr> : masterWaterBills.map(bill => <tr key={bill.id}><td className="p-3 font-medium">{bill.month}</td><td className="p-3 font-semibold">{formatKes(bill.amount)}</td><td className="p-3 text-gray-500">{bill.date ? new Date(bill.date).toLocaleDateString() : '—'}</td></tr>)}</tbody></table></div></div>
+              </div>
+            )}
+
+            {activeTab === 'reports' && (
+              <div className="space-y-6">
+                <div><p className="text-sm text-gray-500">Use current records to review operating performance.</p><h3 className={`text-xl font-semibold mt-1 ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Reports</h3></div>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">{[['Rent collected', formatKes(stats.collectedRentRev)], ['Outstanding rent', formatKes(Math.max(0, stats.expectedRentRev - stats.collectedRentRev))], ['Operating expenses', formatKes(stats.totalOperatingExpenses)], ['Net operating result', formatKes(stats.netOperatingResult)]].map(([label, value]) => <div key={label} className={`p-4 border rounded-lg ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}><p className="text-xs text-gray-500">{label}</p><p className="text-xl font-semibold mt-1">{value}</p></div>)}</div>
+                <div className={`border rounded-lg p-5 ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}><div className="flex items-center justify-between gap-4"><div><h3 className="font-semibold">Occupancy</h3><p className="text-sm text-gray-500 mt-1">{stats.occupiedUnits} of {stats.totalUnits} units occupied.</p></div><span className="text-3xl font-semibold">{stats.occupancyRate}%</span></div><div className="mt-4 h-2 bg-gray-200 dark:bg-[#262626] rounded-full overflow-hidden"><div className="h-full bg-amber-600" style={{ width: `${stats.occupancyRate}%` }} /></div></div>
+                <p className="text-xs text-gray-500">Financial values are calculated from confirmed payment and recorded expense documents. Export permissions are role-controlled; CSV/PDF export is not enabled in this client-only build.</p>
+              </div>
+            )}
+
+            {activeTab === 'activity' && (
+              <div className="space-y-6"><div><p className="text-sm text-gray-500">Immutable operational history for review and accountability.</p><h3 className={`text-xl font-semibold mt-1 ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Activity history</h3></div><div className={`border rounded-lg overflow-hidden ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}><div className="divide-y divide-inherit">{activityLogs.length === 0 ? <p className="p-8 text-center text-gray-500">No activity has been recorded yet.</p> : activityLogs.map(log => <div key={log.id} className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2"><div><p className="font-semibold text-sm">{String(log.action || 'Activity').replaceAll('_', ' ')}</p><p className="text-xs text-gray-500 mt-1">{log.entity || 'record'} {log.entityId || ''}</p></div><time className="text-xs text-gray-500">{log.timestamp ? new Date(log.timestamp).toLocaleString('en-KE', { timeZone: DEFAULT_TIMEZONE }) : '—'}</time></div>)}</div></div></div>
+            )}
+
+            {activeTab === 'settings' && (
+              <div className="space-y-6"><div><p className="text-sm text-gray-500">Workspace defaults and access controls.</p><h3 className={`text-xl font-semibold mt-1 ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Settings</h3></div><div className={`border rounded-lg divide-y divide-inherit ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}><div className="p-4 flex items-center gap-3"><SlidersHorizontal size={18} className="text-amber-600"/><div><p className="font-semibold">General</p><p className="text-sm text-gray-500">Currency: {DEFAULT_CURRENCY} · Timezone: {DEFAULT_TIMEZONE}</p></div></div><div className="p-4 flex items-center gap-3"><ShieldCheck size={18} className="text-amber-600"/><div><p className="font-semibold">Access model</p><p className="text-sm text-gray-500">Roles are resolved from Firebase custom claims or protected user profiles.</p></div></div><div className="p-4 flex items-center gap-3"><Database size={18} className="text-amber-600"/><div><p className="font-semibold">Audit and backups</p><p className="text-sm text-gray-500">Audit records are append-only in the normal UI. Configure scheduled Firebase exports for production backup.</p></div></div></div></div>
             )}
 
             {activeTab === 'repairs' && (
@@ -1427,7 +1679,7 @@ export default function App() {
                         {repairs.length === 0 && (
                           <tr><td colSpan="6" className="p-8 text-center text-gray-500 font-medium">No issues reported!</td></tr>
                         )}
-                        {repairs.map(repair => {
+                        {filteredRepairs.map(repair => {
                           const house = houses.find(h => h.id === repair.houseId);
                           return (
                             <tr key={repair.id} className={`transition ${theme === 'dark' ? 'hover:bg-slate-950/40' : 'hover:bg-[#FDFBF7]'}`}>
@@ -1501,6 +1753,23 @@ export default function App() {
             <p className="text-xs opacity-90 font-medium mt-0.5">{modalError}</p>
           </div>
           <button onClick={() => setModalError('')} className="ml-2 p-1 opacity-70 hover:opacity-100 bg-white/10 rounded-lg"><X size={16}/></button>
+        </div>
+      )}
+
+      {isExpenseModalOpen && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-60" role="presentation" onClick={() => closeAnyModal(setIsExpenseModalOpen)}>
+          <div className={`w-full max-w-lg p-6 rounded-xl border shadow-2xl ${theme === 'dark' ? 'bg-[#111111] border-[#303030] text-white' : 'bg-white border-[#E5E5E5] text-gray-900'}`} role="dialog" aria-modal="true" aria-labelledby="expense-dialog-title" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-5"><div><h3 id="expense-dialog-title" className="text-lg font-semibold">Add expense</h3><p className="text-xs text-gray-500 mt-1">{role === ROLES.LANDLORD ? 'This record will be marked approved.' : 'This record will wait for landlord review.'}</p></div><button onClick={() => closeAnyModal(setIsExpenseModalOpen)} className="p-2 rounded-lg hover:bg-black/5 dark:hover:bg-white/5" aria-label="Close expense dialog"><X size={18}/></button></div>
+            <form onSubmit={handleAddExpense} className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div className="sm:col-span-2"><label className="block text-xs font-semibold text-gray-500 mb-1.5" htmlFor="expense-description">Description</label><input id="expense-description" name="description" required maxLength="160" className={`w-full p-2.5 rounded-lg border text-sm outline-none focus:ring-2 focus:ring-amber-600/40 ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#303030]' : 'bg-white border-[#E5E5E5]'}`} /></div>
+              <div><label className="block text-xs font-semibold text-gray-500 mb-1.5" htmlFor="expense-category">Category</label><select id="expense-category" name="category" required className={`w-full p-2.5 rounded-lg border text-sm outline-none focus:ring-2 focus:ring-amber-600/40 ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#303030]' : 'bg-white border-[#E5E5E5]'}`}><option>Repairs</option><option>Maintenance</option><option>Utilities</option><option>Security</option><option>Cleaning</option><option>Supplies</option><option>Insurance</option><option>Other</option></select></div>
+              <div><label className="block text-xs font-semibold text-gray-500 mb-1.5" htmlFor="expense-amount">Amount ({DEFAULT_CURRENCY})</label><input id="expense-amount" name="amount" required min="0.01" step="0.01" type="number" className={`w-full p-2.5 rounded-lg border text-sm outline-none focus:ring-2 focus:ring-amber-600/40 ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#303030]' : 'bg-white border-[#E5E5E5]'}`} /></div>
+              <div><label className="block text-xs font-semibold text-gray-500 mb-1.5" htmlFor="expense-date">Date</label><input id="expense-date" name="date" required type="date" defaultValue={new Date().toISOString().slice(0, 10)} className={`w-full p-2.5 rounded-lg border text-sm outline-none focus:ring-2 focus:ring-amber-600/40 ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#303030]' : 'bg-white border-[#E5E5E5]'}`} /></div>
+              <div><label className="block text-xs font-semibold text-gray-500 mb-1.5" htmlFor="expense-payment-method">Payment method</label><select id="expense-payment-method" name="paymentMethod" className={`w-full p-2.5 rounded-lg border text-sm outline-none focus:ring-2 focus:ring-amber-600/40 ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#303030]' : 'bg-white border-[#E5E5E5]'}`}><option>Cash</option><option>Bank</option><option>M-Pesa</option><option>Other</option></select></div>
+              <div className="sm:col-span-2"><label className="block text-xs font-semibold text-gray-500 mb-1.5" htmlFor="expense-vendor">Vendor (optional)</label><input id="expense-vendor" name="vendor" maxLength="120" className={`w-full p-2.5 rounded-lg border text-sm outline-none focus:ring-2 focus:ring-amber-600/40 ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#303030]' : 'bg-white border-[#E5E5E5]'}`} /></div>
+              <button type="submit" disabled={isProcessing} className="sm:col-span-2 bg-gray-800 text-white p-2.5 rounded-lg text-sm font-semibold disabled:opacity-50">{isProcessing ? 'Saving…' : 'Save expense'}</button>
+            </form>
+          </div>
         </div>
       )}
 
@@ -1674,7 +1943,7 @@ export default function App() {
                 <div>
                   <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Method</label>
                   <select name="method" className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 text-sm font-bold transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`}>
-                    <option>M-Pesa</option><option>Bank Transfer</option><option>Cash</option>
+                    {paymentMethods.map(methodOption => <option key={methodOption}>{methodOption}</option>)}
                   </select>
                 </div>
               </div>
