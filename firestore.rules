@@ -106,17 +106,29 @@ service cloud.firestore {
     match /artifacts/{appId}/public/data/{collectionName}/{recordId} {
       // Landlords can read all records in their authenticated workspace.
       // Managers only receive operational/collection data, never audit history or settings.
-      allow read: if landlordCanAccess(resource.data) || (
+      // The first two branches are a temporary bridge for the three existing
+      // production accounts. It is UID-authenticated and collection-scoped for
+      // managers so old records without workspaceId remain usable during migration.
+      allow read: if isLegacyLandlord() || (
+        isLegacyManager() && managerCollectionAllowed(collectionName)
+      ) || landlordCanAccess(resource.data) || (
         isManager() &&
         managerCollectionAllowed(collectionName) &&
         (sameWorkspace(resource.data) || (isLegacyManager() && legacyRecord(resource.data)))
       );
 
       // Every new record must identify its workspace and creating user.
+      allow create: if isLegacyLandlord() &&
+        request.resource.data.createdBy == request.auth.uid;
+
       allow create: if isLandlord() &&
         sameWorkspace(request.resource.data) &&
         request.resource.data.createdBy == request.auth.uid &&
         request.resource.data.workspaceId is string;
+
+      allow create: if isLegacyManager() &&
+        managerCanCreate(collectionName) &&
+        request.resource.data.createdBy == request.auth.uid;
 
       allow create: if isManager() &&
         managerCanCreate(collectionName) &&
@@ -126,7 +138,14 @@ service cloud.firestore {
       // Updates are allowed only to an authenticated actor. Normal UI workflows use
       // archival/status changes instead of deleting financial records. This covers
       // tenant archival, releasing its house, and water-vault reset metadata.
+      allow update: if isLegacyLandlord() &&
+        request.resource.data.updatedBy == request.auth.uid;
+
       allow update: if landlordCanWrite(resource.data, request.resource.data);
+
+      allow update: if isLegacyManager() &&
+        managerCollectionAllowed(collectionName) &&
+        request.resource.data.updatedBy == request.auth.uid;
 
       allow update: if isManager() &&
         managerCollectionAllowed(collectionName) &&
