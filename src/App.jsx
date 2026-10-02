@@ -127,6 +127,22 @@ const promiseTimeout = (promise, ms = 15000) => {
   ]);
 };
 
+const describeActionError = (error, action) => {
+  const isPermissionDenied = error?.code === 'permission-denied' ||
+    /missing or insufficient permissions/i.test(error?.message || '');
+  if (isPermissionDenied) {
+    const stage = error?.resetStage ? ` while ${error.resetStage}` : '';
+    const partialWarning = error?.partialReset
+      ? ' Earlier reset batches may already have completed; check the records before retrying.'
+      : '';
+    return `Firebase denied permission${stage} for ${action}. Check that you are signed in with the correct role and workspace, and that the latest Firestore rules are deployed.${partialWarning}`;
+  }
+  if (error?.resetStage) {
+    return `The reset may be partially complete. It stopped while ${error.resetStage}: ${error.message || 'unknown error'}`;
+  }
+  return error?.message || `Could not complete ${action}.`;
+};
+
 const escapeHtml = (value) => String(value ?? '')
   .replaceAll('&', '&amp;')
   .replaceAll('<', '&lt;')
@@ -197,6 +213,8 @@ export default function App() {
   const [isWaterBillModalOpen, setIsWaterBillModalOpen] = useState(false);
   const [isEditTenantModalOpen, setIsEditTenantModalOpen] = useState(false);
   const [isExpenseModalOpen, setIsExpenseModalOpen] = useState(false);
+  const [newTenantHouseId, setNewTenantHouseId] = useState('');
+  const [editTenantHouseId, setEditTenantHouseId] = useState('');
   
   // Selection Targets
   const [selectedTenant, setSelectedTenant] = useState(null); 
@@ -378,6 +396,20 @@ export default function App() {
     tenantCycles.filter(cycle => cycle.cycleId === activeCycle?.id).map(cycle => [cycle.tenantId, cycle])
   ), [tenantCycles, activeCycle]);
   const selectedTenantCycle = selectedTenant ? activeTenantCycles.get(selectedTenant.id) : null;
+  const selectedDetailCycle = selectedTenantForDetails ? activeTenantCycles.get(selectedTenantForDetails.id) : null;
+  const selectedDetailHouse = selectedTenantForDetails
+    ? houses.find(house => house.id === selectedTenantForDetails.houseId)
+    : null;
+  const selectedDetailRent = Number(selectedDetailHouse?.rent ?? selectedTenantForDetails?.expectedRent ?? 0);
+  const selectedDetailDeposit = selectedDetailRent;
+  const selectedDetailRentDue = selectedDetailCycle
+    ? Number(selectedDetailCycle.expectedRent || 0) - Number(selectedDetailCycle.paidRent || 0)
+    : Number(selectedTenantForDetails?.expectedRent || 0) - Number(selectedTenantForDetails?.paidRent || 0);
+  const selectedDetailWaterDue = selectedDetailCycle
+    ? Number(selectedDetailCycle.expectedWater || 0) - Number(selectedDetailCycle.paidWater || 0)
+    : Number(selectedTenantForDetails?.expectedWater || 0) - Number(selectedTenantForDetails?.paidWater || 0);
+  const selectedNewTenantHouse = houses.find(house => house.id === newTenantHouseId);
+  const selectedEditTenantHouse = houses.find(house => house.id === editTenantHouseId);
   const ledgerMonths = useMemo(() => {
     const monthKeys = [...new Set(payments.map(payment => getMonthKey(payment.date)).filter(Boolean))];
     return monthKeys.sort((a, b) => b.localeCompare(a));
@@ -810,7 +842,7 @@ export default function App() {
       const created = await promiseTimeout(addPromise, 5000);
       await recordAudit('UNIT_CREATED', 'unit', created.id, { name: rawHouseName });
       closeAnyModal(setIsHouseModalOpen);
-    } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
+    } catch (err) { setModalError(describeActionError(err, 'adding the property unit')); } finally { setIsProcessing(false); }
   };
 
   const handleToggleHouseRepairMode = async (house) => {
@@ -832,8 +864,6 @@ export default function App() {
     try {
       const formData = new FormData(e.target);
       const houseId = formData.get('houseId');
-      const expectedRent = parseMoney(formData.get('expectedRent'), { allowZero: true });
-      const expectedWater = parseMoney(formData.get('expectedWater'), { allowZero: true });
       
       if (!houseId) throw new Error("Please select an available vacant house unit.");
       if (occupiedHouseIds.has(houseId)) throw new Error("That house unit has just been occupied.");
@@ -841,19 +871,50 @@ export default function App() {
       const tenantRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'tenants'));
       await promiseTimeout(runTransaction(db, async (transaction) => {
         const houseRef = doc(db, 'artifacts', appId, 'public', 'data', 'houses', houseId);
-        const houseSnapshot = await transaction.get(houseRef);
-        if (!houseSnapshot.exists() || houseSnapshot.data().status === 'ARCHIVED') throw new Error('That unit is no longer available.');
-        transaction.set(tenantRef, {
+        const cycleRef = activeCycle ? documentRef('billingCycles', activeCycle.id) : null;
+        const cycleTenantId = activeCycle ? tenantCycleDocumentId(tenantRef.id, activeCycle.id) : null;
+        const cycleTenantRef = cycleTenantId ? documentRef('tenantCycles', cycleTenantId) : null;
+        const [houseSnapshot, cycleSnapshot] = await Promise.all([
+          transaction.get(houseRef),
+          cycleRef ? transaction.get(cycleRef) : Promise.resolve(null),
+        ]);
+        if (!houseSnapshot.exists() || houseSnapshot.data().status !== 'VACANT') throw new Error('That unit is no longer vacant. Refresh the page and choose another unit.');
+        if (cycleSnapshot && (!cycleSnapshot.exists() || cycleSnapshot.data().status !== 'OPEN')) {
+          throw new Error('The active billing cycle has changed. Refresh the page and try again.');
+        }
+        const expectedRent = parseMoney(houseSnapshot.data().rent, { allowZero: true });
+        const now = new Date().toISOString();
+        const newTenant = {
           ...recordDefaults(),
           name: formData.get('name').trim(), phone: formData.get('phone').trim(), contactPref: formData.get('contactPref'),
-          houseId, expectedRent, expectedWater, paidRent: 0, paidWater: 0,
-          status: 'ACTIVE', dateEntered: new Date().toISOString(), createdAt: new Date().toISOString()
+          houseId, expectedRent, depositAmount: expectedRent, paidRent: 0, paidWater: 0,
+          status: 'ACTIVE', dateEntered: now, createdAt: now,
+        };
+        transaction.set(tenantRef, {
+          ...newTenant,
         });
-        transaction.update(houseRef, { status: 'OCCUPIED', updatedBy: user.uid, updatedAt: new Date().toISOString() });
+        transaction.update(houseRef, { status: 'OCCUPIED', updatedBy: user.uid, updatedAt: now });
+        if (cycleTenantRef) {
+          const cycleTenant = {
+            tenantId: tenantRef.id,
+            cycleId: activeCycle.id,
+            tenantName: newTenant.name,
+            houseId,
+            expectedRent,
+            expectedWater: 0,
+            paidRent: 0,
+            paidWater: 0,
+            status: 'OPEN',
+            createdAt: now,
+            ...recordDefaults(),
+          };
+          cycleTenant.status = getCycleTenantStatus(cycleTenant);
+          transaction.set(cycleTenantRef, cycleTenant);
+        }
       }), 5000);
       await recordAudit('TENANT_CREATED', 'tenant', tenantRef.id, { houseId });
       closeAnyModal(setIsTenantModalOpen);
-    } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
+    } catch (err) { setModalError(describeActionError(err, 'registering the tenant')); } finally { setIsProcessing(false); }
   };
 
   const handleEditTenant = async (e) => {
@@ -865,35 +926,82 @@ export default function App() {
       const formData = new FormData(e.target);
       const newHouseId = formData.get('houseId');
       const oldHouseId = selectedTenantForDetails.houseId;
-      const expectedRent = parseMoney(formData.get('expectedRent'), { allowZero: true });
-      const expectedWater = parseMoney(formData.get('expectedWater'), { allowZero: true });
-
-      if (newHouseId && newHouseId !== oldHouseId) {
-         if (occupiedHouseIds.has(newHouseId)) throw new Error("Target house unit is already occupied.");
-      }
+      const targetHouseId = newHouseId || oldHouseId;
+      if (!targetHouseId) throw new Error('Assign this tenant to a property unit with a monthly rent first.');
+      const isMoving = targetHouseId !== oldHouseId;
+      if (isMoving && occupiedHouseIds.has(targetHouseId)) throw new Error("Target house unit is already occupied.");
 
       await promiseTimeout(runTransaction(db, async (transaction) => {
         const tenantRef = doc(db, 'artifacts', appId, 'public', 'data', 'tenants', selectedTenantForDetails.id);
-        const tenantSnapshot = await transaction.get(tenantRef);
+        const targetHouseRef = documentRef('houses', targetHouseId);
+        const oldHouseRef = isMoving && oldHouseId ? documentRef('houses', oldHouseId) : null;
+        const cycleRef = activeCycle ? documentRef('billingCycles', activeCycle.id) : null;
+        const cycleTenantRef = activeCycle
+          ? documentRef('tenantCycles', tenantCycleDocumentId(selectedTenantForDetails.id, activeCycle.id))
+          : null;
+        const hasCycleTenantInCache = Boolean(activeCycle && activeTenantCycles.has(selectedTenantForDetails.id));
+        const [tenantSnapshot, targetHouseSnapshot, cycleSnapshot, cycleTenantSnapshot, oldHouseSnapshot] = await Promise.all([
+          transaction.get(tenantRef),
+          transaction.get(targetHouseRef),
+          cycleRef ? transaction.get(cycleRef) : Promise.resolve(null),
+          cycleTenantRef && hasCycleTenantInCache ? transaction.get(cycleTenantRef) : Promise.resolve(null),
+          oldHouseRef ? transaction.get(oldHouseRef) : Promise.resolve(null),
+        ]);
         if (!tenantSnapshot.exists() || tenantSnapshot.data().status === 'ARCHIVED') throw new Error('This tenant record is no longer active.');
-        if (newHouseId && newHouseId !== oldHouseId) {
-          const newHouseRef = doc(db, 'artifacts', appId, 'public', 'data', 'houses', newHouseId);
-          const oldHouseRef = oldHouseId ? doc(db, 'artifacts', appId, 'public', 'data', 'houses', oldHouseId) : null;
-          const newHouseSnapshot = await transaction.get(newHouseRef);
-          if (!newHouseSnapshot.exists() || newHouseSnapshot.data().status === 'ARCHIVED') throw new Error('Target unit is no longer available.');
-          transaction.update(newHouseRef, { status: 'OCCUPIED', updatedBy: user.uid, updatedAt: new Date().toISOString() });
-          if (oldHouseRef) transaction.update(oldHouseRef, { status: 'VACANT', updatedBy: user.uid, updatedAt: new Date().toISOString() });
+        if (!targetHouseSnapshot.exists() || targetHouseSnapshot.data().status === 'ARCHIVED') throw new Error('Target unit is no longer available.');
+        if (isMoving && targetHouseSnapshot.data().status !== 'VACANT') throw new Error('Target unit has already been occupied. Refresh and choose another unit.');
+        if (cycleSnapshot && (!cycleSnapshot.exists() || cycleSnapshot.data().status !== 'OPEN')) {
+          throw new Error('The active billing cycle has changed. Refresh the page and try again.');
+        }
+        if (oldHouseRef && !oldHouseSnapshot?.exists()) throw new Error('The tenant’s current house unit no longer exists.');
+
+        const expectedRent = parseMoney(targetHouseSnapshot.data().rent, { allowZero: true });
+        const now = new Date().toISOString();
+        if (isMoving) {
+          transaction.update(targetHouseRef, { status: 'OCCUPIED', updatedBy: user.uid, updatedAt: now });
+          transaction.update(oldHouseRef, { status: 'VACANT', updatedBy: user.uid, updatedAt: now });
         }
         transaction.update(tenantRef, {
           name: formData.get('name').trim(), phone: formData.get('phone').trim(), contactPref: formData.get('contactPref'),
-          expectedRent, expectedWater, houseId: newHouseId || oldHouseId,
-          updatedBy: user.uid, updatedAt: new Date().toISOString()
+          expectedRent, depositAmount: expectedRent, houseId: targetHouseId,
+          updatedBy: user.uid, updatedAt: now,
         });
+        if (cycleTenantRef && cycleSnapshot?.exists()) {
+          const currentCycleTenant = cycleTenantSnapshot?.exists() ? cycleTenantSnapshot.data() : {
+            tenantId: selectedTenantForDetails.id,
+            cycleId: activeCycle.id,
+            tenantName: tenantSnapshot.data().name,
+            houseId: targetHouseId,
+            expectedRent,
+            expectedWater: 0,
+            paidRent: 0,
+            paidWater: 0,
+            status: 'OPEN',
+            createdAt: now,
+            ...recordDefaults(),
+          };
+          const nextCycleTenant = {
+            ...currentCycleTenant,
+            tenantName: formData.get('name').trim(),
+            houseId: targetHouseId,
+            expectedRent,
+          };
+          nextCycleTenant.status = getCycleTenantStatus(nextCycleTenant);
+          const cycleUpdate = {
+            tenantName: nextCycleTenant.tenantName,
+            houseId: targetHouseId,
+            expectedRent,
+            status: nextCycleTenant.status,
+            updatedBy: user.uid,
+          };
+          if (cycleTenantSnapshot?.exists()) transaction.update(cycleTenantRef, cycleUpdate);
+          else transaction.set(cycleTenantRef, { ...currentCycleTenant, ...cycleUpdate });
+        }
       }), 5000);
       await recordAudit('TENANT_UPDATED', 'tenant', selectedTenantForDetails.id, { houseId: newHouseId || oldHouseId });
       closeAnyModal(setIsEditTenantModalOpen);
       setSelectedTenantForDetails(null);
-    } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
+    } catch (err) { setModalError(describeActionError(err, 'updating tenant details')); } finally { setIsProcessing(false); }
   };
 
   const handleLogPayment = async (e) => {
@@ -1156,47 +1264,32 @@ export default function App() {
     setModalError('');
     try {
       const formData = new FormData(e.target);
-      const addRent = parseMoney(formData.get('addRent'), { allowZero: true });
-      const addWater = parseMoney(formData.get('addWater'), { allowZero: true });
-      if (addRent === 0 && addWater === 0) throw new Error('Enter a rent or water adjustment greater than zero.');
+      const waterShare = parseMoney(formData.get('waterShare'), { allowZero: true });
       const cycleTenantId = tenantCycleDocumentId(selectedTenant.id, activeCycle.id);
-      const tenantRef = documentRef('tenants', selectedTenant.id);
       const cycleRef = documentRef('billingCycles', activeCycle.id);
       const cycleTenantRef = documentRef('tenantCycles', cycleTenantId);
       await promiseTimeout(runTransaction(db, async (transaction) => {
-        const [tenantSnapshot, cycleSnapshot, cycleTenantSnapshot] = await Promise.all([
-          transaction.get(tenantRef),
+        const [cycleSnapshot, cycleTenantSnapshot] = await Promise.all([
           transaction.get(cycleRef),
           transaction.get(cycleTenantRef),
         ]);
-        if (!tenantSnapshot.exists() || tenantSnapshot.data().status === 'ARCHIVED') throw new Error('This tenant record is no longer active.');
         if (!cycleSnapshot.exists() || cycleSnapshot.data().status !== 'OPEN') throw new Error('The billing cycle is no longer open. Refresh and try again.');
         if (!cycleTenantSnapshot.exists()) throw new Error('This tenant is not set up in the active billing cycle yet.');
-        const currentTenant = tenantSnapshot.data();
         const currentCycleTenant = cycleTenantSnapshot.data();
-        const now = new Date().toISOString();
         const nextCycleTenant = {
           ...currentCycleTenant,
-          expectedRent: Number(currentCycleTenant.expectedRent || 0) + addRent,
-          expectedWater: Number(currentCycleTenant.expectedWater || 0) + addWater,
+          expectedWater: waterShare,
         };
-        transaction.update(tenantRef, {
-          expectedRent: Number(currentTenant.expectedRent || 0) + addRent,
-          expectedWater: Number(currentTenant.expectedWater || 0) + addWater,
-          updatedBy: user.uid,
-          lastAdjustment: { addRent, addWater, by: user.uid, at: now },
-        });
         transaction.update(cycleTenantRef, {
-          expectedRent: nextCycleTenant.expectedRent,
           expectedWater: nextCycleTenant.expectedWater,
           status: getCycleTenantStatus(nextCycleTenant),
           updatedBy: user.uid,
         });
       }), 10000);
-      await recordAudit('TENANT_CHARGES_ADJUSTED', 'tenant', selectedTenant.id, { addRent, addWater });
+      await recordAudit('TENANT_WATER_SHARE_SET', 'tenant', selectedTenant.id, { waterShare, cycleId: activeCycle.id });
       closeAnyModal(setIsBillingModalOpen);
       setSelectedTenant(null);
-    } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
+    } catch (err) { setModalError(describeActionError(err, 'updating this month’s tenant water bill')); } finally { setIsProcessing(false); }
   };
 
   const handleDeleteTenant = async (tenant) => {
@@ -1223,6 +1316,13 @@ export default function App() {
       }
 
       const currentTenants = activeTenants;
+      const tenantHousing = currentTenants.map(tenant => ({
+        tenant,
+        house: houses.find(house => house.id === tenant.houseId),
+      }));
+      if (tenantHousing.some(({ house }) => !house || !Number.isFinite(Number(house.rent)))) {
+        throw new Error('Every active tenant needs an assigned property with a valid monthly rent before opening a billing cycle.');
+      }
       const currentTenantCycles = activeCycle
         ? tenantCycles.filter(cycleTenant => cycleTenant.cycleId === activeCycle.id)
         : [];
@@ -1256,15 +1356,15 @@ export default function App() {
           });
         });
       }
-      currentTenants.forEach(tenant => {
+      tenantHousing.forEach(({ tenant, house }) => {
         const cycleTenantId = tenantCycleDocumentId(tenant.id, cycleRef.id);
         const cycleTenant = {
           tenantId: tenant.id,
           cycleId: cycleRef.id,
           tenantName: tenant.name,
           houseId: tenant.houseId || '',
-          expectedRent: Number(tenant.expectedRent || 0),
-          expectedWater: Number(tenant.expectedWater || 0),
+          expectedRent: Number(house.rent || 0),
+          expectedWater: 0,
           paidRent: 0,
           paidWater: 0,
           status: 'OPEN',
@@ -1327,17 +1427,16 @@ export default function App() {
     const openCycles = cycleDocs.docs.filter(cycle => cycle.data().status === 'OPEN');
     if (openCycles.length > 1) throw new Error('More than one billing cycle is open. Resolve the duplicate open cycles before resetting data.');
     const cycleStatusById = new Map(cycleDocs.docs.map(cycle => [cycle.id, cycle.data().status]));
-    const operations = [
+    const deleteOperations = [
       ...paymentDocs.docs.map(payment => batch => batch.delete(documentRef('payments', payment.id))),
       ...referenceDocs.docs.map(reference => batch => batch.delete(documentRef('paymentReferences', reference.id))),
       ...repairDocs.docs.map(repair => batch => batch.delete(documentRef('repairs', repair.id))),
       ...septicDocs.docs.map(log => batch => batch.delete(documentRef('septicLogs', log.id))),
       ...waterBillDocs.docs.map(bill => batch => batch.delete(documentRef('masterWaterBills', bill.id))),
-      ...tenantDocs.docs.map(tenant => batch => batch.update(documentRef('tenants', tenant.id), {
-        paidRent: 0, paidWater: 0, ...makeRecordMetadata(user, true),
-      })),
     ];
-    await commitBatches(operations);
+    const tenantBalanceOperations = tenantDocs.docs.map(tenant => batch => batch.update(documentRef('tenants', tenant.id), {
+        paidRent: 0, paidWater: 0, ...makeRecordMetadata(user, true),
+    }));
     const cycleResetOperations = tenantCycleDocs.docs
       .filter(cycleTenant => cycleStatusById.has(cycleTenant.data().cycleId))
       .map(cycleTenant => batch => {
@@ -1350,7 +1449,23 @@ export default function App() {
           paidRent: 0, paidWater: 0, status, ...makeRecordMetadata(user, true),
         });
       });
-    await commitBatches(cycleResetOperations, 15);
+    const commitResetStage = async (resetStage, stageOperations, chunkSize) => {
+      try {
+        await commitBatches(stageOperations, chunkSize);
+      } catch (error) {
+        const stageError = new Error(error.message || 'Firestore rejected the write.');
+        stageError.code = error.code;
+        stageError.resetStage = resetStage;
+        stageError.partialReset = true;
+        throw stageError;
+      }
+    };
+
+    // Clear cycle balances before deleting their payment history. If a cycle
+    // update is denied, the original payment records are still available.
+    await commitResetStage('monthly tenant-cycle balances', cycleResetOperations, 15);
+    await commitResetStage('tenant balance totals', tenantBalanceOperations);
+    await commitResetStage('payment, reference, repair, septic, and water-invoice records', deleteOperations);
     await recordAudit('OPERATIONAL_DATA_RESET', 'workspace', workspaceId, { deletedPayments: paymentDocs.size });
     setToastMessage('Data reset completed. Houses and tenant charges were preserved.');
   };
@@ -1388,7 +1503,10 @@ export default function App() {
       }
       setConfirmationAction(null);
     } catch (error) {
-      setModalError(error.message || 'The requested action could not be completed.');
+      const action = confirmationAction.type === 'resetData'
+        ? 'resetting payment and operations data'
+        : confirmationAction.type === 'deleteTenant' ? 'removing the tenant' : 'closing the billing cycle';
+      setModalError(describeActionError(error, action));
     } finally {
       setIsProcessing(false);
     }
@@ -1410,8 +1528,12 @@ export default function App() {
 
     let activeRentArrears = 0, activeWaterArrears = 0;
     activeTenants.forEach(t => {
-      const rBal = (t.expectedRent || 0) - (t.paidRent || 0);
-      const wBal = (t.expectedWater || 0) - (t.paidWater || 0);
+      const cycleTenant = activeTenantCycles.get(t.id);
+      const house = houses.find(item => item.id === t.houseId);
+      const rBal = Number(cycleTenant?.expectedRent ?? house?.rent ?? t.expectedRent ?? 0) -
+        Number(cycleTenant?.paidRent ?? t.paidRent ?? 0);
+      const wBal = Number(cycleTenant?.expectedWater ?? t.expectedWater ?? 0) -
+        Number(cycleTenant?.paidWater ?? t.paidWater ?? 0);
       if (rBal > 0) activeRentArrears += rBal;
       if (wBal > 0) activeWaterArrears += wBal;
     });
@@ -2011,7 +2133,7 @@ export default function App() {
                   <div>
                     <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Tenants Directory</h2>
                   </div>
-                  <button onClick={() => { setModalError(''); setIsTenantModalOpen(true); }} className="bg-gray-800 hover:bg-gray-900 text-white px-5 py-2.5 rounded-xl text-sm font-bold flex items-center gap-2 shadow-sm transition-all hover:shadow-md hover:-translate-y-0.5">
+                  <button onClick={() => { setModalError(''); setNewTenantHouseId(''); setIsTenantModalOpen(true); }} className="bg-gray-800 hover:bg-gray-900 text-white px-5 py-2.5 rounded-xl text-sm font-bold flex items-center gap-2 shadow-sm transition-all hover:shadow-md hover:-translate-y-0.5">
                     <Plus size={18}/> Register Tenant
                   </button>
                 </div>
@@ -2032,7 +2154,14 @@ export default function App() {
                       )}
                       {sortedTenants.map(tenant => {
                         const house = houses.find(h => h.id === tenant.houseId);
-                        const owesMoney = (tenant.expectedRent - tenant.paidRent) > 0 || (tenant.expectedWater - tenant.paidWater) > 0;
+                        const cycle = activeTenantCycles.get(tenant.id);
+                        const rentDue = cycle
+                          ? Number(cycle.expectedRent || 0) - Number(cycle.paidRent || 0)
+                          : Number(tenant.expectedRent || 0) - Number(tenant.paidRent || 0);
+                        const waterDue = cycle
+                          ? Number(cycle.expectedWater || 0) - Number(cycle.paidWater || 0)
+                          : Number(tenant.expectedWater || 0) - Number(tenant.paidWater || 0);
+                        const owesMoney = rentDue > 0 || waterDue > 0;
                         return (
                           <tr key={tenant.id} className={`transition cursor-pointer ${theme === 'dark' ? 'hover:bg-slate-950/40' : 'hover:bg-[#FDFBF7]'}`} onClick={() => setSelectedTenantForDetails(tenant)}>
                             <td className={`p-4 font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{tenant.name}</td>
@@ -2145,7 +2274,7 @@ export default function App() {
                             <div className="flex gap-2.5">
                               <button onClick={() => { setModalError(''); setSelectedTenant(tenant); setIsPaymentModalOpen(true); }} disabled={!activeCycle || !cycleTenant || isProcessing || !canRecordRent} className="flex-1 bg-gray-800 hover:bg-gray-900 text-white text-xs font-bold py-2.5 rounded-xl transition-all shadow-sm text-center disabled:cursor-not-allowed disabled:opacity-40">Log Payment</button>
                               {hasPermission(role, PERMISSIONS.RECORD_RENT) && (
-                                <button onClick={() => { setModalError(''); setSelectedTenant(tenant); setIsBillingModalOpen(true); }} className={`flex-1 text-xs font-bold py-2.5 rounded-xl transition-all shadow-sm text-center border ${theme === 'dark' ? 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700' : 'bg-white hover:bg-gray-50 text-gray-800 border-gray-200'}`}>Update Bills</button>
+                                <button onClick={() => { setModalError(''); setSelectedTenant(tenant); setIsBillingModalOpen(true); }} disabled={!activeCycle || !cycleTenant || isProcessing} className={`flex-1 text-xs font-bold py-2.5 rounded-xl transition-all shadow-sm text-center border disabled:cursor-not-allowed disabled:opacity-40 ${theme === 'dark' ? 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700' : 'bg-white hover:bg-gray-50 text-gray-800 border-gray-200'}`}>Set Water Share</button>
                               )}
                             </div>
                             {canApproveRent && (
@@ -2411,7 +2540,7 @@ export default function App() {
             </h3>
             <p className={`mt-3 text-sm leading-relaxed ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>
               {confirmationAction.type === 'resetData'
-                ? 'This will permanently erase ALL payment records, repair logs, septic logs, and water bill invoices. Tenants and houses will be preserved. This cannot be undone. Paid totals in monthly cycles will also reset, while cycle months and expected rent/water charges are preserved.'
+                ? 'This will permanently erase ALL payment records, repair logs, septic logs, and water bill invoices. Tenants and houses will be preserved. This cannot be undone. Paid totals in monthly cycles will also reset, while cycle months and expected rent/water charges are preserved. Because large resets run in batches, a later failure may leave earlier batches completed; the error will identify where it stopped.'
                 : confirmationAction.type === 'closeCycle'
                   ? `Close ${activeCycle?.month || 'the current month'}? New payments will require a new billing cycle.`
                   : `Archive ${confirmationAction.tenant.name} from the active directory? Their financial history will remain available for audit.`}
@@ -2503,20 +2632,23 @@ export default function App() {
                 </div>
                 <div className="col-span-2">
                   <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Assign House Unit (Vacant only)</label>
-                  <select required name="houseId" className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 text-sm font-bold transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`}>
+                  <select required name="houseId" value={newTenantHouseId} onChange={event => setNewTenantHouseId(event.target.value)} className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 text-sm font-bold transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`}>
                     <option value="">-- Select Vacant Unit --</option>
                     {houses.filter(h => h.status === 'VACANT' && !occupiedHouseIds.has(h.id)).map(h => (
                       <option key={h.id} value={h.id}>{h.name} ({formatKes(h.rent)})</option>
                     ))}
                   </select>
                 </div>
-                <div>
-                  <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Start Rent Bill</label>
-                  <input required name="expectedRent" type="number" defaultValue="0" className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 font-bold text-sm transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`} />
-                </div>
-                <div>
-                  <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Start Water Bill</label>
-                  <input required name="expectedWater" type="number" defaultValue="0" className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 font-bold text-sm transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`} />
+                <div className={`col-span-2 grid grid-cols-2 gap-3 rounded-xl border p-4 ${theme === 'dark' ? 'border-slate-800 bg-slate-950' : 'border-[#E8DFCE] bg-[#F4EFE6]'}`}>
+                  <div>
+                    <p className="text-[10px] font-bold uppercase tracking-wider text-gray-500">Monthly rent target</p>
+                    <p className="mt-1 font-mono text-lg font-bold">{formatKes(selectedNewTenantHouse?.rent || 0)}</p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] font-bold uppercase tracking-wider text-gray-500">Security deposit (one month)</p>
+                    <p className="mt-1 font-mono text-lg font-bold">{formatKes(selectedNewTenantHouse?.rent || 0)}</p>
+                  </div>
+                  <p className="col-span-2 text-xs text-gray-500">Rent and deposit follow the selected unit’s rent. Water is added separately for each billing month after the tenant’s share is calculated.</p>
                 </div>
               </div>
               <button type="submit" disabled={isProcessing} className="w-full bg-gray-800 hover:bg-gray-900 text-white font-bold py-3.5 rounded-xl mt-6 disabled:opacity-50 transition-all shadow-md hover:shadow-lg">
@@ -2541,11 +2673,11 @@ export default function App() {
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="col-span-2">
-                  <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Move To New House (Optional)</label>
-                  <select name="houseId" defaultValue={selectedTenantForDetails.houseId} className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 text-sm font-bold transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`}>
-                    <option value={selectedTenantForDetails.houseId}>Keep Current Unit ({houses.find(h => h.id === selectedTenantForDetails.houseId)?.name || 'Unassigned'})</option>
-                    {houses.filter(h => h.status === 'VACANT' && !occupiedHouseIds.has(h.id)).map(h => (
-                      <option key={h.id} value={h.id}>Move to: {h.name}</option>
+                  <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Assigned Property Unit</label>
+                  <select required name="houseId" value={editTenantHouseId} onChange={event => setEditTenantHouseId(event.target.value)} className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 text-sm font-bold transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`}>
+                    <option value="">-- Select a property unit --</option>
+                    {houses.filter(h => h.id === selectedTenantForDetails.houseId || (h.status === 'VACANT' && !occupiedHouseIds.has(h.id))).map(h => (
+                      <option key={h.id} value={h.id}>{h.id === selectedTenantForDetails.houseId ? 'Keep Current Unit: ' : 'Move to: '}{h.name}</option>
                     ))}
                   </select>
                 </div>
@@ -2559,13 +2691,16 @@ export default function App() {
                     <option>SMS Text</option><option>Phone Call</option><option>Face-to-Face</option>
                   </select>
                 </div>
-                <div>
-                  <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Expected Rent Target</label>
-                  <input required name="expectedRent" type="number" defaultValue={selectedTenantForDetails.expectedRent} className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 font-bold text-sm transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`} />
-                </div>
-                <div>
-                  <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Expected Water Target</label>
-                  <input required name="expectedWater" type="number" defaultValue={selectedTenantForDetails.expectedWater} className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 font-bold text-sm transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`} />
+                <div className={`col-span-2 grid grid-cols-2 gap-3 rounded-xl border p-4 ${theme === 'dark' ? 'border-slate-800 bg-slate-950' : 'border-[#E8DFCE] bg-[#F4EFE6]'}`}>
+                  <div>
+                    <p className="text-[10px] font-bold uppercase tracking-wider text-gray-500">Monthly rent target</p>
+                    <p className="mt-1 font-mono text-lg font-bold">{formatKes(selectedEditTenantHouse?.rent ?? selectedTenantForDetails.expectedRent ?? 0)}</p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] font-bold uppercase tracking-wider text-gray-500">Security deposit (one month)</p>
+                    <p className="mt-1 font-mono text-lg font-bold">{formatKes(selectedEditTenantHouse?.rent ?? selectedTenantForDetails.expectedRent ?? 0)}</p>
+                  </div>
+                  <p className="col-span-2 text-xs text-gray-500">The rent target and deposit are tied to the selected unit. Set each tenant’s water share separately for the active billing month.</p>
                 </div>
               </div>
               <button type="submit" disabled={isProcessing} className="w-full bg-gray-800 hover:bg-gray-900 text-white font-bold py-3.5 rounded-xl mt-6 flex items-center justify-center gap-2 disabled:opacity-50 transition-all shadow-md hover:shadow-lg">
@@ -2632,18 +2767,14 @@ export default function App() {
               <h3 className="text-xl font-bold">Add Monthly Charges</h3>
               <button onClick={() => closeAnyModal(setIsBillingModalOpen)} className={`p-2 rounded-full ${theme === 'dark' ? 'hover:bg-white/5 text-gray-400 hover:text-white' : 'hover:bg-black/5 text-gray-500 hover:text-gray-900'}`}><X/></button>
             </div>
-            <p className="text-xs text-gray-500 font-medium mb-6">Post charges directly onto {selectedTenant.name}'s account.</p>
+            <p className="text-xs text-gray-500 font-medium mb-6">Set this tenant’s allocated water share for {activeCycle?.month || 'the open billing cycle'}. This replaces the current share; rent is set from the property unit.</p>
             <form onSubmit={handleUpdateBills} className="space-y-5">
               <div>
-                <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">New Rent Charge (KES)</label>
-                <input required name="addRent" type="number" defaultValue="0" className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 font-bold transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`} />
-              </div>
-              <div>
-                <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">New Water Charge (KES)</label>
-                <input required name="addWater" type="number" defaultValue="0" className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 font-bold transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`} />
+                <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Tenant’s Water Share for this Month (KES)</label>
+                <input required name="waterShare" type="number" min="0" step="0.01" defaultValue={selectedTenantCycle?.expectedWater || 0} className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 font-bold transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`} />
               </div>
               <button type="submit" disabled={isProcessing} className="w-full bg-gray-800 hover:bg-gray-900 text-white font-bold py-3.5 rounded-xl mt-6 disabled:opacity-50 transition-all shadow-md hover:shadow-lg">
-                {isProcessing ? 'Updating Ledger...' : 'Add Charges'}
+                {isProcessing ? 'Updating Ledger...' : 'Save Water Share'}
               </button>
             </form>
           </div>
@@ -2771,6 +2902,14 @@ export default function App() {
                   <p className="text-[10px] text-gray-500 font-bold uppercase tracking-wider mb-1.5">Contact Info</p>
                   <p className={`font-bold flex items-center gap-2 ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}><Phone size={16} className={`shrink-0 ${theme === 'dark' ? 'text-emerald-500' : 'text-emerald-600'}`}/>{selectedTenantForDetails.phone}</p>
                 </div>
+                <div className={`p-4 rounded-2xl border ${theme === 'dark' ? 'bg-slate-950 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
+                  <p className="text-[10px] text-gray-500 font-bold uppercase tracking-wider mb-1.5">Monthly Rent</p>
+                  <p className="font-mono text-lg font-black">{formatKes(selectedDetailRent)}</p>
+                </div>
+                <div className={`p-4 rounded-2xl border ${theme === 'dark' ? 'bg-slate-950 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
+                  <p className="text-[10px] text-gray-500 font-bold uppercase tracking-wider mb-1.5">Security Deposit (one month)</p>
+                  <p className="font-mono text-lg font-black">{formatKes(selectedDetailDeposit)}</p>
+                </div>
               </div>
 
               <div>
@@ -2778,11 +2917,11 @@ export default function App() {
                 <div className="flex gap-4">
                   <div className="flex-1">
                     <p className="text-xs text-gray-500 font-bold uppercase tracking-wider mb-1">Rent Arrears</p>
-                    <p className={`font-mono text-xl font-black ${(selectedTenantForDetails.expectedRent || 0) - (selectedTenantForDetails.paidRent || 0) > 0 ? (theme === 'dark' ? 'text-rose-500' : 'text-rose-600') : (theme === 'dark' ? 'text-emerald-500' : 'text-emerald-600')}`}>{formatKes((selectedTenantForDetails.expectedRent || 0) - (selectedTenantForDetails.paidRent || 0))}</p>
+                    <p className={`font-mono text-xl font-black ${selectedDetailRentDue > 0 ? (theme === 'dark' ? 'text-rose-500' : 'text-rose-600') : (theme === 'dark' ? 'text-emerald-500' : 'text-emerald-600')}`}>{formatKes(selectedDetailRentDue)}</p>
                   </div>
                   <div className="flex-1">
                     <p className="text-xs text-gray-500 font-bold uppercase tracking-wider mb-1">Water Arrears</p>
-                    <p className={`font-mono text-xl font-black ${(selectedTenantForDetails.expectedWater || 0) - (selectedTenantForDetails.paidWater || 0) > 0 ? (theme === 'dark' ? 'text-rose-500' : 'text-rose-600') : (theme === 'dark' ? 'text-emerald-500' : 'text-emerald-600')}`}>{formatKes((selectedTenantForDetails.expectedWater || 0) - (selectedTenantForDetails.paidWater || 0))}</p>
+                    <p className={`font-mono text-xl font-black ${selectedDetailWaterDue > 0 ? (theme === 'dark' ? 'text-rose-500' : 'text-rose-600') : (theme === 'dark' ? 'text-emerald-500' : 'text-emerald-600')}`}>{formatKes(selectedDetailWaterDue)}</p>
                   </div>
                 </div>
               </div>
@@ -2805,7 +2944,7 @@ export default function App() {
               <div className={`flex justify-between items-center pt-5 border-t ${theme === 'dark' ? 'border-slate-800' : 'border-[#DCD4C6]'}`}>
                 {isLandlord && <button onClick={() => handleDeleteTenant(selectedTenantForDetails)} disabled={isProcessing} className={`text-sm font-bold px-4 py-2.5 rounded-xl transition disabled:opacity-50 ${theme === 'dark' ? 'text-rose-500 hover:bg-rose-500/10' : 'text-rose-600 hover:bg-rose-500/10'}`}>Remove Tenant</button>}
                 {canManageTenants ? (
-                  <button onClick={() => setIsEditTenantModalOpen(true)} disabled={isProcessing} className="bg-gray-800 hover:bg-gray-900 text-white font-bold text-sm px-6 py-3 rounded-xl transition flex items-center gap-2 shadow-md hover:shadow-lg"><Edit size={16}/> Edit Details</button>
+                  <button onClick={() => { setEditTenantHouseId(selectedTenantForDetails.houseId || ''); setModalError(''); setIsEditTenantModalOpen(true); }} disabled={isProcessing} className="bg-gray-800 hover:bg-gray-900 text-white font-bold text-sm px-6 py-3 rounded-xl transition flex items-center gap-2 shadow-md hover:shadow-lg"><Edit size={16}/> Edit Details</button>
                 ) : (
                   <p className="text-xs text-gray-500 flex items-center gap-1.5 ml-auto font-medium"><Info size={14}/> Editing locked for Managers</p>
                 )}

@@ -175,6 +175,48 @@ service cloud.firestore {
         (!('updatedBy' in data) || (data.updatedBy is string && data.updatedBy.size() <= 128));
     }
 
+    function tenantCycleStatusMatchesBalances(data) {
+      let rentDue = data.expectedRent - data.paidRent;
+      let waterDue = data.expectedWater - data.paidWater;
+      let hasPayments = data.paidRent > 0 || data.paidWater > 0;
+      return ((rentDue <= 0 && waterDue <= 0) && data.status == 'CLEARED') ||
+        ((rentDue > 0 || waterDue > 0) && hasPayments && data.status == 'ARREARS') ||
+        ((rentDue > 0 || waterDue > 0) && !hasPayments && data.status == 'OPEN');
+    }
+
+    function isValidTenantPricing(data) {
+      return (!('expectedRent' in data) ||
+          (data.expectedRent is number && data.expectedRent >= 0 && data.expectedRent <= 1000000000000)) &&
+        (!('depositAmount' in data) ||
+          ('expectedRent' in data && data.depositAmount is number && data.depositAmount == data.expectedRent)) &&
+        (!('expectedWater' in data) ||
+          (data.expectedWater is number && data.expectedWater >= 0 && data.expectedWater <= 1000000000000));
+    }
+
+    function tenantRentMatchesUnit(appId, data) {
+      let housePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/houses/$(data.houseId);
+      return data.houseId is string && data.houseId.size() > 0 && data.houseId.size() <= 150 &&
+        existsAfter(housePath) && getAfter(housePath).data.rent is number &&
+        data.expectedRent == getAfter(housePath).data.rent &&
+        (sameWorkspace(getAfter(housePath).data) ||
+          (isLegacyLandlord() && legacyRecord(getAfter(housePath).data)));
+    }
+
+    function isValidTenantLeaseCreate(appId, data) {
+      return data.keys().hasAll(['houseId', 'expectedRent', 'depositAmount']) &&
+        isValidTenantPricing(data) && tenantRentMatchesUnit(appId, data);
+    }
+
+    function tenantPricingUpdateIsValid(appId) {
+      let data = request.resource.data;
+      let rentOrHouseChanged = data.diff(resource.data).affectedKeys().hasAny([
+        'expectedRent', 'depositAmount', 'houseId'
+      ]);
+      return isValidTenantPricing(data) &&
+        (!rentOrHouseChanged ||
+          (data.keys().hasAll(['houseId', 'expectedRent', 'depositAmount']) && tenantRentMatchesUnit(appId, data)));
+    }
+
     function isCycleCollection(collectionName) {
       return collectionName in ['billingCycles', 'tenantCycles'];
     }
@@ -194,13 +236,25 @@ service cloud.firestore {
     }
 
     function tenantCycleResetIsValid(appId, recordId) {
+      let before = resource.data;
       let data = request.resource.data;
       let billingCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/billingCycles/$(data.cycleId);
       let chargesExist = data.expectedRent > 0 || data.expectedWater > 0;
-      return isValidTenantCycle(data, recordId) &&
+      return data.keys().hasAll([
+          'tenantId', 'cycleId', 'expectedRent', 'expectedWater', 'paidRent',
+          'paidWater', 'status', 'workspaceId'
+        ]) &&
+        data.tenantId is string && data.tenantId.size() > 0 && data.tenantId.size() <= 128 &&
+        data.cycleId is string && data.cycleId.size() > 0 && data.cycleId.size() <= 128 &&
+        recordId == data.tenantId + '_' + data.cycleId &&
+        data.expectedRent is number && data.expectedRent >= 0 && data.expectedRent <= 1000000000000 &&
+        data.expectedWater is number && data.expectedWater >= 0 && data.expectedWater <= 1000000000000 &&
+        data.paidRent is number && data.paidRent == 0 &&
+        data.paidWater is number && data.paidWater == 0 &&
+        data.workspaceId is string && data.workspaceId.size() > 0 && data.workspaceId.size() <= 120 &&
+        data.updatedBy == request.auth.uid &&
         exists(billingCyclePath) && sameWorkspace(get(billingCyclePath).data) &&
-        data.diff(resource.data).affectedKeys().hasOnly(['paidRent', 'paidWater', 'status', 'updatedBy']) &&
-        data.paidRent == 0 && data.paidWater == 0 &&
+        data.diff(before).affectedKeys().hasOnly(['paidRent', 'paidWater', 'status', 'updatedBy']) &&
         ((get(billingCyclePath).data.status == 'OPEN' &&
             ((chargesExist && data.status == 'OPEN') || (!chargesExist && data.status == 'CLEARED'))) ||
          (get(billingCyclePath).data.status == 'CLOSED' &&
@@ -219,12 +273,6 @@ service cloud.firestore {
       return (collectionName == 'houses' &&
           request.resource.data.diff(resource.data).affectedKeys().hasOnly(['repairStatus', 'updatedBy']) &&
           request.resource.data.repairStatus in ['GOOD', 'NEEDS_REPAIR']) ||
-        (collectionName == 'tenants' &&
-          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['expectedRent', 'expectedWater', 'updatedBy']) &&
-          request.resource.data.expectedRent is number && request.resource.data.expectedRent >= 0 &&
-          request.resource.data.expectedRent <= 1000000000000 &&
-          request.resource.data.expectedWater is number && request.resource.data.expectedWater >= 0 &&
-          request.resource.data.expectedWater <= 1000000000000) ||
         (collectionName == 'repairs' &&
           request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cost', 'resolvedAt', 'updatedBy']) &&
           request.resource.data.status == 'RESOLVED' &&
@@ -233,8 +281,8 @@ service cloud.firestore {
         (collectionName == 'tenantCycles' &&
           isValidTenantCycle(request.resource.data, recordId) &&
           tenantCycleParentIsOpen(appId, request.resource.data) &&
-          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['expectedRent', 'expectedWater', 'status', 'updatedBy']) &&
-          request.resource.data.status in ['OPEN', 'CLEARED', 'ARREARS']);
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['expectedWater', 'status', 'updatedBy']) &&
+          tenantCycleStatusMatchesBalances(request.resource.data));
     }
 
     function isValidCollectionCreate(collectionName, appId, data, recordId) {
@@ -242,7 +290,8 @@ service cloud.firestore {
           !('updatedBy' in data) && paymentCycleIsOpen(appId, data)) ||
         (collectionName == 'billingCycles' && isValidBillingCycle(data, recordId)) ||
         (collectionName == 'tenantCycles' && validTenantCycleCreate(appId, data, recordId)) ||
-        (!isCycleCollection(collectionName) && collectionName != 'payments');
+        (collectionName == 'tenants' && isValidTenantLeaseCreate(appId, data)) ||
+        (!isCycleCollection(collectionName) && collectionName != 'payments' && collectionName != 'tenants');
     }
 
     function cycleUpdateIsValid(collectionName, appId, recordId) {
@@ -311,6 +360,7 @@ service cloud.firestore {
         (sameWorkspace(resource.data) || (isLegacyLandlord() && legacyRecord(resource.data))) &&
         (sameWorkspace(request.resource.data) || (isLegacyLandlord() && legacyRecord(request.resource.data))) &&
         request.resource.data.updatedBy == request.auth.uid &&
+        (collectionName != 'tenants' || tenantPricingUpdateIsValid(appId)) &&
         (cycleUpdateIsValid(collectionName, appId, recordId) ||
           (collectionName == 'tenantCycles' && tenantCycleResetIsValid(appId, recordId)));
 
