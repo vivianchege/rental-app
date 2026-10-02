@@ -212,9 +212,13 @@ service cloud.firestore {
       let rentOrHouseChanged = data.diff(resource.data).affectedKeys().hasAny([
         'expectedRent', 'depositAmount', 'houseId'
       ]);
-      return isValidTenantPricing(data) &&
-        (!rentOrHouseChanged ||
-          (data.keys().hasAll(['houseId', 'expectedRent', 'depositAmount']) && tenantRentMatchesUnit(appId, data)));
+      // Balance-only updates (payments and reset) preserve legacy lease fields
+      // as-is. Validate the unit/rent/deposit invariant only when those fields
+      // are actually changed.
+      return !rentOrHouseChanged ||
+        (isValidTenantPricing(data) &&
+          data.keys().hasAll(['houseId', 'expectedRent', 'depositAmount']) &&
+          tenantRentMatchesUnit(appId, data));
     }
 
     function isCycleCollection(collectionName) {
