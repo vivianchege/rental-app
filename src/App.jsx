@@ -24,7 +24,9 @@ import {
   signInWithPopup
 } from 'firebase/auth';
 import { 
-  getFirestore, 
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
   collection, 
   onSnapshot, 
   doc, 
@@ -36,6 +38,8 @@ import {
   where,
   enableIndexedDbPersistence 
 } from 'firebase/firestore';
+import { allocatePayment, parseMoney } from './lib/money.js';
+import { hasPermission, PERMISSIONS } from './lib/permissions.js';
 
 // --- FIREBASE SETUP ---
 const firebaseConfig = {
@@ -72,7 +76,6 @@ if (db) {
   });
 }
 
-// Safe database timeout wrapper to prevent sandbox freezes
 const promiseTimeout = (promise, ms = 15000) => {
   return Promise.race([
     promise,
@@ -99,6 +102,15 @@ export default function App() {
   // Global states for errors and visual loading states
   const [isProcessing, setIsProcessing] = useState(false);
   const [modalError, setModalError] = useState('');
+  const [confirmationAction, setConfirmationAction] = useState(null);
+  const [isCycleModalOpen, setIsCycleModalOpen] = useState(false);
+  const [cycleMonth, setCycleMonth] = useState(() => new Date().getMonth());
+  const [cycleYear, setCycleYear] = useState(() => new Date().getFullYear());
+  const [selectedDashboardCycleId, setSelectedDashboardCycleId] = useState('ACTIVE');
+  const [tenantSearch, setTenantSearch] = useState('');
+  const [tenantStatusFilter, setTenantStatusFilter] = useState('ALL');
+  const [paymentMonthFilter, setPaymentMonthFilter] = useState(createCurrentMonthKey);
+  const rejectedGoogleUserUid = useRef(null);
 
   // Authentication State Variables
   const [loginTab, setLoginTab] = useState('landlord'); 
@@ -119,6 +131,12 @@ export default function App() {
   const [expenses, setExpenses] = useState([]);
   const [activityLogs, setActivityLogs] = useState([]);
   const [notifications, setNotifications] = useState([]);
+
+  const isLandlord = hasPermission(role, PERMISSIONS.MANAGE_SETTINGS);
+  const canManageProperties = hasPermission(role, PERMISSIONS.MANAGE_PROPERTIES);
+  const canManageTenants = hasPermission(role, PERMISSIONS.MANAGE_TENANTS);
+  const canRecordRent = hasPermission(role, PERMISSIONS.RECORD_RENT);
+  const canApproveRent = hasPermission(role, PERMISSIONS.APPROVE_RENT);
 
   // Modals Visibility Controllers
   const [isHouseModalOpen, setIsHouseModalOpen] = useState(false);
@@ -226,7 +244,7 @@ export default function App() {
         setHouses(fetchedHouses);
     }, handleSnapshotError);
 
-    const unsubTenants = onSnapshot(getColRef('tenants'), (snap) => {
+    const unsubTenants = onSnapshot(collectionRef('tenants'), (snap) => {
         setTenants(snap.docs.map(d => ({ id: d.id, ...d.data() })));
     }, handleSnapshotError);
 
@@ -266,12 +284,52 @@ export default function App() {
       setNotifications(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)));
     }, handleSnapshotError);
 
+    const unsubCycles = onSnapshot(collectionRef('billingCycles'), (snap) => {
+      const cycles = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      cycles.sort((a, b) => new Date(b.openedAt) - new Date(a.openedAt));
+      setBillingCycles(cycles);
+    }, console.error);
+
+    const unsubTenantCycles = onSnapshot(collectionRef('tenantCycles'), (snap) => {
+      setTenantCycles(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    }, console.error);
+
     return () => { 
       unsubHouses(); unsubTenants(); unsubPayments();
       unsubRepairs(); unsubSeptic(); unsubWaterBills(); unsubWaterVaultResets(); unsubExpenses();
       unsubActivity(); unsubNotifications();
     };
   }, [user, role, workspaceId]);
+
+  const activeCycle = useMemo(() => billingCycles.find(cycle => cycle.status === 'OPEN') || null, [billingCycles]);
+  const viewedCycle = selectedDashboardCycleId === 'ACTIVE'
+    ? activeCycle
+    : billingCycles.find(cycle => cycle.id === selectedDashboardCycleId) || activeCycle;
+  const isHistoricalCycleView = Boolean(viewedCycle && viewedCycle.id !== activeCycle?.id);
+  const tenantCycleById = useMemo(() => new Map(tenantCycles.map(cycle => [cycle.id, cycle])), [tenantCycles]);
+  const activeTenantCycles = useMemo(() => new Map(
+    tenantCycles.filter(cycle => cycle.cycleId === activeCycle?.id).map(cycle => [cycle.tenantId, cycle])
+  ), [tenantCycles, activeCycle]);
+  const ledgerMonths = useMemo(() => {
+    const monthKeys = [...new Set(payments.map(payment => getMonthKey(payment.date)).filter(Boolean))];
+    return monthKeys.sort((a, b) => b.localeCompare(a));
+  }, [payments]);
+
+  const filteredTenants = useMemo(() => {
+    const normalizedSearch = tenantSearch.trim().toLowerCase();
+    return tenants.filter(tenant => {
+      const cycle = activeTenantCycles.get(tenant.id);
+      const rentDue = Number(cycle?.expectedRent || 0) - Number(cycle?.paidRent || 0);
+      const waterDue = Number(cycle?.expectedWater || 0) - Number(cycle?.paidWater || 0);
+      const hasArrears = Boolean(cycle) && (rentDue > 0 || waterDue > 0);
+      const isCleared = Boolean(cycle) && rentDue <= 0 && waterDue <= 0;
+      const matchesSearch = !normalizedSearch || tenant.name?.toLowerCase().includes(normalizedSearch);
+      const matchesStatus = tenantStatusFilter === 'ALL'
+        || (tenantStatusFilter === 'ARREARS' && hasArrears)
+        || (tenantStatusFilter === 'CLEARED' && isCleared);
+      return matchesSearch && matchesStatus;
+    });
+  }, [tenants, activeTenantCycles, tenantSearch, tenantStatusFilter]);
 
   // Derived occupancies
   const activeTenants = useMemo(() => tenants.filter(t => t.status !== 'ARCHIVED' && !t.archivedAt), [tenants]);
@@ -303,6 +361,7 @@ export default function App() {
   // Handle standard email password sign in
   const handleLoginSubmit = async (e) => {
     e.preventDefault();
+    if (isProcessing) return;
     setLoginError('');
     if (!auth) {
       setLoginError('The portal is not configured yet. Add the Firebase values from .env.example.');
@@ -321,6 +380,7 @@ export default function App() {
 
   // Google Single-Sign On (SSO) Popup handler
   const handleGoogleSignIn = async () => {
+    if (isProcessing) return;
     setLoginError('');
     if (!auth) {
       setLoginError('The portal is not configured yet. Add the Firebase values from .env.example.');
@@ -328,6 +388,8 @@ export default function App() {
     }
     setIsProcessing(true);
     const provider = new GoogleAuthProvider();
+    provider.setCustomParameters({ prompt: 'select_account' });
+    rejectedGoogleUserUid.current = null;
     try {
       await signInWithPopup(auth, provider);
       triggerWelcome();
@@ -759,6 +821,10 @@ export default function App() {
     setIsProcessing(true);
     setModalError('');
     try {
+      if (!activeCycle) throw new Error('Open a billing cycle before logging payments.');
+      const cycleTenant = activeTenantCycles.get(selectedTenant.id);
+      if (!cycleTenant) throw new Error('This tenant is not set up in the active billing cycle yet.');
+
       const formData = new FormData(e.target);
       const amount = parseMoney(formData.get('amount'));
       const type = formData.get('type');
@@ -1058,6 +1124,86 @@ export default function App() {
     };
   })();
 
+  const cyclePayments = useMemo(() => (
+    viewedCycle ? payments.filter(payment => payment.cycleId === viewedCycle.id) : []
+  ), [viewedCycle, payments]);
+
+  const cycleStats = useMemo(() => {
+    let collectedRentRev = 0;
+    let collectedWaterRev = 0;
+    let totalJosephBonus = 0;
+    let pendingPaymentsCount = 0;
+    let activeRentArrears = 0;
+    let activeWaterArrears = 0;
+    let totalRepairExpenses = 0;
+    let totalSepticExpenses = 0;
+    let totalMasterWaterBills = 0;
+    const cycleId = viewedCycle?.id;
+    const currentTenantCycles = cycleId
+      ? tenantCycles.filter(cycleTenant => cycleTenant.cycleId === cycleId)
+      : [];
+
+    cyclePayments.forEach(payment => {
+      if (payment.status === 'CONFIRMED') {
+        collectedRentRev += Number(payment.appliedRent || 0);
+        collectedWaterRev += Number(payment.appliedWater || 0);
+        totalJosephBonus += Number(payment.excessAmount || 0);
+      }
+      if (payment.status === 'PENDING') pendingPaymentsCount += 1;
+    });
+    currentTenantCycles.forEach(cycleTenant => {
+      activeRentArrears += Math.max(0, Number(cycleTenant.expectedRent || 0) - Number(cycleTenant.paidRent || 0));
+      activeWaterArrears += Math.max(0, Number(cycleTenant.expectedWater || 0) - Number(cycleTenant.paidWater || 0));
+    });
+
+    repairs.forEach(repair => {
+      if (repair.cycleId === cycleId && repair.status === 'RESOLVED') totalRepairExpenses += Number(repair.cost || 0);
+    });
+    septicLogs.forEach(log => {
+      if (log.cycleId === cycleId) totalSepticExpenses += Number(log.cost || 0);
+    });
+    masterWaterBills.forEach(bill => {
+      if (bill.cycleId === cycleId) totalMasterWaterBills += Number(bill.amount || 0);
+    });
+
+    const expectedRentRev = collectedRentRev + activeRentArrears;
+    const expectedWaterRev = collectedWaterRev + activeWaterArrears;
+    const waterReserve = collectedWaterRev - totalMasterWaterBills;
+    return {
+      expectedRentRev,
+      collectedRentRev,
+      expectedWaterRev,
+      collectedWaterRev,
+      pendingPaymentsCount,
+      totalJosephBonus,
+      totalOperatingExpenses: totalRepairExpenses + totalSepticExpenses,
+      totalMasterWaterBills,
+      waterReserve,
+      vacantHouses: houses.filter(house => house.status === 'VACANT' && !occupiedHouseIds.has(house.id)).length,
+      openRepairs: repairs.filter(repair => repair.cycleId === cycleId && repair.status === 'OPEN').length,
+      totalRepairExpenses,
+      totalSepticExpenses
+    };
+  }, [viewedCycle, cyclePayments, tenantCycles, repairs, septicLogs, masterWaterBills, houses, occupiedHouseIds]);
+
+  const billingCycleHistory = useMemo(() => billingCycles
+    .filter(cycle => cycle.status === 'CLOSED')
+    .map(cycle => {
+      const cyclePaymentsForHistory = payments.filter(payment => payment.cycleId === cycle.id && payment.status === 'CONFIRMED');
+      const cycleTenantRecords = tenantCycles.filter(cycleTenant => cycleTenant.cycleId === cycle.id);
+      return {
+        ...cycle,
+        rentCollected: cyclePaymentsForHistory.reduce((total, payment) => total + Number(payment.appliedRent || 0), 0),
+        waterCollected: cyclePaymentsForHistory.reduce((total, payment) => total + Number(payment.appliedWater || 0), 0),
+        clearedCount: cycleTenantRecords.filter(cycleTenant => cycleTenant.status === 'CLEARED').length,
+        arrearsCount: cycleTenantRecords.filter(cycleTenant => cycleTenant.status === 'ARREARS').length
+      };
+    }), [billingCycles, payments, tenantCycles]);
+
+  const filteredPayments = useMemo(() => paymentMonthFilter === 'ALL'
+    ? payments
+    : payments.filter(payment => getMonthKey(payment.date) === paymentMonthFilter), [payments, paymentMonthFilter]);
+
   const tenantPaymentHistory = useMemo(() => {
     if (!selectedTenant) return [];
     return payments.filter(p => p.tenantId === selectedTenant.id && p.status === 'CONFIRMED');
@@ -1123,40 +1269,22 @@ export default function App() {
 
   if (!user) {
     return (
-      <div 
-        className={`min-h-screen flex flex-col items-center justify-center p-4 relative ${theme === 'dark' ? 'dark' : ''}`} 
-        style={{ backgroundImage: "url('/HSlogo.png')", backgroundSize: 'cover', backgroundPosition: 'center' }}
-      >
-        <div className="absolute inset-0 bg-black/70 backdrop-blur-[2px] z-0"></div>
-        
-        <div className="bg-slate-900/95 max-w-md w-full rounded-2xl shadow-2xl p-8 border border-gray-800 transition-all z-10 relative">
-          <img src="/HSlogo.png" alt="HSE Logo" className="w-20 h-20 rounded-xl object-cover mx-auto mb-4 shadow-lg border border-gray-700" />
-          <h1 className="text-2xl font-bold text-white text-center mb-1 font-mono tracking-wide">Ruiru Rentals</h1>
-          <p className="text-gray-400 text-xs text-center mb-6">Secured Tenant & Property Portal</p>
-
-          <div className="flex border-b border-gray-800 mb-6">
-            <button 
-              type="button" 
-              onClick={() => { setLoginTab('landlord'); setEmail(''); setPassword(''); setLoginError(''); }}
-              className={`flex-1 pb-3 text-xs font-bold border-b-2 transition-all uppercase tracking-wider ${loginTab === 'landlord' ? 'border-gray-400 text-white' : 'border-transparent text-gray-500 hover:text-gray-400'}`}
-            >
-              Landlord (Admin)
-            </button>
-            <button 
-              type="button" 
-              onClick={() => { setLoginTab('manager'); setEmail(''); setPassword(''); setLoginError(''); }}
-              className={`flex-1 pb-3 text-xs font-bold border-b-2 transition-all uppercase tracking-wider ${loginTab === 'manager' ? 'border-gray-400 text-white' : 'border-transparent text-gray-500 hover:text-gray-400'}`}
-            >
-              Manager Portal
-            </button>
+      <div className={`min-h-screen flex flex-col md:flex-row ${theme === 'dark' ? 'bg-slate-950' : 'bg-white'}`}>
+        <section className="relative flex min-h-56 flex-col justify-between overflow-hidden bg-[#0f172a] px-7 py-7 text-white sm:px-10 md:min-h-screen md:w-1/2 md:px-14 md:py-12">
+          <div aria-hidden="true" className="pointer-events-none absolute -right-8 top-8 select-none font-serif text-[15rem] font-black leading-none text-white/[0.035]">RR</div>
+          <div className="relative z-10 flex flex-col items-center text-center md:my-auto">
+            <img src="/HSlogo.png" alt="Ruiru Rentals" className="mb-5 h-20 w-20 rounded-full border border-white/15 object-cover shadow-lg" />
+            <h1 className="font-serif text-3xl font-bold tracking-tight sm:text-4xl">Ruiru Rentals</h1>
+            <p className="mt-2 text-sm text-slate-400">Secure Property Management Portal</p>
           </div>
+          <p className="relative z-10 mt-8 text-center text-xs text-slate-500 md:text-left">{liveClock}</p>
+        </section>
 
-          {loginError && (
-            <div className="bg-rose-500/10 border border-rose-500/20 text-rose-400 p-3 rounded-lg text-xs font-semibold mb-4 flex items-start gap-2 animate-pulse">
-              <AlertCircle size={16} className="shrink-0 mt-0.5" />
-              <p>{loginError}</p>
-            </div>
-          )}
+        <section className={`flex flex-1 items-center justify-center px-5 py-9 sm:px-10 md:w-1/2 md:px-14 ${theme === 'dark' ? 'bg-slate-950 text-slate-100' : 'bg-white text-slate-900'}`}>
+          <div className="w-full max-w-md">
+            <p className="text-xs font-bold uppercase tracking-[0.2em] text-emerald-600">Welcome back</p>
+            <h2 className={`mt-2 text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>Sign in to your account</h2>
+            <p className="mt-1 text-sm text-slate-500">Choose your account type and enter your details.</p>
 
           <form onSubmit={handleLoginSubmit} className="space-y-4">
             <div>
@@ -1200,27 +1328,40 @@ export default function App() {
             </button>
           </form>
 
-          {/* SECURE GOOGLE SINGLE-SIGN ON (SSO) ACCESS POINT */}
-          <div className="mt-5 border-t border-gray-800 pt-5 text-center">
-            <p className="text-gray-500 text-[10px] uppercase font-bold tracking-widest mb-3">Or connect instantly via SSO</p>
-            <button 
-              type="button"
-              onClick={handleGoogleSignIn}
-              disabled={isProcessing}
-              className="w-full bg-slate-950 border border-gray-800 text-gray-300 hover:text-white hover:bg-slate-900 hover:border-gray-700 font-bold py-3 rounded-xl transition-all flex items-center justify-center gap-3 text-sm"
-            >
-              <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" width="24" height="24" xmlns="http://www.w3.org/2000/svg">
-                <g transform="matrix(1, 0, 0, 1, 0, 0)">
-                  <path d="M21.35,11.1H12v2.7h5.38c-0.24,1.28 -0.96,2.37 -2.04,3.1v2.58h3.3c1.93,-1.78 3.04,-4.4 3.04,-7.48C21.68,11.78 21.56,11.4 21.35,11.1z" fill="#4285F4" />
-                  <path d="M12,20.9c2.43,0 4.47,-0.8 5.96,-2.18l-3.3,-2.58c-0.92,0.62 -2.1,0.98 -3.6,0.98 -2.77,0 -5.11,-1.87 -5.95,-4.38H1.67v2.67C3.15,18.3 7.27,20.9 12,20.9z" fill="#34A853" />
-                  <path d="M6.05,12.74a5.27,5.27,0,0,1,0,-3.48V6.59H1.67a8.91,8.91,0,0,0,0,8.82l4.38,-2.67z" fill="#FBBC05" />
-                  <path d="M12,5.18c1.32,0 2.5,0.45 3.44,1.35l2.58,-2.58C16.46,2.51 14.43,1.7 12,1.7c-4.73,0 -8.85,2.6 -10.33,6.41l4.38,2.67C6.89,7.05 9.23,5.18 12,5.18z" fill="#EA4335" />
-                </g>
+              <div>
+                <label className={`mb-1.5 block text-sm font-semibold ${theme === 'dark' ? 'text-slate-300' : 'text-slate-700'}`}>Password</label>
+                <div className="relative">
+                  <input required type={showPassword ? 'text' : 'password'} autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} disabled={isEmailRestrictedForLandlord} placeholder="Enter your password" className={`w-full border-b bg-transparent px-1 py-3 pr-11 text-sm outline-none transition focus:border focus:border-emerald-500 focus:px-3 disabled:cursor-not-allowed disabled:opacity-40 ${theme === 'dark' ? 'border-slate-700 text-white placeholder:text-slate-600' : 'border-slate-300 text-slate-900 placeholder:text-slate-400'}`} />
+                  <button type="button" aria-label={showPassword ? 'Hide password' : 'Show password'} onClick={() => setShowPassword(!showPassword)} className={`absolute right-1 top-1/2 -translate-y-1/2 p-2 ${theme === 'dark' ? 'text-slate-400 hover:text-white' : 'text-slate-500 hover:text-slate-900'}`}>
+                    {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                  </button>
+                </div>
+                <div className="mt-2 text-right">
+                  <button type="button" onClick={handleForgotPassword} className="text-xs font-semibold text-slate-500 transition hover:text-emerald-700">Forgot Password?</button>
+                </div>
+              </div>
+
+              <button type="submit" disabled={isProcessing || isEmailRestrictedForLandlord} className="flex w-full items-center justify-center gap-2 rounded-md bg-[#0f172a] py-3.5 text-sm font-bold uppercase tracking-wide text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50">
+                {isProcessing ? <div className="h-5 w-5 animate-spin rounded-full border-2 border-white border-t-transparent" /> : 'Sign In'}
+              </button>
+            </form>
+
+            <div className="my-6 flex items-center gap-4 text-xs font-semibold text-slate-400">
+              <span className={`h-px flex-1 ${theme === 'dark' ? 'bg-slate-800' : 'bg-slate-200'}`} />
+              <span>or continue with Google</span>
+              <span className={`h-px flex-1 ${theme === 'dark' ? 'bg-slate-800' : 'bg-slate-200'}`} />
+            </div>
+            <button type="button" onClick={handleGoogleSignIn} disabled={isProcessing} className={`flex w-full items-center justify-center gap-3 border px-4 py-3 text-sm font-semibold transition disabled:opacity-50 ${theme === 'dark' ? 'border-slate-700 text-slate-200 hover:bg-slate-900' : 'border-slate-300 text-slate-700 hover:bg-slate-50'}`}>
+              <svg className="h-5 w-5 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+                <path fill="#4285F4" d="M21.35 11.1H12v2.7h5.38a5.4 5.4 0 0 1-2.04 3.1v2.58h3.3c1.93-1.78 3.04-4.4 3.04-7.48 0-.38-.12-.76-.33-1.1Z" />
+                <path fill="#34A853" d="M12 20.9c2.43 0 4.47-.8 5.96-2.18l-3.3-2.58c-.92.62-2.1.98-3.6.98-2.77 0-5.11-1.87-5.95-4.38H1.67v2.67C3.15 18.3 7.27 20.9 12 20.9Z" />
+                <path fill="#FBBC05" d="M6.05 12.74a5.27 5.27 0 0 1 0-3.48V6.59H1.67a8.91 8.91 0 0 0 0 8.82l4.38-2.67Z" />
+                <path fill="#EA4335" d="M12 5.18c1.32 0 2.5.45 3.44 1.35l2.58-2.58C16.46 2.51 14.43 1.7 12 1.7c-4.73 0-8.85 2.6-10.33 6.41l4.38 2.67C6.89 7.05 9.23 5.18 12 5.18Z" />
               </svg>
-              Sign In with Google
+              Continue with Google
             </button>
           </div>
-        </div>
+        </section>
       </div>
     );
   }
@@ -1251,7 +1392,7 @@ export default function App() {
             <img src="/HSlogo.png" alt="Logo" className={`w-10 h-10 rounded-xl object-cover shadow-sm border ${theme === 'dark' ? 'border-slate-700' : 'border-gray-300'}`} />
             <div>
               <h1 className={`text-lg font-extrabold leading-tight ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Ruiru Rentals</h1>
-              <p className="text-[10px] font-bold text-gray-500 uppercase tracking-wider">{role === 'LANDLORD' ? 'Super Admin' : 'Manager'}</p>
+              <p className="text-[10px] font-bold text-gray-500 uppercase tracking-wider">{isLandlord ? 'Super Admin' : 'Manager'}</p>
             </div>
           </div>
           <div className="flex flex-col gap-2 items-end">
@@ -1302,20 +1443,62 @@ export default function App() {
           </header>
 
           <div className="flex-1">
-            {activeTab === 'dashboard' && role === 'LANDLORD' && (
+            {activeTab === 'dashboard' && isLandlord && (
               <div className="space-y-6 animate-in fade-in duration-500">
-                <div className="flex justify-between items-center">
+                <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
                   <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Landlord Finance Overview</h2>
+                  <label className="flex items-center gap-2 text-sm font-semibold text-gray-500">
+                    <span>Viewing:</span>
+                    <select value={selectedDashboardCycleId === 'ACTIVE' && !activeCycle ? 'NONE' : selectedDashboardCycleId} onChange={e => setSelectedDashboardCycleId(e.target.value)} className={`max-w-52 rounded-lg border px-3 py-2 text-sm font-bold outline-none ${theme === 'dark' ? 'border-slate-700 bg-slate-900 text-white' : 'border-[#DCD4C6] bg-white text-gray-800'}`}>
+                      {activeCycle ? <option value="ACTIVE">{activeCycle.month} · Active</option> : <option value="NONE">No open cycle</option>}
+                      {billingCycles.filter(cycle => cycle.status === 'CLOSED').map(cycle => <option key={cycle.id} value={cycle.id}>{cycle.month} · Closed</option>)}
+                    </select>
+                  </label>
                 </div>
+
+                <section className={`rounded-2xl border p-5 md:p-6 ${theme === 'dark' ? 'border-slate-800 bg-slate-900' : 'border-[#E8DFCE] bg-[#F4EFE6]'}`}>
+                  <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <p className="text-xs font-black uppercase tracking-widest text-gray-500">Billing Cycles</p>
+                      <h3 className={`mt-1 text-xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>
+                        {activeCycle ? <>{activeCycle.month} <span className="text-emerald-600">— OPEN</span></> : 'No open billing cycle'}
+                      </h3>
+                      {viewedCycle && viewedCycle.id !== activeCycle?.id && <p className="mt-1 text-xs font-semibold text-amber-600">Historical view · read only</p>}
+                      {!activeCycle && <p className="mt-1 text-sm text-gray-500">Open the first month to start cycle based billing.</p>}
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <button type="button" onClick={() => { setModalError(''); setIsCycleModalOpen(true); }} disabled={isProcessing} className="rounded-xl bg-gray-800 px-4 py-2.5 text-sm font-bold text-white transition hover:bg-gray-900 disabled:opacity-50">Open New Month</button>
+                      <button type="button" onClick={() => setConfirmationAction({ type: 'closeCycle' })} disabled={!activeCycle || isProcessing} className={`rounded-xl border px-4 py-2.5 text-sm font-bold transition disabled:opacity-40 ${theme === 'dark' ? 'border-slate-700 text-slate-200 hover:bg-slate-800' : 'border-gray-300 text-gray-700 hover:bg-white'}`}>Close Current Month</button>
+                    </div>
+                  </div>
+                  {billingCycleHistory.length > 0 && (
+                    <div className={`mt-5 border-t pt-4 ${theme === 'dark' ? 'border-slate-800' : 'border-[#DCD4C6]'}`}>
+                      <h4 className="mb-3 text-xs font-black uppercase tracking-widest text-gray-500">Monthly History</h4>
+                      <div className="space-y-2">
+                        {billingCycleHistory.map(cycle => (
+                          <button key={cycle.id} type="button" onClick={() => setSelectedDashboardCycleId(cycle.id)} className={`flex w-full flex-col gap-2 rounded-xl border p-3 text-left transition sm:flex-row sm:items-center sm:justify-between ${viewedCycle?.id === cycle.id ? (theme === 'dark' ? 'border-emerald-700 bg-emerald-950/20' : 'border-emerald-300 bg-emerald-50') : (theme === 'dark' ? 'border-slate-800 hover:bg-slate-950' : 'border-[#E8DFCE] hover:bg-white')}`}>
+                            <span className={`font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{cycle.month}</span>
+                            <span className="flex flex-wrap gap-x-4 gap-y-1 text-xs font-semibold text-gray-500">
+                              <span>Rent {formatKes(cycle.rentCollected)}</span>
+                              <span>Water {formatKes(cycle.waterCollected)}</span>
+                              <span className="text-emerald-600">{cycle.clearedCount} cleared</span>
+                              <span className="text-rose-600">{cycle.arrearsCount} arrears</span>
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </section>
                 
-                {stats.waterReserve < 0 ? (
+                {cycleStats.waterReserve < 0 ? (
                   <div className="bg-rose-500/10 border border-rose-500/30 p-4 rounded-xl flex items-center gap-4 animate-pulse">
                     <div className="bg-rose-500/20 p-3 rounded-full text-rose-500"><AlertCircle size={24}/></div>
                     <div className="flex-1">
                       <h4 className="text-rose-500 font-bold">Deficit Alert: RUJWASCO Bill Settle Needed</h4>
                       <p className={`text-sm ${theme === 'dark' ? 'text-rose-400' : 'text-rose-700'}`}>
-                        Collected water payments from tenants total <strong className="font-mono">{formatKes(stats.collectedWaterRev)}</strong>. 
-                        This is short by <strong className={`font-mono text-lg ${theme === 'dark' ? 'text-rose-500' : 'text-rose-600'}`}>{formatKes(Math.abs(stats.waterReserve))}</strong> to settle the logged invoices of <strong className="font-mono">{formatKes(stats.totalMasterWaterBills)}</strong>.
+                        Collected water payments from tenants total <strong className="font-mono">{formatKes(cycleStats.collectedWaterRev)}</strong>.
+                        This is short by <strong className={`font-mono text-lg ${theme === 'dark' ? 'text-rose-500' : 'text-rose-600'}`}>{formatKes(Math.abs(cycleStats.waterReserve))}</strong> to settle the logged invoices of <strong className="font-mono">{formatKes(cycleStats.totalMasterWaterBills)}</strong>.
                       </p>
                     </div>
                   </div>
@@ -1336,7 +1519,7 @@ export default function App() {
                     <div className="flex-1">
                       <h4 className={`font-bold ${theme === 'dark' ? 'text-cyan-400' : 'text-cyan-700'}`}>Water Vault Tracker</h4>
                       <p className={`text-sm ${theme === 'dark' ? 'text-cyan-500' : 'text-cyan-800'}`}>
-                        Accumulated water payments inside vault: <strong className="font-mono">{formatKes(stats.collectedWaterRev)}</strong>. Log a master provider bill to evaluate balance limits.
+                        Accumulated water payments inside vault: <strong className="font-mono">{formatKes(cycleStats.collectedWaterRev)}</strong>. Log a master provider bill to evaluate balance limits.
                       </p>
                     </div>
                   </div>
@@ -1354,7 +1537,7 @@ export default function App() {
                       <p className={`text-xs font-extrabold uppercase tracking-wide mb-1 flex items-center gap-1 ${theme === 'dark' ? 'text-cyan-400' : 'text-cyan-600'}`}>
                         <Droplet size={14}/> Water Vault Total
                       </p>
-                      <h3 className={`text-2xl font-extrabold ${theme === 'dark' ? 'text-cyan-300' : 'text-cyan-500'}`}>{formatKes(stats.collectedWaterRev)}</h3>
+                      <h3 className={`text-2xl font-extrabold ${theme === 'dark' ? 'text-cyan-300' : 'text-cyan-500'}`}>{formatKes(cycleStats.collectedWaterRev)}</h3>
                     </div>
                     <div className={`mt-3 pt-3 border-t ${theme === 'dark' ? 'border-cyan-900/40' : 'border-cyan-200'}`}>
                       <div className="grid grid-cols-2 gap-2">
@@ -1373,11 +1556,11 @@ export default function App() {
                       <p className={`text-xs font-extrabold uppercase tracking-wide mb-1 flex items-center gap-1 ${theme === 'dark' ? 'text-rose-400' : 'text-rose-600'}`}>
                         <AlertCircle size={14}/> Total Operations Exp.
                       </p>
-                      <h3 className={`text-2xl font-extrabold ${theme === 'dark' ? 'text-rose-400' : 'text-rose-600'}`}>{formatKes(stats.totalOperatingExpenses)}</h3>
+                      <h3 className={`text-2xl font-extrabold ${theme === 'dark' ? 'text-rose-400' : 'text-rose-600'}`}>{formatKes(cycleStats.totalOperatingExpenses)}</h3>
                     </div>
                     <div className={`mt-3 pt-3 border-t text-[10px] font-bold space-y-0.5 ${theme === 'dark' ? 'border-rose-900/40 text-rose-400' : 'border-rose-200 text-rose-600'}`}>
-                      <p>Repairs: {formatKes(stats.totalRepairExpenses)}</p>
-                      <p>Septic Removals: {formatKes(stats.totalSepticExpenses)}</p>
+                      <p>Repairs: {formatKes(cycleStats.totalRepairExpenses)}</p>
+                      <p>Septic Removals: {formatKes(cycleStats.totalSepticExpenses)}</p>
                     </div>
                   </div>
 
@@ -1385,21 +1568,31 @@ export default function App() {
                     <p className={`text-xs font-extrabold uppercase tracking-wide mb-1 flex items-center gap-1 ${theme === 'dark' ? 'text-gray-400' : 'text-gray-600'}`}>
                       <Coins size={14}/> Joseph's Tip Pool
                     </p>
-                    <h3 className={`text-2xl font-black font-mono ${theme === 'dark' ? 'text-gray-200' : 'text-gray-900'}`}>{formatKes(stats.totalJosephBonus)}</h3>
-                    <p className="text-[10px] text-gray-500 font-bold mt-1">Accumulated from excess payments</p>
+                    <h3 className={`text-2xl font-black font-mono ${theme === 'dark' ? 'text-gray-200' : 'text-gray-900'}`}>{formatKes(cycleStats.totalJosephBonus)}</h3>
+                    <p className="text-[10px] text-gray-500 font-bold mt-1">This cycle from excess payments</p>
                   </div>
                 </div>
+
+                <section className={`rounded-2xl border p-5 ${theme === 'dark' ? 'border-slate-800 bg-slate-900/60' : 'border-[#E8DFCE] bg-white/70'}`}>
+                  <h3 className={`mb-4 text-sm font-black uppercase tracking-widest ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>All-Time Summary</h3>
+                  <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+                    <div><p className="text-xs font-semibold text-gray-500">Rent collected</p><p className={`mt-1 font-mono text-lg font-black ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{formatKes(stats.collectedRentRev)}</p></div>
+                    <div><p className="text-xs font-semibold text-gray-500">Water collected</p><p className={`mt-1 font-mono text-lg font-black ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{formatKes(stats.collectedWaterRev)}</p></div>
+                    <div><p className="text-xs font-semibold text-gray-500">Operations expenses</p><p className={`mt-1 font-mono text-lg font-black ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{formatKes(stats.totalOperatingExpenses)}</p></div>
+                    <div><p className="text-xs font-semibold text-gray-500">Excess payments</p><p className={`mt-1 font-mono text-lg font-black ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{formatKes(stats.totalJosephBonus)}</p></div>
+                  </div>
+                </section>
 
                 <div className={`rounded-2xl border p-6 shadow-sm ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
                   <h3 className={`text-lg font-bold mb-4 ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Pending Verifications</h3>
                   <p className="text-sm text-gray-500 mb-4 font-medium">Logged by Manager; needs Super Admin confirmation.</p>
-                  {payments.filter(p => p.status === 'PENDING').length === 0 ? (
+                  {cyclePayments.filter(p => p.status === 'PENDING').length === 0 ? (
                     <p className={`text-sm font-bold p-4 rounded-xl flex items-center gap-2 ${theme === 'dark' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-emerald-500/10 text-emerald-600'}`}>
                       <CheckCircle2 size={18}/> All payments verified and up to date.
                     </p>
                   ) : (
                     <div className="space-y-3">
-                      {payments.filter(p => p.status === 'PENDING').map(p => (
+                      {cyclePayments.filter(p => p.status === 'PENDING').map(p => (
                         <div key={p.id} className={`flex flex-col sm:flex-row sm:items-center justify-between p-4 rounded-xl border gap-4 transition-all hover:shadow-md ${theme === 'dark' ? 'bg-slate-950 border-slate-800' : 'bg-[#FDFBF7] border-[#E8DFCE]'}`}>
                           <div>
                             <p className={`font-bold text-lg ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{p.tenantName}</p>
@@ -1412,7 +1605,7 @@ export default function App() {
                             <span className={`font-black text-xl ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{formatKes(p.amount)}</span>
                             <button 
                               onClick={() => handleConfirmPayment(p)} 
-                              disabled={isProcessing}
+                              disabled={isProcessing || isHistoricalCycleView}
                               className="bg-gray-800 hover:bg-gray-900 text-white px-5 py-2.5 rounded-xl text-sm font-bold transition-all disabled:bg-gray-400 flex items-center gap-2"
                             >
                               {isProcessing ? 'Processing...' : 'Confirm'}
@@ -1423,6 +1616,12 @@ export default function App() {
                     </div>
                   )}
                 </div>
+
+                <section className="rounded-2xl border border-rose-500/40 p-5">
+                  <p className="text-xs font-black uppercase tracking-widest text-rose-600">Danger Zone</p>
+                  <p className={`mt-1 text-sm ${theme === 'dark' ? 'text-slate-400' : 'text-gray-600'}`}>Remove operational logs and reset tenant paid totals.</p>
+                  <button type="button" onClick={() => setConfirmationAction({ type: 'resetData' })} disabled={isProcessing} className="mt-4 rounded-xl border border-rose-500 px-4 py-2.5 text-sm font-bold text-rose-600 transition hover:bg-rose-600 hover:text-white disabled:opacity-50">Reset Payment & Operations Data</button>
+                </section>
               </div>
             )}
 
@@ -1456,7 +1655,7 @@ export default function App() {
               <div className="space-y-6 animate-in fade-in duration-500">
                 <div className="flex justify-between items-center">
                   <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Properties & Units</h2>
-                  {role === 'LANDLORD' && (
+                  {canManageProperties && (
                     <button onClick={() => { setModalError(''); setIsHouseModalOpen(true); }} className="bg-gray-800 hover:bg-gray-900 text-white px-5 py-2.5 rounded-xl text-sm font-bold flex items-center gap-2 shadow-sm transition-all hover:shadow-md hover:-translate-y-0.5">
                       <Plus size={18}/> Add Unit
                     </button>
@@ -1494,7 +1693,7 @@ export default function App() {
                           </div>
                         </div>
                         
-                        {role === 'LANDLORD' && !isOccupied && (
+                        {canManageProperties && !isOccupied && (
                           <div className={`ml-2 mt-4 pt-4 border-t ${theme === 'dark' ? 'border-white/10' : 'border-black/5'}`}>
                             <button 
                               onClick={() => handleToggleHouseRepairMode(house)}
@@ -1560,17 +1759,35 @@ export default function App() {
 
             {activeTab === 'billing' && (
               <div className="space-y-8 animate-in fade-in duration-500">
-                <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Billing & Payments</h2>
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+                  <div>
+                    <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Billing & Payments</h2>
+                    <p className="mt-1 text-sm font-medium text-gray-500">{activeCycle ? `Balances for ${activeCycle.month}` : 'No billing cycle is currently open.'}</p>
+                  </div>
+                </div>
 
                 <div>
-                  <h3 className="text-lg font-bold mb-4 font-mono uppercase tracking-wider text-gray-500">Tenant Billing Profiles</h3>
+                  <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+                    <h3 className="text-lg font-bold font-mono uppercase tracking-wider text-gray-500">Tenant Billing Profiles</h3>
+                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      <label className="sr-only" htmlFor="tenant-billing-search">Search tenants</label>
+                      <input id="tenant-billing-search" value={tenantSearch} onChange={e => setTenantSearch(e.target.value)} placeholder="Search tenant name" className={`min-w-0 rounded-xl border px-3 py-2 text-sm outline-none focus:border-emerald-500 ${theme === 'dark' ? 'border-slate-700 bg-slate-900 text-white placeholder:text-slate-500' : 'border-[#DCD4C6] bg-white text-gray-900'}`} />
+                      <label className="sr-only" htmlFor="tenant-billing-status">Filter tenants by balance</label>
+                      <select id="tenant-billing-status" value={tenantStatusFilter} onChange={e => setTenantStatusFilter(e.target.value)} className={`rounded-xl border px-3 py-2 text-sm font-semibold outline-none ${theme === 'dark' ? 'border-slate-700 bg-slate-900 text-white' : 'border-[#DCD4C6] bg-white text-gray-900'}`}>
+                        <option value="ALL">All Tenants</option>
+                        <option value="ARREARS">Has Arrears</option>
+                        <option value="CLEARED">Fully Cleared</option>
+                      </select>
+                    </div>
+                  </div>
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                     {sortedTenants.map(tenant => {
                       const house = houses.find(h => h.id === tenant.houseId);
-                      const rentBal = (tenant.expectedRent || 0) - (tenant.paidRent || 0);
-                      const waterBal = (tenant.expectedWater || 0) - (tenant.paidWater || 0);
+                      const cycleTenant = activeTenantCycles.get(tenant.id);
+                      const rentBal = Number(cycleTenant?.expectedRent || 0) - Number(cycleTenant?.paidRent || 0);
+                      const waterBal = Number(cycleTenant?.expectedWater || 0) - Number(cycleTenant?.paidWater || 0);
                       const tenantRepairs = repairs.filter(r => r.houseId === tenant.houseId && r.status === 'OPEN');
-                      const pendingPayments = payments.filter(p => p.tenantId === tenant.id && p.status === 'PENDING');
+                      const pendingPayments = payments.filter(p => p.tenantId === tenant.id && p.status === 'PENDING' && (!activeCycle || p.cycleId === activeCycle.id));
 
                       return (
                         <div key={tenant.id} className={`p-5 rounded-2xl border shadow-sm flex flex-col justify-between transition-all duration-300 hover:-translate-y-1 hover:shadow-xl ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
@@ -1616,7 +1833,7 @@ export default function App() {
                                     <p className="text-[10px] mt-0.5">{pendingPayment.method}</p>
                                   </div>
                                 </div>
-                                {role === 'LANDLORD' && (
+                                {canApproveRent && (
                                   <button 
                                     onClick={() => handleConfirmPayment(pendingPayment)} 
                                     disabled={isProcessing}
@@ -1631,12 +1848,12 @@ export default function App() {
 
                           <div className={`flex flex-col gap-2.5 mt-4 pt-3 border-t ${theme === 'dark' ? 'border-slate-800' : 'border-[#DCD4C6]'}`}>
                             <div className="flex gap-2.5">
-                              <button onClick={() => { setModalError(''); setSelectedTenant(tenant); setIsPaymentModalOpen(true); }} className="flex-1 bg-gray-800 hover:bg-gray-900 text-white text-xs font-bold py-2.5 rounded-xl transition-all shadow-sm text-center">Log Payment</button>
-                              {role === 'MANAGER' && (
+                              <button onClick={() => { setModalError(''); setSelectedTenant(tenant); setIsPaymentModalOpen(true); }} disabled={!activeCycle || !cycleTenant || isProcessing || !canRecordRent} className="flex-1 bg-gray-800 hover:bg-gray-900 text-white text-xs font-bold py-2.5 rounded-xl transition-all shadow-sm text-center disabled:cursor-not-allowed disabled:opacity-40">Log Payment</button>
+                              {hasPermission(role, PERMISSIONS.RECORD_RENT) && (
                                 <button onClick={() => { setModalError(''); setSelectedTenant(tenant); setIsBillingModalOpen(true); }} className={`flex-1 text-xs font-bold py-2.5 rounded-xl transition-all shadow-sm text-center border ${theme === 'dark' ? 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700' : 'bg-white hover:bg-gray-50 text-gray-800 border-gray-200'}`}>Update Bills</button>
                               )}
                             </div>
-                            {role === 'LANDLORD' && (
+                            {canApproveRent && (
                               <button onClick={() => { setSelectedTenant(tenant); setIsHistoryModalOpen(true); }} className={`w-full text-xs font-bold py-2.5 rounded-xl transition flex items-center justify-center gap-1.5 border ${theme === 'dark' ? 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700' : 'bg-[#FDFBF7] hover:bg-white text-gray-700 border-[#DCD4C6]'}`}>
                                 <ListOrdered size={16}/> View Verified History
                               </button>
@@ -1645,15 +1862,27 @@ export default function App() {
                         </div>
                       )
                     })}
+                    {filteredTenants.length === 0 && <p className="col-span-full rounded-xl border border-dashed border-gray-300 p-8 text-center text-sm font-medium text-gray-500">{tenants.length === 0 ? 'No tenants registered.' : 'No tenants match the current search and filter.'}</p>}
                   </div>
                 </div>
 
                 <div>
-                  <div className="flex justify-between items-end mb-4">
-                    <h3 className="text-lg font-bold font-mono uppercase tracking-wider text-gray-500">Payment Ledger</h3>
-                    <button onClick={printLedgerReport} className="text-xs font-bold px-4 py-2 bg-gray-800 hover:bg-gray-900 text-white rounded-lg flex items-center gap-2 transition-all shadow-sm">
-                      <Download size={14} /> Download Ledger Report
-                    </button>
+                  <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+                    <div>
+                      <h3 className="text-lg font-bold font-mono uppercase tracking-wider text-gray-500">Payment Ledger</h3>
+                      <p className="mt-1 text-xs font-semibold text-gray-500">Showing {filteredPayments.length} of {payments.length} payments</p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <label className="sr-only" htmlFor="payment-ledger-month">Filter ledger by month</label>
+                      <select id="payment-ledger-month" value={paymentMonthFilter} onChange={e => setPaymentMonthFilter(e.target.value)} className={`rounded-lg border px-3 py-2 text-xs font-bold outline-none ${theme === 'dark' ? 'border-slate-700 bg-slate-900 text-white' : 'border-[#DCD4C6] bg-white text-gray-800'}`}>
+                        <option value={createCurrentMonthKey()}>{getMonthLabel(createCurrentMonthKey())}</option>
+                        {ledgerMonths.filter(month => month !== createCurrentMonthKey()).map(month => <option key={month} value={month}>{getMonthLabel(month)}</option>)}
+                        <option value="ALL">View All</option>
+                      </select>
+                      <button onClick={printLedgerReport} className="flex items-center gap-2 rounded-lg bg-gray-800 px-4 py-2 text-xs font-bold text-white shadow-sm transition hover:bg-gray-900">
+                        <Download size={14} /> Download Ledger Report
+                      </button>
+                    </div>
                   </div>
                   
                   <div className={`rounded-2xl border overflow-hidden shadow-sm overflow-x-auto ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
@@ -1670,8 +1899,8 @@ export default function App() {
                         </tr>
                       </thead>
                       <tbody className={`divide-y ${theme === 'dark' ? 'divide-slate-800' : 'divide-[#E8DFCE]'}`}>
-                        {payments.length === 0 && (
-                          <tr><td colSpan="7" className="p-8 text-center text-gray-500 font-medium">No payments recorded.</td></tr>
+                        {filteredPayments.length === 0 && (
+                          <tr><td colSpan="7" className="p-8 text-center text-gray-500 font-medium">{payments.length === 0 ? 'No payments recorded.' : 'No payments in this month.'}</td></tr>
                         )}
                         {sortedPayments.map(payment => (
                           <tr key={payment.id} className={`transition ${theme === 'dark' ? 'hover:bg-slate-950/40' : 'hover:bg-[#FDFBF7]'}`}>
@@ -2033,7 +2262,7 @@ export default function App() {
                 </div>
               </div>
               <button type="submit" disabled={isProcessing} className="w-full bg-gray-800 hover:bg-gray-900 text-white font-bold py-3.5 rounded-xl mt-6 flex items-center justify-center gap-2 disabled:opacity-50 transition-all shadow-md hover:shadow-lg">
-                <FileText size={18}/> {isProcessing ? 'Logging...' : (role === 'MANAGER' ? 'Submit for Landlord Review' : 'Log & Confirm Receipt')}
+                <FileText size={18}/> {isProcessing ? 'Logging...' : (!canApproveRent ? 'Submit for Landlord Review' : 'Log & Confirm Receipt')}
               </button>
             </form>
           </div>
@@ -2218,8 +2447,8 @@ export default function App() {
               })()}
 
               <div className={`flex justify-between items-center pt-5 border-t ${theme === 'dark' ? 'border-slate-800' : 'border-[#DCD4C6]'}`}>
-                {role === 'LANDLORD' && <button onClick={() => handleDeleteTenant(selectedTenantForDetails)} disabled={isProcessing} className={`text-sm font-bold px-4 py-2.5 rounded-xl transition disabled:opacity-50 ${theme === 'dark' ? 'text-rose-500 hover:bg-rose-500/10' : 'text-rose-600 hover:bg-rose-500/10'}`}>Remove Tenant</button>}
-                {role === 'LANDLORD' ? (
+                {isLandlord && <button onClick={() => handleDeleteTenant(selectedTenantForDetails)} disabled={isProcessing} className={`text-sm font-bold px-4 py-2.5 rounded-xl transition disabled:opacity-50 ${theme === 'dark' ? 'text-rose-500 hover:bg-rose-500/10' : 'text-rose-600 hover:bg-rose-500/10'}`}>Remove Tenant</button>}
+                {canManageTenants ? (
                   <button onClick={() => setIsEditTenantModalOpen(true)} disabled={isProcessing} className="bg-gray-800 hover:bg-gray-900 text-white font-bold text-sm px-6 py-3 rounded-xl transition flex items-center gap-2 shadow-md hover:shadow-lg"><Edit size={16}/> Edit Details</button>
                 ) : (
                   <p className="text-xs text-gray-500 flex items-center gap-1.5 ml-auto font-medium"><Info size={14}/> Editing locked for Managers</p>
