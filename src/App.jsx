@@ -9,7 +9,7 @@ import {
   SlidersHorizontal, Database, ArrowUpRight, RotateCcw
 } from 'lucide-react';
 import { allocatePayment, parseMoney } from './lib/money.js';
-import { hasPermission, normalizeRole, PERMISSIONS, ROLES } from './lib/permissions.js';
+import { canAccessWorkspaceRecord, hasPermission, normalizeRole, PERMISSIONS, ROLES } from './lib/permissions.js';
 
 // --- FIREBASE IMPORTS ---
 import { initializeApp, getApps, getApp } from 'firebase/app';
@@ -1413,31 +1413,42 @@ export default function App() {
 
   const handleDataReset = async () => {
     if (!user || !db || role !== ROLES.LANDLORD) return;
+    const isLegacyAccount = Boolean(LEGACY_ROLE_BY_UID[user.uid]);
     const scopedCollection = (collectionName) => {
       const ref = collectionRef(collectionName);
-      return LEGACY_ROLE_BY_UID[user.uid] ? ref : query(ref, where('workspaceId', '==', workspaceId));
+      return isLegacyAccount ? ref : query(ref, where('workspaceId', '==', workspaceId));
     };
-    const [paymentDocs, referenceDocs, repairDocs, septicDocs, waterBillDocs, tenantDocs, tenantCycleDocs, cycleDocs] = await promiseTimeout(
+    const collectionSnapshots = await promiseTimeout(
       Promise.all([
         'payments', 'paymentReferences', 'repairs', 'septicLogs', 'masterWaterBills',
         'tenants', 'tenantCycles', 'billingCycles',
       ].map(collectionName => getDocs(scopedCollection(collectionName)))),
       15000,
     );
-    const openCycles = cycleDocs.docs.filter(cycle => cycle.data().status === 'OPEN');
+    // Legacy listeners can read unscoped records for compatibility, but reset
+    // writes must follow the same workspace boundary enforced by Firestore.
+    const scopedSnapshots = collectionSnapshots.map(snapshot => snapshot.docs.filter(record =>
+      canAccessWorkspaceRecord(record.data(), workspaceId, isLegacyAccount),
+    ));
+    const skippedOutOfWorkspaceRecords = collectionSnapshots.reduce(
+      (total, snapshot, index) => total + snapshot.docs.length - scopedSnapshots[index].length,
+      0,
+    );
+    const [paymentDocs, referenceDocs, repairDocs, septicDocs, waterBillDocs, tenantDocs, tenantCycleDocs, cycleDocs] = scopedSnapshots;
+    const openCycles = cycleDocs.filter(cycle => cycle.data().status === 'OPEN');
     if (openCycles.length > 1) throw new Error('More than one billing cycle is open. Resolve the duplicate open cycles before resetting data.');
-    const cycleStatusById = new Map(cycleDocs.docs.map(cycle => [cycle.id, cycle.data().status]));
+    const cycleStatusById = new Map(cycleDocs.map(cycle => [cycle.id, cycle.data().status]));
     const deleteOperations = [
-      ...paymentDocs.docs.map(payment => batch => batch.delete(documentRef('payments', payment.id))),
-      ...referenceDocs.docs.map(reference => batch => batch.delete(documentRef('paymentReferences', reference.id))),
-      ...repairDocs.docs.map(repair => batch => batch.delete(documentRef('repairs', repair.id))),
-      ...septicDocs.docs.map(log => batch => batch.delete(documentRef('septicLogs', log.id))),
-      ...waterBillDocs.docs.map(bill => batch => batch.delete(documentRef('masterWaterBills', bill.id))),
+      ...paymentDocs.map(payment => batch => batch.delete(documentRef('payments', payment.id))),
+      ...referenceDocs.map(reference => batch => batch.delete(documentRef('paymentReferences', reference.id))),
+      ...repairDocs.map(repair => batch => batch.delete(documentRef('repairs', repair.id))),
+      ...septicDocs.map(log => batch => batch.delete(documentRef('septicLogs', log.id))),
+      ...waterBillDocs.map(bill => batch => batch.delete(documentRef('masterWaterBills', bill.id))),
     ];
-    const tenantBalanceOperations = tenantDocs.docs.map(tenant => batch => batch.update(documentRef('tenants', tenant.id), {
+    const tenantBalanceOperations = tenantDocs.map(tenant => batch => batch.update(documentRef('tenants', tenant.id), {
         paidRent: 0, paidWater: 0, ...makeRecordMetadata(user, true),
     }));
-    const cycleResetOperations = tenantCycleDocs.docs
+    const cycleResetOperations = tenantCycleDocs
       .filter(cycleTenant => cycleStatusById.has(cycleTenant.data().cycleId))
       .map(cycleTenant => batch => {
         const data = cycleTenant.data();
@@ -1466,8 +1477,11 @@ export default function App() {
     await commitResetStage('monthly tenant-cycle balances', cycleResetOperations, 15);
     await commitResetStage('tenant balance totals', tenantBalanceOperations);
     await commitResetStage('payment, reference, repair, septic, and water-invoice records', deleteOperations);
-    await recordAudit('OPERATIONAL_DATA_RESET', 'workspace', workspaceId, { deletedPayments: paymentDocs.size });
-    setToastMessage('Data reset completed. Houses and tenant charges were preserved.');
+    await recordAudit('OPERATIONAL_DATA_RESET', 'workspace', workspaceId, { deletedPayments: paymentDocs.length });
+    const skippedNotice = skippedOutOfWorkspaceRecords > 0
+      ? ` ${skippedOutOfWorkspaceRecords} record(s) outside this workspace were left unchanged.`
+      : '';
+    setToastMessage(`Data reset completed. Houses and tenant charges were preserved.${skippedNotice}`);
   };
 
   const handleConfirmationSubmit = async () => {
@@ -1718,68 +1732,100 @@ export default function App() {
 
   if (!user) {
     return (
-      <div className={`min-h-screen flex flex-col md:flex-row ${theme === 'dark' ? 'bg-slate-950' : 'bg-white'}`}>
-        <section className="relative flex min-h-56 flex-col justify-between overflow-hidden bg-[#0f172a] px-7 py-7 text-white sm:px-10 md:min-h-screen md:w-1/2 md:px-14 md:py-12">
-          <div aria-hidden="true" className="pointer-events-none absolute -right-8 top-8 select-none font-serif text-[15rem] font-black leading-none text-white/[0.035]">RR</div>
-          <div className="relative z-10 flex flex-col items-center text-center md:my-auto">
-            <img src="/HSlogo.png" alt="Ruiru Rentals" className="mb-5 h-20 w-20 rounded-full border border-white/15 object-cover shadow-lg" />
-            <h1 className="font-serif text-3xl font-bold tracking-tight sm:text-4xl">Ruiru Rentals</h1>
-            <p className="mt-2 text-sm text-slate-400">Secure Property Management Portal</p>
-          </div>
-          <p className="relative z-10 mt-8 text-center text-xs text-slate-500 md:text-left">{liveClock}</p>
-        </section>
-
-        <section className={`flex flex-1 items-center justify-center px-5 py-9 sm:px-10 md:w-1/2 md:px-14 ${theme === 'dark' ? 'bg-slate-950 text-slate-100' : 'bg-white text-slate-900'}`}>
-          <div className="w-full max-w-md">
-            <p className="text-xs font-bold uppercase tracking-[0.2em] text-emerald-600">Welcome back</p>
-            <h2 className={`mt-2 text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>Sign in to your account</h2>
-            <p className="mt-1 text-sm text-slate-500">Use your authorized account to securely access the portal.</p>
-
-            {loginError && (
-              <p role="alert" className="mt-5 border-l-2 border-rose-500 bg-rose-500/5 px-3 py-2 text-sm text-rose-600">
-                {loginError}
-              </p>
-            )}
-
-            <form onSubmit={handleLoginSubmit} className="mt-6 space-y-5">
-              <div>
-                <label className={`mb-1.5 block text-sm font-semibold ${theme === 'dark' ? 'text-slate-300' : 'text-slate-700'}`}>Email address</label>
-                <input required type="email" autoComplete="username" value={email} onChange={e => setEmail(e.target.value)} placeholder="Enter your email" className={`w-full border-b bg-transparent px-1 py-3 text-sm outline-none transition focus:border focus:border-emerald-500 focus:px-3 ${theme === 'dark' ? 'border-slate-700 text-white placeholder:text-slate-600' : 'border-slate-300 text-slate-900 placeholder:text-slate-400'}`} />
-              </div>
-              <div>
-                <label className={`mb-1.5 block text-sm font-semibold ${theme === 'dark' ? 'text-slate-300' : 'text-slate-700'}`}>Password</label>
-                <div className="relative">
-                  <input required type={showPassword ? 'text' : 'password'} autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Enter your password" className={`w-full border-b bg-transparent px-1 py-3 pr-11 text-sm outline-none transition focus:border focus:border-emerald-500 focus:px-3 ${theme === 'dark' ? 'border-slate-700 text-white placeholder:text-slate-600' : 'border-slate-300 text-slate-900 placeholder:text-slate-400'}`} />
-                  <button type="button" aria-label={showPassword ? 'Hide password' : 'Show password'} onClick={() => setShowPassword(!showPassword)} className={`absolute right-1 top-1/2 -translate-y-1/2 p-2 ${theme === 'dark' ? 'text-slate-400 hover:text-white' : 'text-slate-500 hover:text-slate-900'}`}>
-                    {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
-                  </button>
-                </div>
-                <div className="mt-2 text-right">
-                  <button type="button" onClick={handleForgotPassword} className="text-xs font-semibold text-slate-500 transition hover:text-emerald-700">Forgot password?</button>
-                </div>
-              </div>
-              <button type="submit" disabled={isProcessing} className="flex w-full items-center justify-center gap-2 rounded-md bg-[#0f172a] py-3.5 text-sm font-bold uppercase tracking-wide text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50">
-                {isProcessing ? <div className="h-5 w-5 animate-spin rounded-full border-2 border-white border-t-transparent" /> : 'Sign in'}
-              </button>
-            </form>
-
-            <div className="my-6 flex items-center gap-4 text-xs font-semibold text-slate-400">
-              <span className={`h-px flex-1 ${theme === 'dark' ? 'bg-slate-800' : 'bg-slate-200'}`} />
-              <span>or continue with Google</span>
-              <span className={`h-px flex-1 ${theme === 'dark' ? 'bg-slate-800' : 'bg-slate-200'}`} />
+      <main className={`flex min-h-[100svh] flex-col md:flex-row ${theme === 'dark' ? 'bg-slate-950' : 'bg-[#f4f6f3]'}`}>
+        <section aria-label="Ruiru Rentals" className="relative isolate flex min-h-[250px] flex-col overflow-hidden bg-gradient-to-br from-slate-950 via-slate-900 to-emerald-950 px-6 py-6 text-white sm:px-10 sm:py-8 md:min-h-screen md:w-[46%] md:px-12 md:py-10 lg:px-16">
+          <div aria-hidden="true" className="pointer-events-none absolute -right-24 -top-24 h-80 w-80 rounded-full border border-white/[0.06]" />
+          <div aria-hidden="true" className="pointer-events-none absolute -right-10 -top-10 h-52 w-52 rounded-full border border-white/[0.08]" />
+          <div className="relative z-10 flex items-center gap-3">
+            <img src="/HSlogo.png" alt="" className="h-12 w-12 rounded-2xl border border-white/15 object-cover shadow-lg" />
+            <div>
+              <p className="font-serif text-lg font-bold tracking-wide">Ruiru Rentals</p>
+              <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-slate-400">Property management</p>
             </div>
-            <button type="button" onClick={handleGoogleSignIn} disabled={isProcessing} className={`flex w-full items-center justify-center gap-3 border px-4 py-3 text-sm font-semibold transition disabled:opacity-50 ${theme === 'dark' ? 'border-slate-700 text-slate-200 hover:bg-slate-900' : 'border-slate-300 text-slate-700 hover:bg-slate-50'}`}>
-              <svg className="h-5 w-5 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
-                <path fill="#4285F4" d="M21.35 11.1H12v2.7h5.38a5.4 5.4 0 0 1-2.04 3.1v2.58h3.3c1.93-1.78 3.04-4.4 3.04-7.48 0-.38-.12-.76-.33-1.1Z" />
-                <path fill="#34A853" d="M12 20.9c2.43 0 4.47-.8 5.96-2.18l-3.3-2.58c-.92.62-2.1.98-3.6.98-2.77 0-5.11-1.87-5.95-4.38H1.67v2.67C3.15 18.3 7.27 20.9 12 20.9Z" />
-                <path fill="#FBBC05" d="M6.05 12.74a5.27 5.27 0 0 1 0-3.48V6.59H1.67a8.91 8.91 0 0 0 0 8.82l4.38-2.67Z" />
-                <path fill="#EA4335" d="M12 5.18c1.32 0 2.5.45 3.44 1.35l2.58-2.58C16.46 2.51 14.43 1.7 12 1.7c-4.73 0-8.85 2.6-10.33 6.41l4.38 2.67C6.89 7.05 9.23 5.18 12 5.18Z" />
-              </svg>
-              Continue with Google
-            </button>
+          </div>
+
+          <div className="relative z-10 mx-auto flex w-full max-w-xl flex-1 flex-col justify-center py-7 md:py-16">
+            <p className="text-xs font-bold uppercase tracking-[0.2em] text-emerald-300">A simpler way to stay on top</p>
+            <h1 className="mt-3 max-w-lg font-serif text-3xl font-semibold leading-tight tracking-tight sm:text-4xl lg:text-5xl">Your rentals, all in one place.</h1>
+            <p className="mt-4 hidden max-w-md text-sm leading-6 text-slate-300 sm:block sm:text-base">Keep tenant details, rent collection, and property operations organized in one secure workspace.</p>
+            <div className="mt-7 hidden grid-cols-2 gap-3 sm:grid">
+              <div className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/[0.06] p-3.5 text-sm font-medium text-slate-200 backdrop-blur-sm">
+                <span className="rounded-xl bg-emerald-400/10 p-2 text-emerald-300"><Building2 size={18} /></span>
+                Tenant & property details
+              </div>
+              <div className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/[0.06] p-3.5 text-sm font-medium text-slate-200 backdrop-blur-sm">
+                <span className="rounded-xl bg-emerald-400/10 p-2 text-emerald-300"><Wallet size={18} /></span>
+                Rent & operations
+              </div>
+            </div>
+          </div>
+
+          <div className="relative z-10 hidden items-center justify-between border-t border-white/10 pt-5 text-xs text-slate-400 md:flex">
+            <span className="flex items-center gap-2"><ShieldCheck size={15} className="text-emerald-300" />Secure property workspace</span>
+            <span>{liveClock}</span>
           </div>
         </section>
-      </div>
+
+        <section className={`flex flex-1 items-center justify-center px-5 py-9 sm:px-10 sm:py-12 md:w-[54%] md:px-12 lg:px-16 ${theme === 'dark' ? 'bg-slate-950 text-slate-100' : 'text-slate-900'}`}>
+          <div className="w-full max-w-[440px]">
+            <div className={`rounded-3xl border p-6 shadow-[0_24px_70px_-35px_rgba(15,23,42,0.35)] sm:p-9 ${theme === 'dark' ? 'border-slate-800 bg-slate-900' : 'border-slate-200/80 bg-white'}`}>
+              <div className="mb-7 flex items-start gap-3.5">
+                <span className={`rounded-2xl p-3 ${theme === 'dark' ? 'bg-emerald-400/10 text-emerald-300' : 'bg-emerald-50 text-emerald-700'}`}><ShieldCheck size={22} /></span>
+                <div>
+                  <p className={`text-xs font-bold uppercase tracking-[0.16em] ${theme === 'dark' ? 'text-emerald-400' : 'text-emerald-700'}`}>Welcome back</p>
+                  <h2 className={`mt-1 text-2xl font-bold tracking-tight ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>Sign in</h2>
+                  <p className={`mt-1 text-sm leading-5 ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}>Use your authorized account to access the portal.</p>
+                </div>
+              </div>
+
+              {loginError && (
+                <p role="alert" className={`mb-5 flex items-start gap-2.5 rounded-xl border px-3.5 py-3 text-sm leading-5 ${theme === 'dark' ? 'border-rose-900/80 bg-rose-950/50 text-rose-300' : 'border-rose-200 bg-rose-50 text-rose-700'}`}>
+                  <AlertCircle size={17} className="mt-0.5 shrink-0" />
+                  <span>{loginError}</span>
+                </p>
+              )}
+
+              <form onSubmit={handleLoginSubmit} className="space-y-5">
+                <div>
+                  <label htmlFor="login-email" className={`mb-2 block text-sm font-semibold ${theme === 'dark' ? 'text-slate-300' : 'text-slate-700'}`}>Email address</label>
+                  <input id="login-email" required type="email" autoComplete="username" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@example.com" className={`w-full rounded-xl border px-4 py-3.5 text-sm outline-none transition placeholder:text-slate-500 focus:border-emerald-600 focus:ring-4 focus:ring-emerald-600/10 ${theme === 'dark' ? 'border-slate-700 bg-slate-950 text-white' : 'border-slate-300 bg-white text-slate-900'}`} />
+                </div>
+                <div>
+                  <div className="mb-2 flex items-center justify-between gap-3">
+                    <label htmlFor="login-password" className={`block text-sm font-semibold ${theme === 'dark' ? 'text-slate-300' : 'text-slate-700'}`}>Password</label>
+                    <button type="button" onClick={handleForgotPassword} className={`text-xs font-semibold transition ${theme === 'dark' ? 'text-emerald-400 hover:text-emerald-300' : 'text-emerald-700 hover:text-emerald-800'}`}>Forgot password?</button>
+                  </div>
+                  <div className="relative">
+                    <input id="login-password" required type={showPassword ? 'text' : 'password'} autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Enter your password" className={`w-full rounded-xl border px-4 py-3.5 pr-12 text-sm outline-none transition placeholder:text-slate-500 focus:border-emerald-600 focus:ring-4 focus:ring-emerald-600/10 ${theme === 'dark' ? 'border-slate-700 bg-slate-950 text-white' : 'border-slate-300 bg-white text-slate-900'}`} />
+                    <button type="button" aria-label={showPassword ? 'Hide password' : 'Show password'} aria-pressed={showPassword} onClick={() => setShowPassword(!showPassword)} className={`absolute right-2 top-1/2 -translate-y-1/2 rounded-lg p-2 transition ${theme === 'dark' ? 'text-slate-400 hover:bg-slate-800 hover:text-white' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-900'}`}>
+                      {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                    </button>
+                  </div>
+                </div>
+                <button type="submit" disabled={isProcessing} className={`flex w-full items-center justify-center gap-2 rounded-xl py-3.5 text-sm font-bold text-white shadow-sm transition focus-visible:outline-emerald-600 disabled:cursor-not-allowed disabled:opacity-50 ${theme === 'dark' ? 'bg-emerald-700 hover:bg-emerald-600' : 'bg-slate-900 hover:bg-slate-800'}`}>
+                  {isProcessing ? <div className="h-5 w-5 animate-spin rounded-full border-2 border-white border-t-transparent" /> : 'Sign in to your workspace'}
+                </button>
+              </form>
+
+              <div className={`my-6 flex items-center gap-3 text-[11px] font-semibold uppercase tracking-[0.12em] ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}>
+                <span className={`h-px flex-1 ${theme === 'dark' ? 'bg-slate-800' : 'bg-slate-200'}`} />
+                <span>Or use Google</span>
+                <span className={`h-px flex-1 ${theme === 'dark' ? 'bg-slate-800' : 'bg-slate-200'}`} />
+              </div>
+              <button type="button" onClick={handleGoogleSignIn} disabled={isProcessing} className={`flex w-full items-center justify-center gap-3 rounded-xl border px-4 py-3.5 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${theme === 'dark' ? 'border-slate-700 text-slate-200 hover:bg-slate-800' : 'border-slate-300 text-slate-700 hover:bg-slate-50'}`}>
+                <svg className="h-5 w-5 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+                  <path fill="#4285F4" d="M21.35 11.1H12v2.7h5.38a5.4 5.4 0 0 1-2.04 3.1v2.58h3.3c1.93-1.78 3.04-4.4 3.04-7.48 0-.38-.12-.76-.33-1.1Z" />
+                  <path fill="#34A853" d="M12 20.9c2.43 0 4.47-.8 5.96-2.18l-3.3-2.58c-.92.62-2.1.98-3.6.98-2.77 0-5.11-1.87-5.95-4.38H1.67v2.67C3.15 18.3 7.27 20.9 12 20.9Z" />
+                  <path fill="#FBBC05" d="M6.05 12.74a5.27 5.27 0 0 1 0-3.48V6.59H1.67a8.91 8.91 0 0 0 0 8.82l4.38-2.67Z" />
+                  <path fill="#EA4335" d="M12 5.18c1.32 0 2.5.45 3.44 1.35l2.58-2.58C16.46 2.51 14.43 1.7 12 1.7c-4.73 0-8.85 2.6-10.33 6.41l4.38 2.67C6.89 7.05 9.23 5.18 12 5.18Z" />
+                </svg>
+                Continue with Google
+              </button>
+            </div>
+            <p className={`mt-5 text-center text-xs ${theme === 'dark' ? 'text-slate-400' : 'text-slate-600'}`}><span className="inline-flex items-center gap-1.5"><ShieldCheck size={14} />Secure sign-in for authorized users</span></p>
+          </div>
+        </section>
+      </main>
     );
   }
 

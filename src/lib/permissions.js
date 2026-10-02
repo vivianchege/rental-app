@@ -47,3 +47,10 @@ export function normalizeRole(role) {
   const normalized = String(role || '').toUpperCase();
   return Object.values(ROLES).includes(normalized) ? normalized : null;
 }
+
+export function canAccessWorkspaceRecord(data, workspaceId, allowLegacyRecords = false) {
+  if (data?.workspaceId === workspaceId) return true;
+  if (!allowLegacyRecords) return false;
+
+  return typeof data?.workspaceId !== 'string' || data.workspaceId === 'main-workspace';
+}

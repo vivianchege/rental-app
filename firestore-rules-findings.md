@@ -23,6 +23,7 @@ Non-legacy landlord and manager collection listeners include `where('workspaceId
 - Monthly rent targets and deposits are derived from the assigned unit's `rent`. A monthly water-share entry replaces the amount on the open `tenantCycles` record (rather than accumulating repeated submissions), so it no longer attempts an extra `lastAdjustment` tenant-field write that manager rules reject.
 - Managers cannot create houses, tenants, or billing cycles, or update permanent tenant lease terms. Their updates are limited to property repair status, repair resolution, and current-cycle water-share adjustments.
 - Deletes are denied by default. Landlord deletion is limited to payments, payment references, repairs, septic logs, and master water bills in the landlord's workspace. Tenant records are archived rather than deleted; houses and cycle history cannot be deleted through these rules.
+- The reset workflow filters compatibility reads back to the active workspace before preparing any tenant-balance update or operational-record delete batch. Legacy records without a workspace ID remain supported only for the legacy accounts; records from other workspaces are left untouched rather than causing a whole batch to be rejected.
 - User profile reads are limited to the owner and same-workspace landlords. Role assignment is not accepted from a user's own profile write.
 - Tenant documents contain phone/contact PII. Reads remain behind authenticated role/workspace rules.
 
