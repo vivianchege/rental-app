@@ -2,6 +2,12 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
+    // Assumed data model: app records live under artifacts/{appId}/public/data/{collection}/{id}.
+    // payments: tenant/cycle IDs, amount allocations, type/method/reference, status, date, actor and workspace.
+    // billingCycles: mirrored ID, month/year/index, OPEN/CLOSED state, timestamps, actor and workspace.
+    // tenantCycles: tenant/cycle IDs, expected/paid rent and water, status, creation actor/time and workspace.
+    // Other operational collections retain the existing app schema and workspace/actor checks.
+
     function signedIn() {
       return request.auth != null;
     }
@@ -14,8 +20,7 @@ service cloud.firestore {
       return signedIn() && exists(profilePath());
     }
 
-    // Temporary compatibility bridge for the existing live accounts. Remove these
-    // UID checks after creating users/{uid} role profiles for all three accounts.
+    // Temporary compatibility bridge for the three existing production accounts.
     function isLegacyLandlord() {
       return signedIn() && request.auth.uid == 'b4HMBcL0WXT3Qg2vunj5ITZOVb72';
     }
@@ -53,13 +58,9 @@ service cloud.firestore {
 
     function sameWorkspace(data) {
       return data.workspaceId is string && (
-        (isLegacyAccount() && data.workspaceId == 'main-workspace') ||
-        (!isLegacyAccount() && hasProfile() && profile().workspaceId is string && data.workspaceId == profile().workspaceId)
+        (hasProfile() && profile().workspaceId is string && data.workspaceId == profile().workspaceId) ||
+        (isLegacyAccount() && data.workspaceId == 'main-workspace')
       );
-    }
-
-    function landlordCanAccess(data) {
-      return isLandlord() && (!(data.workspaceId is string) || sameWorkspace(data));
     }
 
     function legacyRecord(data) {
@@ -68,92 +69,263 @@ service cloud.firestore {
 
     function managerCollectionAllowed(collectionName) {
       return collectionName in [
-        'houses',
-        'tenants',
-        'payments',
-        'repairs',
-        'septicLogs',
-        'masterWaterBills',
-        'expenses',
-        'notifications',
-        'paymentReferences'
+        'houses', 'tenants', 'payments', 'repairs', 'septicLogs', 'masterWaterBills',
+        'billingCycles', 'tenantCycles', 'expenses', 'notifications', 'paymentReferences'
       ];
     }
 
     function managerCanCreate(collectionName) {
-      return managerCollectionAllowed(collectionName) || collectionName == 'auditLogs';
+      return collectionName in [
+        'payments', 'repairs', 'septicLogs', 'masterWaterBills', 'expenses',
+        'notifications', 'paymentReferences', 'auditLogs'
+      ];
     }
 
-    function landlordCanWrite(resourceData, requestedData) {
-      return isLandlord() &&
-        (sameWorkspace(resourceData) || (isLegacyLandlord() && legacyRecord(resourceData))) &&
-        (sameWorkspace(requestedData) || (isLegacyLandlord() && legacyRecord(requestedData))) &&
-        requestedData.updatedBy == request.auth.uid;
+    function paymentCycleIsOpen(appId, paymentData) {
+      let tenantCycleId = paymentData.tenantId + '_' + paymentData.cycleId;
+      let billingCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/billingCycles/$(paymentData.cycleId);
+      let tenantCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/tenantCycles/$(tenantCycleId);
+      let tenantPath = /databases/$(database)/documents/artifacts/$(appId)/public/data/tenants/$(paymentData.tenantId);
+      return exists(billingCyclePath) &&
+        get(billingCyclePath).data.status == 'OPEN' &&
+        sameWorkspace(get(billingCyclePath).data) &&
+        exists(tenantPath) &&
+        sameWorkspace(get(tenantPath).data) &&
+        exists(tenantCyclePath) &&
+        get(tenantCyclePath).data.tenantId == paymentData.tenantId &&
+        get(tenantCyclePath).data.cycleId == paymentData.cycleId &&
+        sameWorkspace(get(tenantCyclePath).data);
+    }
+
+    function isValidPayment(data) {
+      return data.keys().hasAll([
+          'tenantId', 'tenantName', 'amount', 'appliedRent', 'appliedWater', 'excessAmount',
+          'type', 'method', 'messageCode', 'status', 'date', 'loggedBy', 'cycleId', 'workspaceId', 'createdBy'
+        ]) &&
+        data.keys().hasOnly([
+          'tenantId', 'tenantName', 'amount', 'appliedRent', 'appliedWater', 'excessAmount',
+          'type', 'method', 'messageCode', 'status', 'date', 'loggedBy', 'cycleId', 'workspaceId', 'createdBy', 'updatedBy'
+        ]) &&
+        data.tenantId is string && data.tenantId.size() > 0 && data.tenantId.size() <= 128 &&
+        data.tenantName is string && data.tenantName.size() > 0 && data.tenantName.size() <= 120 &&
+        data.amount is number && data.amount > 0 && data.amount <= 1000000000000 &&
+        data.appliedRent is number && data.appliedRent >= 0 && data.appliedRent <= data.amount &&
+        data.appliedWater is number && data.appliedWater >= 0 && data.appliedWater <= data.amount &&
+        data.excessAmount is number && data.excessAmount >= 0 && data.excessAmount <= data.amount &&
+        data.type in ['RENT', 'WATER', 'COMBINED'] &&
+        data.method is string && data.method.size() > 0 && data.method.size() <= 40 &&
+        data.messageCode is string && data.messageCode.size() <= 100 &&
+        data.status in ['PENDING', 'CONFIRMED'] &&
+        data.date is string && data.date.size() > 0 && data.date.size() <= 40 &&
+        data.loggedBy in ['LANDLORD', 'MANAGER'] &&
+        data.cycleId is string && data.cycleId.size() > 0 && data.cycleId.size() <= 128 &&
+        data.workspaceId is string && data.workspaceId.size() > 0 && data.workspaceId.size() <= 120 &&
+        data.createdBy is string && data.createdBy.size() > 0 && data.createdBy.size() <= 128 &&
+        (!('updatedBy' in data) || (data.updatedBy is string && data.updatedBy.size() <= 128)) &&
+        ((data.status == 'PENDING' && data.loggedBy == 'MANAGER' &&
+          data.appliedRent == 0 && data.appliedWater == 0 && data.excessAmount == 0) ||
+         (data.status == 'CONFIRMED' &&
+          math.abs(data.amount - data.appliedRent - data.appliedWater - data.excessAmount) <= 0.01));
+    }
+
+    function isValidBillingCycle(data, recordId) {
+      return data.keys().hasAll([
+          'id', 'month', 'year', 'monthIndex', 'status', 'openedAt', 'closedAt',
+          'openedBy', 'workspaceId', 'createdBy'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'month', 'year', 'monthIndex', 'status', 'openedAt', 'closedAt',
+          'openedBy', 'workspaceId', 'createdBy', 'updatedBy'
+        ]) &&
+        data.id == recordId &&
+        data.month is string && data.month.size() > 0 && data.month.size() <= 40 &&
+        data.year is int && data.year >= 2000 && data.year <= 2200 &&
+        data.monthIndex is int && data.monthIndex >= 0 && data.monthIndex <= 11 &&
+        data.status in ['OPEN', 'CLOSED'] &&
+        data.openedAt is string && data.openedAt.size() > 0 && data.openedAt.size() <= 40 &&
+        (data.closedAt == null || (data.closedAt is string && data.closedAt.size() <= 40)) &&
+        data.openedBy == 'LANDLORD' &&
+        data.workspaceId is string && data.workspaceId.size() > 0 && data.workspaceId.size() <= 120 &&
+        data.createdBy is string && data.createdBy.size() > 0 && data.createdBy.size() <= 128 &&
+        (!('updatedBy' in data) || (data.updatedBy is string && data.updatedBy.size() <= 128));
+    }
+
+    function isValidTenantCycle(data, recordId) {
+      return data.keys().hasAll([
+          'tenantId', 'cycleId', 'tenantName', 'houseId', 'expectedRent', 'expectedWater',
+          'paidRent', 'paidWater', 'status', 'createdAt', 'workspaceId', 'createdBy'
+        ]) &&
+        data.keys().hasOnly([
+          'tenantId', 'cycleId', 'tenantName', 'houseId', 'expectedRent', 'expectedWater',
+          'paidRent', 'paidWater', 'status', 'createdAt', 'workspaceId', 'createdBy', 'updatedBy'
+        ]) &&
+        data.tenantId is string && data.tenantId.size() > 0 && data.tenantId.size() <= 128 &&
+        data.cycleId is string && data.cycleId.size() > 0 && data.cycleId.size() <= 128 &&
+        recordId == data.tenantId + '_' + data.cycleId &&
+        data.tenantName is string && data.tenantName.size() > 0 && data.tenantName.size() <= 120 &&
+        data.houseId is string && data.houseId.size() <= 150 &&
+        data.expectedRent is number && data.expectedRent >= 0 && data.expectedRent <= 1000000000000 &&
+        data.expectedWater is number && data.expectedWater >= 0 && data.expectedWater <= 1000000000000 &&
+        data.paidRent is number && data.paidRent >= 0 && data.paidRent <= 1000000000000 &&
+        data.paidWater is number && data.paidWater >= 0 && data.paidWater <= 1000000000000 &&
+        data.status in ['OPEN', 'CLEARED', 'ARREARS'] &&
+        data.createdAt is string && data.createdAt.size() > 0 && data.createdAt.size() <= 40 &&
+        data.workspaceId is string && data.workspaceId.size() > 0 && data.workspaceId.size() <= 120 &&
+        data.createdBy is string && data.createdBy.size() > 0 && data.createdBy.size() <= 128 &&
+        (!('updatedBy' in data) || (data.updatedBy is string && data.updatedBy.size() <= 128));
+    }
+
+    function isCycleCollection(collectionName) {
+      return collectionName in ['billingCycles', 'tenantCycles'];
+    }
+
+    function validTenantCycleCreate(appId, data, recordId) {
+      let billingCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/billingCycles/$(data.cycleId);
+      return isValidTenantCycle(data, recordId) &&
+        existsAfter(billingCyclePath) &&
+        getAfter(billingCyclePath).data.status == 'OPEN' &&
+        sameWorkspace(getAfter(billingCyclePath).data);
+    }
+
+    function tenantCycleParentIsOpen(appId, data) {
+      let billingCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/billingCycles/$(data.cycleId);
+      return exists(billingCyclePath) && get(billingCyclePath).data.status == 'OPEN' &&
+        sameWorkspace(get(billingCyclePath).data);
+    }
+
+    function tenantCycleResetIsValid(appId, recordId) {
+      let data = request.resource.data;
+      let billingCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/billingCycles/$(data.cycleId);
+      let chargesExist = data.expectedRent > 0 || data.expectedWater > 0;
+      return isValidTenantCycle(data, recordId) &&
+        exists(billingCyclePath) && sameWorkspace(get(billingCyclePath).data) &&
+        data.diff(resource.data).affectedKeys().hasOnly(['paidRent', 'paidWater', 'status', 'updatedBy']) &&
+        data.paidRent == 0 && data.paidWater == 0 &&
+        ((get(billingCyclePath).data.status == 'OPEN' &&
+            ((chargesExist && data.status == 'OPEN') || (!chargesExist && data.status == 'CLEARED'))) ||
+         (get(billingCyclePath).data.status == 'CLOSED' &&
+            ((chargesExist && data.status == 'ARREARS') || (!chargesExist && data.status == 'CLEARED'))));
+    }
+
+    function managerPaymentCreateIsPending(appId) {
+      return isValidPayment(request.resource.data) &&
+        !('updatedBy' in request.resource.data) &&
+        request.resource.data.status == 'PENDING' &&
+        request.resource.data.loggedBy == 'MANAGER' &&
+        paymentCycleIsOpen(appId, request.resource.data);
+    }
+
+    function managerCanUpdateRecord(collectionName, appId, recordId) {
+      return (collectionName == 'houses' &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['repairStatus', 'updatedBy']) &&
+          request.resource.data.repairStatus in ['GOOD', 'NEEDS_REPAIR']) ||
+        (collectionName == 'tenants' &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['expectedRent', 'expectedWater', 'updatedBy']) &&
+          request.resource.data.expectedRent is number && request.resource.data.expectedRent >= 0 &&
+          request.resource.data.expectedRent <= 1000000000000 &&
+          request.resource.data.expectedWater is number && request.resource.data.expectedWater >= 0 &&
+          request.resource.data.expectedWater <= 1000000000000) ||
+        (collectionName == 'repairs' &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cost', 'resolvedAt', 'updatedBy']) &&
+          request.resource.data.status == 'RESOLVED' &&
+          request.resource.data.cost is number && request.resource.data.cost >= 0 && request.resource.data.cost <= 1000000000000 &&
+          request.resource.data.resolvedAt is string && request.resource.data.resolvedAt.size() <= 40) ||
+        (collectionName == 'tenantCycles' &&
+          isValidTenantCycle(request.resource.data, recordId) &&
+          tenantCycleParentIsOpen(appId, request.resource.data) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['expectedRent', 'expectedWater', 'status', 'updatedBy']) &&
+          request.resource.data.status in ['OPEN', 'CLEARED', 'ARREARS']);
+    }
+
+    function isValidCollectionCreate(collectionName, appId, data, recordId) {
+      return (collectionName == 'payments' && isValidPayment(data) &&
+          !('updatedBy' in data) && paymentCycleIsOpen(appId, data)) ||
+        (collectionName == 'billingCycles' && isValidBillingCycle(data, recordId)) ||
+        (collectionName == 'tenantCycles' && validTenantCycleCreate(appId, data, recordId)) ||
+        (!isCycleCollection(collectionName) && collectionName != 'payments');
+    }
+
+    function cycleUpdateIsValid(collectionName, appId, recordId) {
+      return (collectionName != 'billingCycles' && collectionName != 'tenantCycles' && collectionName != 'payments') ||
+        (collectionName == 'billingCycles' &&
+          isValidBillingCycle(request.resource.data, recordId) &&
+          resource.data.status == 'OPEN' && request.resource.data.status == 'CLOSED' &&
+          request.resource.data.closedAt is string &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'closedAt', 'updatedBy'])) ||
+        (collectionName == 'tenantCycles' &&
+          isValidTenantCycle(request.resource.data, recordId) &&
+          tenantCycleParentIsOpen(appId, request.resource.data) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'tenantName', 'houseId', 'expectedRent', 'expectedWater', 'paidRent',
+            'paidWater', 'status', 'updatedBy'
+          ])) ||
+        (collectionName == 'payments' &&
+          isValidPayment(request.resource.data) &&
+          resource.data.status == 'PENDING' && request.resource.data.status == 'CONFIRMED' &&
+          request.resource.data.updatedBy == request.auth.uid &&
+          paymentCycleIsOpen(appId, request.resource.data) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'status', 'appliedRent', 'appliedWater', 'excessAmount', 'updatedBy'
+          ]));
     }
 
     match /users/{userId} {
-      // A user may read their own role profile. Landlords may read manager profiles.
-      allow read: if signedIn() && (request.auth.uid == userId || isLandlord());
+      // Role profiles can contain private identity data. A landlord may only read profiles in their workspace.
+      allow read: if signedIn() && (request.auth.uid == userId ||
+        (isLandlord() && hasProfile() &&
+          get(/databases/$(database)/documents/users/$(userId)).data.workspaceId is string &&
+          profile().workspaceId is string &&
+          get(/databases/$(database)/documents/users/$(userId)).data.workspaceId == profile().workspaceId));
 
-      // A landlord may provision/update managers, but cannot create or promote another landlord.
+      // Only an already-authorized landlord may provision or update manager profiles.
       allow create, update: if isLandlord() &&
         request.resource.data.role == 'MANAGER' &&
-        request.resource.data.workspaceId is string;
+        request.resource.data.workspaceId is string &&
+        (isLegacyLandlord()
+          ? request.resource.data.workspaceId == 'main-workspace'
+          : (hasProfile() && request.resource.data.workspaceId == profile().workspaceId));
 
       allow delete: if false;
     }
 
     match /artifacts/{appId}/public/data/{collectionName}/{recordId} {
-      // Landlords can read all records in their authenticated workspace.
-      // Managers only receive operational/collection data, never audit history or settings.
-      // The first two branches are a temporary bridge for the three existing
-      // production accounts. It is UID-authenticated and collection-scoped for
-      // managers so old records without workspaceId remain usable during migration.
-      allow read: if isLegacyLandlord() || (
-        isLegacyManager() && managerCollectionAllowed(collectionName)
-      ) || landlordCanAccess(resource.data) || (
-        isManager() &&
-        managerCollectionAllowed(collectionName) &&
-        (sameWorkspace(resource.data) || (isLegacyManager() && legacyRecord(resource.data)))
-      );
-
-      // Every new record must identify its workspace and creating user.
-      allow create: if isLegacyLandlord() &&
-        request.resource.data.createdBy == request.auth.uid;
+      // Compatibility reads preserve the existing UID-based accounts while they migrate.
+      allow read: if isLegacyLandlord() ||
+        (isLegacyManager() && managerCollectionAllowed(collectionName)) ||
+        (isLandlord() && sameWorkspace(resource.data)) ||
+        (isManager() && managerCollectionAllowed(collectionName) && sameWorkspace(resource.data));
 
       allow create: if isLandlord() &&
         sameWorkspace(request.resource.data) &&
         request.resource.data.createdBy == request.auth.uid &&
-        request.resource.data.workspaceId is string;
-
-      allow create: if isLegacyManager() &&
-        managerCanCreate(collectionName) &&
-        request.resource.data.createdBy == request.auth.uid;
+        isValidCollectionCreate(collectionName, appId, request.resource.data, recordId);
 
       allow create: if isManager() &&
         managerCanCreate(collectionName) &&
         sameWorkspace(request.resource.data) &&
-        request.resource.data.createdBy == request.auth.uid;
+        request.resource.data.createdBy == request.auth.uid &&
+        !isCycleCollection(collectionName) &&
+        (collectionName != 'payments' || managerPaymentCreateIsPending(appId));
 
-      // Updates are allowed only to an authenticated actor. Normal UI workflows use
-      // archival/status changes instead of deleting financial records. This covers
-      // tenant archival, releasing its house, and water-vault reset metadata.
-      allow update: if isLegacyLandlord() &&
-        request.resource.data.updatedBy == request.auth.uid;
-
-      allow update: if landlordCanWrite(resource.data, request.resource.data);
-
-      allow update: if isLegacyManager() &&
-        managerCollectionAllowed(collectionName) &&
-        request.resource.data.updatedBy == request.auth.uid;
+      allow update: if isLandlord() &&
+        (sameWorkspace(resource.data) || (isLegacyLandlord() && legacyRecord(resource.data))) &&
+        (sameWorkspace(request.resource.data) || (isLegacyLandlord() && legacyRecord(request.resource.data))) &&
+        request.resource.data.updatedBy == request.auth.uid &&
+        (cycleUpdateIsValid(collectionName, appId, recordId) ||
+          (collectionName == 'tenantCycles' && tenantCycleResetIsValid(appId, recordId)));
 
       allow update: if isManager() &&
         managerCollectionAllowed(collectionName) &&
+        collectionName != 'billingCycles' &&
         (sameWorkspace(resource.data) || (isLegacyManager() && legacyRecord(resource.data))) &&
         (sameWorkspace(request.resource.data) || (isLegacyManager() && legacyRecord(request.resource.data))) &&
-        request.resource.data.updatedBy == request.auth.uid;
+        request.resource.data.updatedBy == request.auth.uid &&
+        cycleUpdateIsValid(collectionName, appId, recordId) &&
+        managerCanUpdateRecord(collectionName, appId, recordId);
 
-      allow delete: if false;
+      allow delete: if isLandlord() &&
+        collectionName in ['payments', 'paymentReferences', 'repairs', 'septicLogs', 'masterWaterBills'] &&
+        (sameWorkspace(resource.data) || (isLegacyLandlord() && legacyRecord(resource.data)));
     }
   }
 }

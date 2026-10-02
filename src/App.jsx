@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   Users, Home, Wallet, Wrench, LayoutDashboard, LogOut, 
   CheckCircle2, Plus, AlertCircle, Phone, X, ShieldCheck,
@@ -8,8 +8,8 @@ import {
   Settings, Bell, Building2, Activity,
   SlidersHorizontal, Database, ArrowUpRight, RotateCcw
 } from 'lucide-react';
-import { allocatePayment, parseMoney } from './lib/money';
-import { hasPermission, normalizeRole, PERMISSIONS, ROLES } from './lib/permissions';
+import { allocatePayment, parseMoney } from './lib/money.js';
+import { hasPermission, normalizeRole, PERMISSIONS, ROLES } from './lib/permissions.js';
 
 // --- FIREBASE IMPORTS ---
 import { initializeApp, getApps, getApp } from 'firebase/app';
@@ -28,6 +28,7 @@ import {
   persistentLocalCache,
   persistentMultipleTabManager,
   collection, 
+  getDocs,
   onSnapshot, 
   doc, 
   addDoc, 
@@ -36,10 +37,8 @@ import {
   runTransaction,
   query,
   where,
-  enableIndexedDbPersistence 
+  writeBatch
 } from 'firebase/firestore';
-import { allocatePayment, parseMoney } from './lib/money.js';
-import { hasPermission, PERMISSIONS } from './lib/permissions.js';
 
 // --- FIREBASE SETUP ---
 const firebaseConfig = {
@@ -54,7 +53,9 @@ const firebaseConfig = {
 const isFirebaseConfigured = Object.values(firebaseConfig).every(Boolean);
 const app = isFirebaseConfigured ? (getApps().length === 0 ? initializeApp(firebaseConfig) : getApp()) : null;
 const auth = app ? getAuth(app) : null;
-const db = app ? getFirestore(app) : null;
+const db = app ? initializeFirestore(app, {
+  localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
+}) : null;
 const appId = firebaseConfig.projectId || 'house-management-portal';
 const DEFAULT_CURRENCY = import.meta.env.VITE_DEFAULT_CURRENCY || 'KES';
 const DEFAULT_TIMEZONE = import.meta.env.VITE_DEFAULT_TIMEZONE || 'Africa/Nairobi';
@@ -69,12 +70,55 @@ const LEGACY_ROLE_BY_UID = {
   [import.meta.env.VITE_LEGACY_MANAGER_UID_2 || 'N8wEpIJvUZRmD6WoYYxqpUiiLhj2']: ROLES.MANAGER,
 };
 
-// FORCE FRESH DATA SYNC
-if (db) {
-  enableIndexedDbPersistence(db).catch(() => {
-    // Offline persistence is optional. The live session remains usable when another tab owns the cache.
-  });
-}
+const collectionRef = (collectionName) => collection(db, 'artifacts', appId, 'public', 'data', collectionName);
+const documentRef = (collectionName, documentId) => doc(db, 'artifacts', appId, 'public', 'data', collectionName, documentId);
+const tenantCycleDocumentId = (tenantId, cycleId) => `${tenantId}_${cycleId}`;
+const monthNames = Array.from({ length: 12 }, (_, index) => new Date(2026, index, 1).toLocaleString('en', { month: 'long' }));
+
+const getCycleTenantStatus = (cycleTenant) => {
+  const rentDue = Number(cycleTenant.expectedRent || 0) - Number(cycleTenant.paidRent || 0);
+  const waterDue = Number(cycleTenant.expectedWater || 0) - Number(cycleTenant.paidWater || 0);
+  if (rentDue <= 0 && waterDue <= 0) return 'CLEARED';
+  if (Number(cycleTenant.paidRent || 0) > 0 || Number(cycleTenant.paidWater || 0) > 0) return 'ARREARS';
+  return 'OPEN';
+};
+
+const finalizeTenantCycle = (cycleTenant) => ({
+  ...cycleTenant,
+  status: getCycleTenantStatus(cycleTenant) === 'CLEARED' ? 'CLEARED' : 'ARREARS'
+});
+
+const commitBatches = async (operations, chunkSize = 450) => {
+  for (let index = 0; index < operations.length; index += chunkSize) {
+    const batch = writeBatch(db);
+    operations.slice(index, index + chunkSize).forEach((operation) => operation(batch));
+    await promiseTimeout(batch.commit(), 15000);
+  }
+};
+
+const getMonthKey = (dateValue) => {
+  const date = new Date(dateValue);
+  if (Number.isNaN(date.getTime())) return '';
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+};
+
+const getMonthLabel = (key) => {
+  const [year, month] = key.split('-').map(Number);
+  return new Date(year, month - 1, 1).toLocaleString('en-KE', { month: 'long', year: 'numeric' });
+};
+
+const createCycleLabel = (year, monthIndex) => new Date(year, monthIndex, 1).toLocaleString('en-KE', {
+  month: 'long',
+  year: 'numeric'
+});
+
+const dateInNairobi = (date = new Date()) => date.toLocaleString('en-KE', {
+  dateStyle: 'full',
+  timeStyle: 'short',
+  timeZone: DEFAULT_TIMEZONE
+});
+
+const createCurrentMonthKey = () => getMonthKey(new Date());
 
 const promiseTimeout = (promise, ms = 15000) => {
   return Promise.race([
@@ -95,10 +139,14 @@ export default function App() {
   const [user, setUser] = useState(null);
   const [role, setRole] = useState(null);
   const [userProfile, setUserProfile] = useState(null);
+  const [billingCycles, setBillingCycles] = useState([]);
+  const [tenantCycles, setTenantCycles] = useState([]);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [loading, setLoading] = useState(() => Boolean(auth));
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [globalSearch, setGlobalSearch] = useState('');
+  const [toastMessage, setToastMessage] = useState('');
+  const [liveClock, setLiveClock] = useState(() => dateInNairobi());
   // Global states for errors and visual loading states
   const [isProcessing, setIsProcessing] = useState(false);
   const [modalError, setModalError] = useState('');
@@ -113,7 +161,6 @@ export default function App() {
   const rejectedGoogleUserUid = useRef(null);
 
   // Authentication State Variables
-  const [loginTab, setLoginTab] = useState('landlord'); 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -159,11 +206,26 @@ export default function App() {
   // workspace. Keep their scope stable even if an old users/{uid} profile has
   // a stale or incompatible workspaceId value.
   const workspaceId = LEGACY_ROLE_BY_UID[user?.uid] ? DEFAULT_WORKSPACE_ID : userProfile?.workspaceId || user?.uid || '';
+  const makeRecordMetadata = (actor, isUpdate = false) => ({
+    workspaceId,
+    [isUpdate ? 'updatedBy' : 'createdBy']: actor?.uid || ''
+  });
 
   useEffect(() => {
     localStorage.setItem('ruiru_theme', theme);
     document.documentElement.dataset.theme = theme;
   }, [theme]);
+
+  useEffect(() => {
+    const timer = setInterval(() => setLiveClock(dateInNairobi()), 30000);
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!toastMessage) return undefined;
+    const timer = setTimeout(() => setToastMessage(''), 4000);
+    return () => clearTimeout(timer);
+  }, [toastMessage]);
 
   // Authentication is intentionally role-agnostic in the client. The role is resolved
   // from a protected profile/custom claim instead of a hard-coded email allowlist.
@@ -174,6 +236,10 @@ export default function App() {
 
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       if (currentUser) {
+        if (rejectedGoogleUserUid.current === currentUser.uid) {
+          setLoading(false);
+          return;
+        }
         try {
           const token = await getIdTokenResult(currentUser);
           const profileSnapshot = db ? await getDoc(doc(db, 'users', currentUser.uid)) : null;
@@ -227,8 +293,9 @@ export default function App() {
     
     const getColRef = (colName) => {
       const ref = collection(db, 'artifacts', appId, 'public', 'data', colName);
-      const isLegacyManager = role === ROLES.MANAGER && LEGACY_ROLE_BY_UID[user?.uid] === ROLES.MANAGER;
-      return role === ROLES.MANAGER && !isLegacyManager ? query(ref, where('workspaceId', '==', workspaceId)) : ref;
+      const isLegacyAccount = Boolean(LEGACY_ROLE_BY_UID[user?.uid]);
+      const needsWorkspaceQuery = [ROLES.LANDLORD, ROLES.MANAGER].includes(role) && !isLegacyAccount;
+      return needsWorkspaceQuery ? query(ref, where('workspaceId', '==', workspaceId)) : ref;
     };
     // Individual subscriptions can fail for legacy records or during a brief
     // offline period. Keep the rest of the portal usable without blocking the UI
@@ -244,7 +311,7 @@ export default function App() {
         setHouses(fetchedHouses);
     }, handleSnapshotError);
 
-    const unsubTenants = onSnapshot(collectionRef('tenants'), (snap) => {
+    const unsubTenants = onSnapshot(getColRef('tenants'), (snap) => {
         setTenants(snap.docs.map(d => ({ id: d.id, ...d.data() })));
     }, handleSnapshotError);
 
@@ -284,20 +351,20 @@ export default function App() {
       setNotifications(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)));
     }, handleSnapshotError);
 
-    const unsubCycles = onSnapshot(collectionRef('billingCycles'), (snap) => {
+    const unsubCycles = onSnapshot(getColRef('billingCycles'), (snap) => {
       const cycles = snap.docs.map(d => ({ id: d.id, ...d.data() }));
       cycles.sort((a, b) => new Date(b.openedAt) - new Date(a.openedAt));
       setBillingCycles(cycles);
-    }, console.error);
+    }, handleSnapshotError);
 
-    const unsubTenantCycles = onSnapshot(collectionRef('tenantCycles'), (snap) => {
+    const unsubTenantCycles = onSnapshot(getColRef('tenantCycles'), (snap) => {
       setTenantCycles(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    }, console.error);
+    }, handleSnapshotError);
 
     return () => { 
       unsubHouses(); unsubTenants(); unsubPayments();
       unsubRepairs(); unsubSeptic(); unsubWaterBills(); unsubWaterVaultResets(); unsubExpenses();
-      unsubActivity(); unsubNotifications();
+      unsubActivity(); unsubNotifications(); unsubCycles(); unsubTenantCycles();
     };
   }, [user, role, workspaceId]);
 
@@ -306,18 +373,19 @@ export default function App() {
     ? activeCycle
     : billingCycles.find(cycle => cycle.id === selectedDashboardCycleId) || activeCycle;
   const isHistoricalCycleView = Boolean(viewedCycle && viewedCycle.id !== activeCycle?.id);
-  const tenantCycleById = useMemo(() => new Map(tenantCycles.map(cycle => [cycle.id, cycle])), [tenantCycles]);
+  const activeTenants = useMemo(() => tenants.filter(t => t.status !== 'ARCHIVED' && !t.archivedAt), [tenants]);
   const activeTenantCycles = useMemo(() => new Map(
     tenantCycles.filter(cycle => cycle.cycleId === activeCycle?.id).map(cycle => [cycle.tenantId, cycle])
   ), [tenantCycles, activeCycle]);
+  const selectedTenantCycle = selectedTenant ? activeTenantCycles.get(selectedTenant.id) : null;
   const ledgerMonths = useMemo(() => {
     const monthKeys = [...new Set(payments.map(payment => getMonthKey(payment.date)).filter(Boolean))];
     return monthKeys.sort((a, b) => b.localeCompare(a));
   }, [payments]);
 
-  const filteredTenants = useMemo(() => {
+  const filteredBillingTenants = useMemo(() => {
     const normalizedSearch = tenantSearch.trim().toLowerCase();
-    return tenants.filter(tenant => {
+    return activeTenants.filter(tenant => {
       const cycle = activeTenantCycles.get(tenant.id);
       const rentDue = Number(cycle?.expectedRent || 0) - Number(cycle?.paidRent || 0);
       const waterDue = Number(cycle?.expectedWater || 0) - Number(cycle?.paidWater || 0);
@@ -329,10 +397,9 @@ export default function App() {
         || (tenantStatusFilter === 'CLEARED' && isCleared);
       return matchesSearch && matchesStatus;
     });
-  }, [tenants, activeTenantCycles, tenantSearch, tenantStatusFilter]);
+  }, [activeTenants, activeTenantCycles, tenantSearch, tenantStatusFilter]);
 
   // Derived occupancies
-  const activeTenants = useMemo(() => tenants.filter(t => t.status !== 'ARCHIVED' && !t.archivedAt), [tenants]);
   const occupiedHouseIds = useMemo(() => {
     return new Set(activeTenants.map(t => t.houseId).filter(Boolean));
   }, [activeTenants]);
@@ -391,11 +458,25 @@ export default function App() {
     provider.setCustomParameters({ prompt: 'select_account' });
     rejectedGoogleUserUid.current = null;
     try {
-      await signInWithPopup(auth, provider);
+      const result = await signInWithPopup(auth, provider);
+      const token = await getIdTokenResult(result.user);
+      const profileSnapshot = db ? await getDoc(doc(db, 'users', result.user.uid)) : null;
+      const profile = profileSnapshot?.exists() ? profileSnapshot.data() : {};
+      const resolvedRole = normalizeRole(token.claims.role || profile.role || LEGACY_ROLE_BY_UID[result.user.uid]);
+      if (!resolvedRole) {
+        rejectedGoogleUserUid.current = result.user.uid;
+        setUser(null);
+        setRole(null);
+        setUserProfile(null);
+        await signOut(auth);
+        setLoginError('Access denied: this Google account is not authorized for the rental portal.');
+        return;
+      }
       triggerWelcome();
-    } catch {
-      setLoginError('Invalid credentials.');
-      await signOut(auth);
+    } catch (error) {
+      if (error.code !== 'auth/popup-closed-by-user') {
+        setLoginError(error.message?.replace(/^Firebase:\s*/i, '') || 'Google sign-in failed.');
+      }
     } finally {
       setIsProcessing(false);
     }
@@ -832,42 +913,64 @@ export default function App() {
       const method = formData.get('method');
 
       const paymentRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'payments'));
-      const referenceRef = messageCode && method !== 'CASH' && messageCode !== 'N/A'
+      const isCashMethod = method.trim().toLowerCase() === 'cash';
+      const referenceRef = messageCode && !isCashMethod && messageCode !== 'N/A'
         ? doc(db, 'artifacts', appId, 'public', 'data', 'paymentReferences', encodeURIComponent(messageCode))
         : null;
       const isConfirmed = role === ROLES.LANDLORD;
 
       await promiseTimeout(runTransaction(db, async (transaction) => {
         const tenantRef = doc(db, 'artifacts', appId, 'public', 'data', 'tenants', selectedTenant.id);
+        const cycleRef = documentRef('billingCycles', activeCycle.id);
+        const cycleTenantRef = documentRef('tenantCycles', cycleTenant.id);
         const tenantSnapshot = await transaction.get(tenantRef);
+        const cycleSnapshot = await transaction.get(cycleRef);
+        const cycleTenantSnapshot = await transaction.get(cycleTenantRef);
         const referenceSnapshot = referenceRef ? await transaction.get(referenceRef) : null;
         if (!tenantSnapshot.exists() || tenantSnapshot.data().status === 'ARCHIVED') throw new Error('This tenant record is no longer active.');
+        if (!cycleSnapshot.exists() || cycleSnapshot.data().status !== 'OPEN') throw new Error('The billing cycle is no longer open. Refresh and try again.');
+        if (!cycleTenantSnapshot.exists()) throw new Error('This tenant is not set up in the active billing cycle yet.');
         if (referenceSnapshot?.exists()) throw new Error('That payment reference has already been recorded.');
 
         const currentTenant = tenantSnapshot.data();
+        const currentCycleTenant = cycleTenantSnapshot.data();
+        if (currentCycleTenant.tenantId !== selectedTenant.id || currentCycleTenant.cycleId !== activeCycle.id) {
+          throw new Error('This tenant billing record does not match the active cycle.');
+        }
         const allocation = allocatePayment(
           amount,
           type,
-          Number(currentTenant.expectedRent || 0) - Number(currentTenant.paidRent || 0),
-          Number(currentTenant.expectedWater || 0) - Number(currentTenant.paidWater || 0)
+          Number(currentCycleTenant.expectedRent || 0) - Number(currentCycleTenant.paidRent || 0),
+          Number(currentCycleTenant.expectedWater || 0) - Number(currentCycleTenant.paidWater || 0)
         );
         const now = new Date().toISOString();
         transaction.set(paymentRef, {
-          ...recordDefaults(),
+          workspaceId,
+          createdBy: user.uid,
           tenantId: selectedTenant.id, tenantName: currentTenant.name,
           amount, appliedRent: isConfirmed ? allocation.appliedRent : 0,
           appliedWater: isConfirmed ? allocation.appliedWater : 0,
           excessAmount: isConfirmed ? allocation.excessAmount : 0,
-          pendingAllocation: isConfirmed ? null : allocation,
           type, method, messageCode, status: isConfirmed ? 'CONFIRMED' : 'PENDING',
-          date: now, createdAt: now, loggedBy: role, loggedByUserId: user.uid
+          date: now, loggedBy: role, cycleId: activeCycle.id
         });
         if (referenceRef) transaction.set(referenceRef, { ...recordDefaults(), paymentId: paymentRef.id, reference: messageCode, createdAt: now });
         if (isConfirmed) {
+          const updatedCycleTenant = {
+            ...currentCycleTenant,
+            paidRent: Number(currentCycleTenant.paidRent || 0) + allocation.appliedRent,
+            paidWater: Number(currentCycleTenant.paidWater || 0) + allocation.appliedWater,
+          };
+          transaction.update(cycleTenantRef, {
+            paidRent: updatedCycleTenant.paidRent,
+            paidWater: updatedCycleTenant.paidWater,
+            status: getCycleTenantStatus(updatedCycleTenant),
+            updatedBy: user.uid,
+          });
           transaction.update(tenantRef, {
             paidRent: Number(currentTenant.paidRent || 0) + allocation.appliedRent,
             paidWater: Number(currentTenant.paidWater || 0) + allocation.appliedWater,
-            updatedBy: user.uid, updatedAt: now
+            updatedBy: user.uid,
           });
         }
       }), 5000);
@@ -884,27 +987,47 @@ export default function App() {
     try {
       const paymentRef = doc(db, 'artifacts', appId, 'public', 'data', 'payments', payment.id);
       const tenantRef = doc(db, 'artifacts', appId, 'public', 'data', 'tenants', payment.tenantId);
+      if (!payment.cycleId) throw new Error('This older payment has no billing cycle and needs manual review.');
+      const cycleRef = documentRef('billingCycles', payment.cycleId);
+      const cycleTenantRef = documentRef('tenantCycles', tenantCycleDocumentId(payment.tenantId, payment.cycleId));
       await promiseTimeout(runTransaction(db, async (transaction) => {
         const paymentSnapshot = await transaction.get(paymentRef);
         const tenantSnapshot = await transaction.get(tenantRef);
+        const cycleSnapshot = await transaction.get(cycleRef);
+        const cycleTenantSnapshot = await transaction.get(cycleTenantRef);
         if (!paymentSnapshot.exists() || paymentSnapshot.data().status !== 'PENDING') throw new Error('This payment has already been reviewed.');
         if (!tenantSnapshot.exists() || tenantSnapshot.data().status === 'ARCHIVED') throw new Error('Tenant is no longer in the directory.');
+        if (!cycleSnapshot.exists() || cycleSnapshot.data().status !== 'OPEN') throw new Error('Only payments in an open billing cycle can be confirmed.');
+        if (!cycleTenantSnapshot.exists()) throw new Error('The tenant billing record for this cycle is missing.');
         const currentPayment = paymentSnapshot.data();
         const currentTenant = tenantSnapshot.data();
+        const currentCycleTenant = cycleTenantSnapshot.data();
         const allocation = allocatePayment(
           currentPayment.amount,
           currentPayment.type,
-          Number(currentTenant.expectedRent || 0) - Number(currentTenant.paidRent || 0),
-          Number(currentTenant.expectedWater || 0) - Number(currentTenant.paidWater || 0)
+          Number(currentCycleTenant.expectedRent || 0) - Number(currentCycleTenant.paidRent || 0),
+          Number(currentCycleTenant.expectedWater || 0) - Number(currentCycleTenant.paidWater || 0)
         );
-        const now = new Date().toISOString();
-        transaction.update(paymentRef, { status: 'CONFIRMED', ...allocation, reviewedBy: user.uid, reviewedAt: now, updatedBy: user.uid, updatedAt: now });
+        const updatedCycleTenant = {
+          ...currentCycleTenant,
+          paidRent: Number(currentCycleTenant.paidRent || 0) + allocation.appliedRent,
+          paidWater: Number(currentCycleTenant.paidWater || 0) + allocation.appliedWater,
+        };
+        transaction.update(paymentRef, {
+          status: 'CONFIRMED', ...allocation, updatedBy: user.uid,
+        });
+        transaction.update(cycleTenantRef, {
+          paidRent: updatedCycleTenant.paidRent,
+          paidWater: updatedCycleTenant.paidWater,
+          status: getCycleTenantStatus(updatedCycleTenant),
+          updatedBy: user.uid,
+        });
         transaction.update(tenantRef, {
           paidRent: Number(currentTenant.paidRent || 0) + allocation.appliedRent,
           paidWater: Number(currentTenant.paidWater || 0) + allocation.appliedWater,
-          updatedBy: user.uid, updatedAt: now
+          updatedBy: user.uid,
         });
-      }), 5000);
+      }), 10000);
       await recordAudit('PAYMENT_CONFIRMED', 'payment', payment.id, { tenantId: payment.tenantId, amount: payment.amount });
     } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
@@ -923,7 +1046,7 @@ export default function App() {
         category: formData.get('category'), description: formData.get('description').trim(), amount,
         date, paymentMethod: formData.get('paymentMethod'), vendor: formData.get('vendor').trim(),
         status: role === ROLES.LANDLORD ? 'APPROVED' : 'PENDING',
-        recordedBy: user.uid, createdAt: new Date().toISOString()
+        recordedBy: user.uid, createdAt: new Date().toISOString(), cycleId: activeCycle?.id || null
       }), 5000);
       await recordAudit('EXPENSE_CREATED', 'expense', created.id, { amount, category: formData.get('category') });
       closeAnyModal(setIsExpenseModalOpen);
@@ -940,10 +1063,10 @@ export default function App() {
       const repairPromise = addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'repairs'), {
         ...recordDefaults(),
         description: formData.get('description').trim(), houseId, status: 'OPEN', cost: 0,
-        date: new Date().toISOString(), createdAt: new Date().toISOString(), loggedBy: role, loggedByUserId: user.uid
+        date: new Date().toISOString(), createdAt: new Date().toISOString(), loggedBy: role, loggedByUserId: user.uid, cycleId: activeCycle?.id || null
       });
       const created = await promiseTimeout(repairPromise, 5000);
-      await promiseTimeout(updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', houseId), { repairStatus: 'NEEDS_REPAIR', updatedBy: user.uid, updatedAt: new Date().toISOString() }), 5000);
+      await promiseTimeout(updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', houseId), { repairStatus: 'NEEDS_REPAIR', updatedBy: user.uid }), 5000);
       await recordAudit('MAINTENANCE_CREATED', 'maintenance', created.id, { houseId });
       closeAnyModal(setIsRepairModalOpen);
     } catch(err) { setModalError(err.message); } finally { setIsProcessing(false); }
@@ -961,8 +1084,8 @@ export default function App() {
         const houseRef = doc(db, 'artifacts', appId, 'public', 'data', 'houses', selectedRepair.houseId);
         const repairSnapshot = await transaction.get(repairRef);
         if (!repairSnapshot.exists() || repairSnapshot.data().status !== 'OPEN') throw new Error('This maintenance ticket has already been updated.');
-        transaction.update(repairRef, { status: 'RESOLVED', cost, resolvedAt: now, updatedBy: user.uid, updatedAt: now });
-        transaction.update(houseRef, { repairStatus: 'GOOD', updatedBy: user.uid, updatedAt: now });
+        transaction.update(repairRef, { status: 'RESOLVED', cost, resolvedAt: now, updatedBy: user.uid });
+        transaction.update(houseRef, { repairStatus: 'GOOD', updatedBy: user.uid });
       }), 5000);
       await recordAudit('MAINTENANCE_COMPLETED', 'maintenance', selectedRepair.id, { cost });
       closeAnyModal(setIsResolveRepairModalOpen);
@@ -978,7 +1101,7 @@ export default function App() {
       const optionRaw = new FormData(e.target).get('provider');
       const [provider, costStr] = optionRaw.split('|');
       const created = await promiseTimeout(addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'septicLogs'), {
-        ...recordDefaults(), provider, cost: parseMoney(costStr, { allowZero: true }), date: new Date().toISOString(), loggedBy: role
+        ...recordDefaults(), provider, cost: parseMoney(costStr, { allowZero: true }), date: new Date().toISOString(), loggedBy: role, cycleId: activeCycle?.id || null
       }), 5000);
       await recordAudit('EXPENSE_CREATED', 'septic', created.id, { provider, cost: Number(costStr) });
       closeAnyModal(setIsSepticModalOpen);
@@ -993,7 +1116,7 @@ export default function App() {
       const formData = new FormData(e.target);
       const amount = parseMoney(formData.get('amount'));
       const created = await promiseTimeout(addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'masterWaterBills'), {
-        ...recordDefaults(), month: formData.get('month').trim(), amount, date: new Date().toISOString(), loggedBy: role
+        ...recordDefaults(), month: formData.get('month').trim(), amount, date: new Date().toISOString(), loggedBy: role, cycleId: activeCycle?.id || null
       }), 5000);
       await recordAudit('UTILITY_BILL_CREATED', 'utility_bill', created.id, { amount });
       closeAnyModal(setIsWaterBillModalOpen);
@@ -1028,17 +1151,48 @@ export default function App() {
 
   const handleUpdateBills = async (e) => {
     e.preventDefault();
-    if (!user || !db || !selectedTenant || isProcessing) return;
+    if (!user || !db || !selectedTenant || !activeCycle || isProcessing) return;
     setIsProcessing(true);
+    setModalError('');
     try {
       const formData = new FormData(e.target);
       const addRent = parseMoney(formData.get('addRent'), { allowZero: true });
       const addWater = parseMoney(formData.get('addWater'), { allowZero: true });
-      await promiseTimeout(updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tenants', selectedTenant.id), {
-        expectedRent: Number(selectedTenant.expectedRent || 0) + addRent,
-        expectedWater: Number(selectedTenant.expectedWater || 0) + addWater,
-        updatedBy: user.uid, updatedAt: new Date().toISOString(), lastAdjustment: { addRent, addWater, by: user.uid, at: new Date().toISOString() }
-      }), 5000);
+      if (addRent === 0 && addWater === 0) throw new Error('Enter a rent or water adjustment greater than zero.');
+      const cycleTenantId = tenantCycleDocumentId(selectedTenant.id, activeCycle.id);
+      const tenantRef = documentRef('tenants', selectedTenant.id);
+      const cycleRef = documentRef('billingCycles', activeCycle.id);
+      const cycleTenantRef = documentRef('tenantCycles', cycleTenantId);
+      await promiseTimeout(runTransaction(db, async (transaction) => {
+        const [tenantSnapshot, cycleSnapshot, cycleTenantSnapshot] = await Promise.all([
+          transaction.get(tenantRef),
+          transaction.get(cycleRef),
+          transaction.get(cycleTenantRef),
+        ]);
+        if (!tenantSnapshot.exists() || tenantSnapshot.data().status === 'ARCHIVED') throw new Error('This tenant record is no longer active.');
+        if (!cycleSnapshot.exists() || cycleSnapshot.data().status !== 'OPEN') throw new Error('The billing cycle is no longer open. Refresh and try again.');
+        if (!cycleTenantSnapshot.exists()) throw new Error('This tenant is not set up in the active billing cycle yet.');
+        const currentTenant = tenantSnapshot.data();
+        const currentCycleTenant = cycleTenantSnapshot.data();
+        const now = new Date().toISOString();
+        const nextCycleTenant = {
+          ...currentCycleTenant,
+          expectedRent: Number(currentCycleTenant.expectedRent || 0) + addRent,
+          expectedWater: Number(currentCycleTenant.expectedWater || 0) + addWater,
+        };
+        transaction.update(tenantRef, {
+          expectedRent: Number(currentTenant.expectedRent || 0) + addRent,
+          expectedWater: Number(currentTenant.expectedWater || 0) + addWater,
+          updatedBy: user.uid,
+          lastAdjustment: { addRent, addWater, by: user.uid, at: now },
+        });
+        transaction.update(cycleTenantRef, {
+          expectedRent: nextCycleTenant.expectedRent,
+          expectedWater: nextCycleTenant.expectedWater,
+          status: getCycleTenantStatus(nextCycleTenant),
+          updatedBy: user.uid,
+        });
+      }), 10000);
       await recordAudit('TENANT_CHARGES_ADJUSTED', 'tenant', selectedTenant.id, { addRent, addWater });
       closeAnyModal(setIsBillingModalOpen);
       setSelectedTenant(null);
@@ -1047,31 +1201,196 @@ export default function App() {
 
   const handleDeleteTenant = async (tenant) => {
     if (!user || !db || role !== ROLES.LANDLORD || !tenant || isProcessing) return;
-    if (window.confirm(`Archive ${tenant.name}'s record? Financial history will remain available for audit.`)) {
-       setIsProcessing(true);
-       try {
-         await promiseTimeout(runTransaction(db, async (transaction) => {
-           const tenantRef = doc(db, 'artifacts', appId, 'public', 'data', 'tenants', tenant.id);
-           const tenantSnapshot = await transaction.get(tenantRef);
-           if (!tenantSnapshot.exists()) throw new Error('Tenant record no longer exists.');
-           const currentTenant = tenantSnapshot.data();
-           if (currentTenant.status === 'ARCHIVED' || currentTenant.archivedAt) throw new Error('This tenant has already been archived.');
-           const houseRef = currentTenant.houseId ? doc(db, 'artifacts', appId, 'public', 'data', 'houses', currentTenant.houseId) : null;
-           const houseSnapshot = houseRef ? await transaction.get(houseRef) : null;
-           if (houseRef && !houseSnapshot.exists()) throw new Error('The tenant’s house unit no longer exists.');
-           const now = new Date().toISOString();
-           transaction.update(tenantRef, { status: 'ARCHIVED', archivedAt: now, archivedBy: user.uid, updatedBy: user.uid, updatedAt: now });
-           if (houseRef) {
-             transaction.update(houseRef, { status: 'VACANT', updatedBy: user.uid, updatedAt: now });
-           }
-         }), 5000);
-         await recordAudit('TENANT_ARCHIVED', 'tenant', tenant.id, { houseId: tenant.houseId });
-         setSelectedTenantForDetails(null);
-       } catch (err) {
-         setModalError(err?.code === 'permission-denied'
-           ? 'Firebase denied this landlord action. Publish the current Firestore rules and confirm this account is the landlord account.'
-           : (err.message || 'Could not archive tenant safely.'));
-       } finally { setIsProcessing(false); }
+    setConfirmationAction({ type: 'deleteTenant', tenant });
+  };
+
+  const handleOpenCycle = async (e) => {
+    e.preventDefault();
+    if (!user || !db || role !== ROLES.LANDLORD || isProcessing) return;
+    setIsProcessing(true);
+    setModalError('');
+    try {
+      const year = Number(cycleYear);
+      const monthIndex = Number(cycleMonth);
+      if (!Number.isInteger(year) || year < 2000 || year > 2200 || monthIndex < 0 || monthIndex > 11) {
+        throw new Error('Choose a valid month and year.');
+      }
+      if (activeCycle && payments.some(payment => payment.cycleId === activeCycle.id && payment.status === 'PENDING')) {
+        throw new Error('Review all pending payments before opening another billing cycle.');
+      }
+      if (billingCycles.some(cycle => Number(cycle.year) === year && Number(cycle.monthIndex) === monthIndex)) {
+        throw new Error('A billing cycle already exists for that month.');
+      }
+
+      const currentTenants = activeTenants;
+      const currentTenantCycles = activeCycle
+        ? tenantCycles.filter(cycleTenant => cycleTenant.cycleId === activeCycle.id)
+        : [];
+      const writeCount = 1 + currentTenants.length + (activeCycle ? 1 + currentTenantCycles.length : 0);
+      if (writeCount > 500) throw new Error('This month has too many records to open safely in a single Firestore batch.');
+
+      const now = new Date().toISOString();
+      const cycleRef = doc(collectionRef('billingCycles'));
+      const cycleData = {
+        id: cycleRef.id,
+        month: createCycleLabel(year, monthIndex),
+        year,
+        monthIndex,
+        status: 'OPEN',
+        openedAt: now,
+        closedAt: null,
+        openedBy: 'LANDLORD',
+        ...makeRecordMetadata(user),
+      };
+      const batch = writeBatch(db);
+      batch.set(cycleRef, cycleData);
+      if (activeCycle) {
+        batch.update(documentRef('billingCycles', activeCycle.id), {
+          status: 'CLOSED', closedAt: now, ...makeRecordMetadata(user, true),
+        });
+        currentTenantCycles.forEach(cycleTenant => {
+          const finalized = finalizeTenantCycle(cycleTenant);
+          batch.update(documentRef('tenantCycles', cycleTenant.id), {
+            status: finalized.status,
+            ...makeRecordMetadata(user, true),
+          });
+        });
+      }
+      currentTenants.forEach(tenant => {
+        const cycleTenantId = tenantCycleDocumentId(tenant.id, cycleRef.id);
+        const cycleTenant = {
+          tenantId: tenant.id,
+          cycleId: cycleRef.id,
+          tenantName: tenant.name,
+          houseId: tenant.houseId || '',
+          expectedRent: Number(tenant.expectedRent || 0),
+          expectedWater: Number(tenant.expectedWater || 0),
+          paidRent: 0,
+          paidWater: 0,
+          status: 'OPEN',
+          createdAt: now,
+          ...makeRecordMetadata(user),
+        };
+        cycleTenant.status = getCycleTenantStatus(cycleTenant);
+        batch.set(documentRef('tenantCycles', cycleTenantId), cycleTenant);
+      });
+      await promiseTimeout(batch.commit(), 15000);
+      await recordAudit('BILLING_CYCLE_OPENED', 'billing_cycle', cycleRef.id, { month: cycleData.month });
+      setSelectedDashboardCycleId('ACTIVE');
+      setIsCycleModalOpen(false);
+      setToastMessage(`${cycleData.month} billing cycle opened.`);
+    } catch (error) {
+      setModalError(error.message || 'Could not open the billing cycle.');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleCloseCycle = async () => {
+    if (!user || !db || role !== ROLES.LANDLORD || !activeCycle) return;
+    if (payments.some(payment => payment.cycleId === activeCycle.id && payment.status === 'PENDING')) {
+      throw new Error('Review all pending payments before closing this billing cycle.');
+    }
+    const currentTenantCycles = tenantCycles.filter(cycleTenant => cycleTenant.cycleId === activeCycle.id);
+    if (currentTenantCycles.length + 1 > 500) throw new Error('This billing cycle has too many records to close in one safe operation.');
+    const now = new Date().toISOString();
+    const batch = writeBatch(db);
+    currentTenantCycles.forEach(cycleTenant => {
+      const finalized = finalizeTenantCycle(cycleTenant);
+      batch.update(documentRef('tenantCycles', cycleTenant.id), {
+        status: finalized.status,
+        ...makeRecordMetadata(user, true),
+      });
+    });
+    batch.update(documentRef('billingCycles', activeCycle.id), {
+      status: 'CLOSED', closedAt: now, ...makeRecordMetadata(user, true),
+    });
+    await promiseTimeout(batch.commit(), 15000);
+    await recordAudit('BILLING_CYCLE_CLOSED', 'billing_cycle', activeCycle.id, { month: activeCycle.month });
+    setSelectedDashboardCycleId('ACTIVE');
+    setToastMessage(`${activeCycle.month} billing cycle closed.`);
+  };
+
+  const handleDataReset = async () => {
+    if (!user || !db || role !== ROLES.LANDLORD) return;
+    const scopedCollection = (collectionName) => {
+      const ref = collectionRef(collectionName);
+      return LEGACY_ROLE_BY_UID[user.uid] ? ref : query(ref, where('workspaceId', '==', workspaceId));
+    };
+    const [paymentDocs, referenceDocs, repairDocs, septicDocs, waterBillDocs, tenantDocs, tenantCycleDocs, cycleDocs] = await promiseTimeout(
+      Promise.all([
+        'payments', 'paymentReferences', 'repairs', 'septicLogs', 'masterWaterBills',
+        'tenants', 'tenantCycles', 'billingCycles',
+      ].map(collectionName => getDocs(scopedCollection(collectionName)))),
+      15000,
+    );
+    const openCycles = cycleDocs.docs.filter(cycle => cycle.data().status === 'OPEN');
+    if (openCycles.length > 1) throw new Error('More than one billing cycle is open. Resolve the duplicate open cycles before resetting data.');
+    const cycleStatusById = new Map(cycleDocs.docs.map(cycle => [cycle.id, cycle.data().status]));
+    const operations = [
+      ...paymentDocs.docs.map(payment => batch => batch.delete(documentRef('payments', payment.id))),
+      ...referenceDocs.docs.map(reference => batch => batch.delete(documentRef('paymentReferences', reference.id))),
+      ...repairDocs.docs.map(repair => batch => batch.delete(documentRef('repairs', repair.id))),
+      ...septicDocs.docs.map(log => batch => batch.delete(documentRef('septicLogs', log.id))),
+      ...waterBillDocs.docs.map(bill => batch => batch.delete(documentRef('masterWaterBills', bill.id))),
+      ...tenantDocs.docs.map(tenant => batch => batch.update(documentRef('tenants', tenant.id), {
+        paidRent: 0, paidWater: 0, ...makeRecordMetadata(user, true),
+      })),
+    ];
+    await commitBatches(operations);
+    const cycleResetOperations = tenantCycleDocs.docs
+      .filter(cycleTenant => cycleStatusById.has(cycleTenant.data().cycleId))
+      .map(cycleTenant => batch => {
+        const data = cycleTenant.data();
+        const resetTenantCycle = { ...data, paidRent: 0, paidWater: 0 };
+        const status = cycleStatusById.get(data.cycleId) === 'OPEN'
+          ? getCycleTenantStatus(resetTenantCycle)
+          : finalizeTenantCycle(resetTenantCycle).status;
+        batch.update(documentRef('tenantCycles', cycleTenant.id), {
+          paidRent: 0, paidWater: 0, status, ...makeRecordMetadata(user, true),
+        });
+      });
+    await commitBatches(cycleResetOperations, 15);
+    await recordAudit('OPERATIONAL_DATA_RESET', 'workspace', workspaceId, { deletedPayments: paymentDocs.size });
+    setToastMessage('Data reset completed. Houses and tenant charges were preserved.');
+  };
+
+  const handleConfirmationSubmit = async () => {
+    if (!user || !db || role !== ROLES.LANDLORD || !confirmationAction || isProcessing) return;
+    setIsProcessing(true);
+    setModalError('');
+    try {
+      if (confirmationAction.type === 'resetData') {
+        await handleDataReset();
+      } else if (confirmationAction.type === 'closeCycle') {
+        await handleCloseCycle();
+      } else if (confirmationAction.type === 'deleteTenant') {
+        const tenant = confirmationAction.tenant;
+        await promiseTimeout(runTransaction(db, async (transaction) => {
+          const tenantRef = documentRef('tenants', tenant.id);
+          const tenantSnapshot = await transaction.get(tenantRef);
+          if (!tenantSnapshot.exists()) throw new Error('Tenant record no longer exists.');
+          const currentTenant = tenantSnapshot.data();
+          if (currentTenant.status === 'ARCHIVED' || currentTenant.archivedAt) throw new Error('This tenant has already been archived.');
+          const houseRef = currentTenant.houseId ? documentRef('houses', currentTenant.houseId) : null;
+          const houseSnapshot = houseRef ? await transaction.get(houseRef) : null;
+          if (houseRef && !houseSnapshot.exists()) throw new Error('The tenant’s house unit no longer exists.');
+          const now = new Date().toISOString();
+          transaction.update(tenantRef, {
+            status: 'ARCHIVED', archivedAt: now, archivedBy: user.uid,
+            ...makeRecordMetadata(user, true),
+          });
+          if (houseRef) transaction.update(houseRef, { status: 'VACANT', ...makeRecordMetadata(user, true) });
+        }), 10000);
+        await recordAudit('TENANT_ARCHIVED', 'tenant', tenant.id, { houseId: tenant.houseId });
+        setSelectedTenantForDetails(null);
+        setToastMessage(`${tenant.name} was removed from the active tenant directory.`);
+      }
+      setConfirmationAction(null);
+    } catch (error) {
+      setModalError(error.message || 'The requested action could not be completed.');
+    } finally {
+      setIsProcessing(false);
     }
   };
 
@@ -1138,6 +1457,7 @@ export default function App() {
     let totalRepairExpenses = 0;
     let totalSepticExpenses = 0;
     let totalMasterWaterBills = 0;
+    let totalOtherExpenses = 0;
     const cycleId = viewedCycle?.id;
     const currentTenantCycles = cycleId
       ? tenantCycles.filter(cycleTenant => cycleTenant.cycleId === cycleId)
@@ -1165,6 +1485,9 @@ export default function App() {
     masterWaterBills.forEach(bill => {
       if (bill.cycleId === cycleId) totalMasterWaterBills += Number(bill.amount || 0);
     });
+    expenses.forEach(expense => {
+      if (expense.cycleId === cycleId && expense.status !== 'REJECTED') totalOtherExpenses += Number(expense.amount || 0);
+    });
 
     const expectedRentRev = collectedRentRev + activeRentArrears;
     const expectedWaterRev = collectedWaterRev + activeWaterArrears;
@@ -1176,7 +1499,7 @@ export default function App() {
       collectedWaterRev,
       pendingPaymentsCount,
       totalJosephBonus,
-      totalOperatingExpenses: totalRepairExpenses + totalSepticExpenses,
+      totalOperatingExpenses: totalRepairExpenses + totalSepticExpenses + totalOtherExpenses,
       totalMasterWaterBills,
       waterReserve,
       vacantHouses: houses.filter(house => house.status === 'VACANT' && !occupiedHouseIds.has(house.id)).length,
@@ -1184,7 +1507,7 @@ export default function App() {
       totalRepairExpenses,
       totalSepticExpenses
     };
-  }, [viewedCycle, cyclePayments, tenantCycles, repairs, septicLogs, masterWaterBills, houses, occupiedHouseIds]);
+  }, [viewedCycle, cyclePayments, tenantCycles, repairs, septicLogs, masterWaterBills, expenses, houses, occupiedHouseIds]);
 
   const billingCycleHistory = useMemo(() => billingCycles
     .filter(cycle => cycle.status === 'CLOSED')
@@ -1200,16 +1523,18 @@ export default function App() {
       };
     }), [billingCycles, payments, tenantCycles]);
 
-  const filteredPayments = useMemo(() => paymentMonthFilter === 'ALL'
-    ? payments
-    : payments.filter(payment => getMonthKey(payment.date) === paymentMonthFilter), [payments, paymentMonthFilter]);
+  const normalizedSearch = globalSearch.trim().toLowerCase();
+  const filteredPayments = useMemo(() => payments.filter(payment => {
+    const matchesMonth = paymentMonthFilter === 'ALL' || getMonthKey(payment.date) === paymentMonthFilter;
+    const searchRecord = `${payment.tenantName} ${payment.messageCode || ''} ${payment.type} ${payment.method}`.toLowerCase();
+    return matchesMonth && (!normalizedSearch || searchRecord.includes(normalizedSearch));
+  }), [payments, paymentMonthFilter, normalizedSearch]);
 
   const tenantPaymentHistory = useMemo(() => {
     if (!selectedTenant) return [];
     return payments.filter(p => p.tenantId === selectedTenant.id && p.status === 'CONFIRMED');
   }, [selectedTenant, payments]);
 
-  const normalizedSearch = globalSearch.trim().toLowerCase();
   const houseNameById = useMemo(() => new Map(houses.map(house => [house.id, house.name || ''])), [houses]);
   const tenantById = useMemo(() => new Map(activeTenants.map(tenant => [tenant.id, tenant])), [activeTenants]);
   const filteredHouses = useMemo(() => houses.filter(house => !normalizedSearch || `${house.name} ${house.type}`.toLowerCase().includes(normalizedSearch)), [houses, normalizedSearch]);
@@ -1217,12 +1542,14 @@ export default function App() {
     const house = houses.find(h => h.id === tenant.houseId);
     return !normalizedSearch || `${tenant.name} ${tenant.phone} ${house?.name || ''}`.toLowerCase().includes(normalizedSearch);
   }), [activeTenants, houses, normalizedSearch]);
-  const filteredPayments = useMemo(() => payments.filter(payment => !normalizedSearch || `${payment.tenantName} ${payment.messageCode || ''} ${payment.type} ${payment.method}`.toLowerCase().includes(normalizedSearch)), [payments, normalizedSearch]);
   const filteredRepairs = useMemo(() => repairs.filter(repair => !normalizedSearch || `${repair.description} ${houses.find(h => h.id === repair.houseId)?.name || ''}`.toLowerCase().includes(normalizedSearch)), [repairs, houses, normalizedSearch]);
   const sortedHouses = useMemo(() => [...filteredHouses].sort((a, b) => compareNatural(a.name, b.name)), [filteredHouses]);
   const sortedTenants = useMemo(() => [...filteredTenants].sort((a, b) => (
     compareNatural(houseNameById.get(a.houseId), houseNameById.get(b.houseId)) || compareNatural(a.name, b.name)
   )), [filteredTenants, houseNameById]);
+  const sortedBillingTenants = useMemo(() => [...filteredBillingTenants].sort((a, b) => (
+    compareNatural(houseNameById.get(a.houseId), houseNameById.get(b.houseId)) || compareNatural(a.name, b.name)
+  )), [filteredBillingTenants, houseNameById]);
   const sortedPayments = useMemo(() => [...filteredPayments].sort((a, b) => (
     compareNatural(houseNameById.get(tenantById.get(a.tenantId)?.houseId), houseNameById.get(tenantById.get(b.tenantId)?.houseId)) ||
     (new Date(b.date) - new Date(a.date))
@@ -1284,65 +1611,33 @@ export default function App() {
           <div className="w-full max-w-md">
             <p className="text-xs font-bold uppercase tracking-[0.2em] text-emerald-600">Welcome back</p>
             <h2 className={`mt-2 text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>Sign in to your account</h2>
-            <p className="mt-1 text-sm text-slate-500">Choose your account type and enter your details.</p>
+            <p className="mt-1 text-sm text-slate-500">Use your authorized account to securely access the portal.</p>
 
-          <form onSubmit={handleLoginSubmit} className="space-y-4">
-            <div>
-              <label className="block text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Account Email</label>
-              <input 
-                required type="email" value={email} onChange={e => setEmail(e.target.value)} 
-                placeholder={loginTab === 'landlord' ? "Super Admin email address" : "Manager email address"} 
-                className="w-full bg-slate-950 border border-gray-800 focus:border-gray-500 rounded-xl p-3 outline-none text-white text-sm transition-all"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Secure Password</label>
-              <div className="relative">
-                <input 
-                  required type={showPassword ? "text" : "password"} value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••"
-                  className="w-full bg-slate-950 border border-gray-800 focus:border-gray-500 rounded-xl p-3 pr-10 outline-none text-white text-sm"
-                />
-                <button 
-                  type="button" 
-                  onClick={() => setShowPassword(!showPassword)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white transition-colors p-1"
-                >
-                  {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
-                </button>
-              </div>
-              <div className="text-right mt-2">
-                <button 
-                  type="button" 
-                  onClick={handleForgotPassword}
-                  className="text-xs font-semibold text-gray-500 hover:text-gray-300 transition-colors"
-                >
-                  Forgot Password?
-                </button>
-              </div>
-            </div>
-            <button 
-              type="submit" disabled={isProcessing}
-              className="w-full bg-gray-800 hover:bg-gray-700 disabled:bg-gray-900 disabled:text-gray-600 disabled:cursor-not-allowed text-white font-bold py-3 rounded-xl transition-all hover:shadow-lg flex items-center justify-center gap-2 mt-2"
-            >
-              {isProcessing ? <div className="animate-spin rounded-full h-5 w-5 border-2 border-white border-t-transparent"></div> : 'Verify Credentials & Sign In'}
-            </button>
-          </form>
+            {loginError && (
+              <p role="alert" className="mt-5 border-l-2 border-rose-500 bg-rose-500/5 px-3 py-2 text-sm text-rose-600">
+                {loginError}
+              </p>
+            )}
 
+            <form onSubmit={handleLoginSubmit} className="mt-6 space-y-5">
+              <div>
+                <label className={`mb-1.5 block text-sm font-semibold ${theme === 'dark' ? 'text-slate-300' : 'text-slate-700'}`}>Email address</label>
+                <input required type="email" autoComplete="username" value={email} onChange={e => setEmail(e.target.value)} placeholder="Enter your email" className={`w-full border-b bg-transparent px-1 py-3 text-sm outline-none transition focus:border focus:border-emerald-500 focus:px-3 ${theme === 'dark' ? 'border-slate-700 text-white placeholder:text-slate-600' : 'border-slate-300 text-slate-900 placeholder:text-slate-400'}`} />
+              </div>
               <div>
                 <label className={`mb-1.5 block text-sm font-semibold ${theme === 'dark' ? 'text-slate-300' : 'text-slate-700'}`}>Password</label>
                 <div className="relative">
-                  <input required type={showPassword ? 'text' : 'password'} autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} disabled={isEmailRestrictedForLandlord} placeholder="Enter your password" className={`w-full border-b bg-transparent px-1 py-3 pr-11 text-sm outline-none transition focus:border focus:border-emerald-500 focus:px-3 disabled:cursor-not-allowed disabled:opacity-40 ${theme === 'dark' ? 'border-slate-700 text-white placeholder:text-slate-600' : 'border-slate-300 text-slate-900 placeholder:text-slate-400'}`} />
+                  <input required type={showPassword ? 'text' : 'password'} autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Enter your password" className={`w-full border-b bg-transparent px-1 py-3 pr-11 text-sm outline-none transition focus:border focus:border-emerald-500 focus:px-3 ${theme === 'dark' ? 'border-slate-700 text-white placeholder:text-slate-600' : 'border-slate-300 text-slate-900 placeholder:text-slate-400'}`} />
                   <button type="button" aria-label={showPassword ? 'Hide password' : 'Show password'} onClick={() => setShowPassword(!showPassword)} className={`absolute right-1 top-1/2 -translate-y-1/2 p-2 ${theme === 'dark' ? 'text-slate-400 hover:text-white' : 'text-slate-500 hover:text-slate-900'}`}>
                     {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
                   </button>
                 </div>
                 <div className="mt-2 text-right">
-                  <button type="button" onClick={handleForgotPassword} className="text-xs font-semibold text-slate-500 transition hover:text-emerald-700">Forgot Password?</button>
+                  <button type="button" onClick={handleForgotPassword} className="text-xs font-semibold text-slate-500 transition hover:text-emerald-700">Forgot password?</button>
                 </div>
               </div>
-
-              <button type="submit" disabled={isProcessing || isEmailRestrictedForLandlord} className="flex w-full items-center justify-center gap-2 rounded-md bg-[#0f172a] py-3.5 text-sm font-bold uppercase tracking-wide text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50">
-                {isProcessing ? <div className="h-5 w-5 animate-spin rounded-full border-2 border-white border-t-transparent" /> : 'Sign In'}
+              <button type="submit" disabled={isProcessing} className="flex w-full items-center justify-center gap-2 rounded-md bg-[#0f172a] py-3.5 text-sm font-bold uppercase tracking-wide text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50">
+                {isProcessing ? <div className="h-5 w-5 animate-spin rounded-full border-2 border-white border-t-transparent" /> : 'Sign in'}
               </button>
             </form>
 
@@ -1781,13 +2076,13 @@ export default function App() {
                     </div>
                   </div>
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                    {sortedTenants.map(tenant => {
+                    {sortedBillingTenants.map(tenant => {
                       const house = houses.find(h => h.id === tenant.houseId);
                       const cycleTenant = activeTenantCycles.get(tenant.id);
                       const rentBal = Number(cycleTenant?.expectedRent || 0) - Number(cycleTenant?.paidRent || 0);
                       const waterBal = Number(cycleTenant?.expectedWater || 0) - Number(cycleTenant?.paidWater || 0);
                       const tenantRepairs = repairs.filter(r => r.houseId === tenant.houseId && r.status === 'OPEN');
-                      const pendingPayments = payments.filter(p => p.tenantId === tenant.id && p.status === 'PENDING' && (!activeCycle || p.cycleId === activeCycle.id));
+                      const pendingPayments = activeCycle ? payments.filter(p => p.tenantId === tenant.id && p.status === 'PENDING' && p.cycleId === activeCycle.id) : [];
 
                       return (
                         <div key={tenant.id} className={`p-5 rounded-2xl border shadow-sm flex flex-col justify-between transition-all duration-300 hover:-translate-y-1 hover:shadow-xl ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
@@ -1836,7 +2131,7 @@ export default function App() {
                                 {canApproveRent && (
                                   <button 
                                     onClick={() => handleConfirmPayment(pendingPayment)} 
-                                    disabled={isProcessing}
+                                    disabled={isProcessing || !activeCycle || pendingPayment.cycleId !== activeCycle.id}
                                     className="w-full mt-3 bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs py-2 rounded-lg transition-all disabled:opacity-50 shadow-sm"
                                   >
                                     {isProcessing ? 'Processing...' : 'Confirm & Update Balances'}
@@ -1862,7 +2157,7 @@ export default function App() {
                         </div>
                       )
                     })}
-                    {filteredTenants.length === 0 && <p className="col-span-full rounded-xl border border-dashed border-gray-300 p-8 text-center text-sm font-medium text-gray-500">{tenants.length === 0 ? 'No tenants registered.' : 'No tenants match the current search and filter.'}</p>}
+                    {sortedBillingTenants.length === 0 && <p className="col-span-full rounded-xl border border-dashed border-gray-300 p-8 text-center text-sm font-medium text-gray-500">{activeTenants.length === 0 ? 'No active tenants registered.' : 'No tenants match the current search and filter.'}</p>}
                   </div>
                 </div>
 
@@ -2070,6 +2365,67 @@ export default function App() {
         </div>
       )}
 
+      {toastMessage && (
+        <div role="status" className="fixed right-4 top-4 z-100 flex max-w-sm items-center gap-3 rounded-xl bg-emerald-700 px-4 py-3 text-sm font-bold text-white shadow-xl">
+          <CheckCircle2 size={19} />
+          <span>{toastMessage}</span>
+          <button type="button" aria-label="Dismiss notification" onClick={() => setToastMessage('')} className="ml-2 rounded p-1 hover:bg-white/10"><X size={16} /></button>
+        </div>
+      )}
+
+      {isCycleModalOpen && (
+        <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={() => !isProcessing && setIsCycleModalOpen(false)}>
+          <div role="dialog" aria-modal="true" aria-labelledby="cycle-dialog-title" className={`w-full max-w-md rounded-2xl border p-6 shadow-2xl ${theme === 'dark' ? 'border-slate-800 bg-slate-900 text-white' : 'border-[#E8DFCE] bg-white text-gray-900'}`} onClick={e => e.stopPropagation()}>
+            <div className="mb-5 flex items-center justify-between">
+              <div>
+                <h3 id="cycle-dialog-title" className="text-xl font-bold">Open a billing cycle</h3>
+                <p className="mt-1 text-sm text-gray-500">Opening a month closes the current cycle.</p>
+              </div>
+              <button type="button" disabled={isProcessing} onClick={() => setIsCycleModalOpen(false)} className="rounded-lg p-2 text-gray-500 hover:bg-black/5 disabled:opacity-50" aria-label="Close dialog"><X size={20} /></button>
+            </div>
+            <form onSubmit={handleOpenCycle} className="space-y-4">
+              <div>
+                <label htmlFor="cycle-month" className="mb-1.5 block text-xs font-bold uppercase tracking-wider text-gray-500">Month</label>
+                <select id="cycle-month" value={cycleMonth} onChange={e => setCycleMonth(Number(e.target.value))} className={`w-full rounded-xl border p-3 outline-none focus:border-emerald-500 ${theme === 'dark' ? 'border-slate-700 bg-slate-950 text-white' : 'border-[#DCD4C6] bg-white text-gray-900'}`}>
+                  {monthNames.map((month, index) => <option key={month} value={index}>{month}</option>)}
+                </select>
+              </div>
+              <div>
+                <label htmlFor="cycle-year" className="mb-1.5 block text-xs font-bold uppercase tracking-wider text-gray-500">Year</label>
+                <input id="cycle-year" required type="number" min="2000" max="2200" value={cycleYear} onChange={e => setCycleYear(e.target.value)} className={`w-full rounded-xl border p-3 outline-none focus:border-emerald-500 ${theme === 'dark' ? 'border-slate-700 bg-slate-950 text-white' : 'border-[#DCD4C6] bg-white text-gray-900'}`} />
+              </div>
+              <div className="flex justify-end gap-2 pt-2">
+                <button type="button" disabled={isProcessing} onClick={() => setIsCycleModalOpen(false)} className={`rounded-xl px-4 py-2.5 text-sm font-bold disabled:opacity-50 ${theme === 'dark' ? 'text-slate-300 hover:bg-white/5' : 'text-gray-600 hover:bg-black/5'}`}>Cancel</button>
+                <button type="submit" disabled={isProcessing} className="rounded-xl bg-gray-800 px-5 py-2.5 text-sm font-bold text-white transition hover:bg-gray-900 disabled:opacity-50">{isProcessing ? 'Opening…' : 'Open Cycle'}</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {confirmationAction && (
+        <div className="fixed inset-0 z-70 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={() => !isProcessing && setConfirmationAction(null)}>
+          <div role="dialog" aria-modal="true" aria-labelledby="confirmation-title" className={`w-full max-w-md rounded-2xl border p-6 shadow-2xl ${theme === 'dark' ? 'border-slate-800 bg-slate-900 text-white' : 'border-[#E8DFCE] bg-white text-gray-900'}`} onClick={e => e.stopPropagation()}>
+            <h3 id="confirmation-title" className="text-lg font-bold text-rose-600">
+              {confirmationAction.type === 'resetData' ? 'Reset payment and operations data?' : confirmationAction.type === 'closeCycle' ? 'Close the current billing cycle?' : 'Remove tenant from the active directory?'}
+            </h3>
+            <p className={`mt-3 text-sm leading-relaxed ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>
+              {confirmationAction.type === 'resetData'
+                ? 'This will permanently erase ALL payment records, repair logs, septic logs, and water bill invoices. Tenants and houses will be preserved. This cannot be undone. Paid totals in monthly cycles will also reset, while cycle months and expected rent/water charges are preserved.'
+                : confirmationAction.type === 'closeCycle'
+                  ? `Close ${activeCycle?.month || 'the current month'}? New payments will require a new billing cycle.`
+                  : `Archive ${confirmationAction.tenant.name} from the active directory? Their financial history will remain available for audit.`}
+            </p>
+            <div className="mt-6 flex justify-end gap-2">
+              <button type="button" onClick={() => setConfirmationAction(null)} disabled={isProcessing} className={`rounded-xl px-4 py-2.5 text-sm font-bold transition disabled:opacity-50 ${theme === 'dark' ? 'text-slate-300 hover:bg-white/5' : 'text-gray-600 hover:bg-black/5'}`}>Cancel</button>
+              <button type="button" onClick={handleConfirmationSubmit} disabled={isProcessing} className="rounded-xl bg-rose-600 px-4 py-2.5 text-sm font-bold text-white transition hover:bg-rose-700 disabled:opacity-50">
+                {isProcessing ? 'Working…' : confirmationAction.type === 'resetData' ? 'Reset Data' : confirmationAction.type === 'closeCycle' ? 'Close Cycle' : 'Remove Tenant'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {isExpenseModalOpen && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-60" role="presentation" onClick={() => closeAnyModal(setIsExpenseModalOpen)}>
           <div className={`w-full max-w-lg p-6 rounded-xl border shadow-2xl ${theme === 'dark' ? 'bg-[#111111] border-[#303030] text-white' : 'bg-white border-[#E5E5E5] text-gray-900'}`} role="dialog" aria-modal="true" aria-labelledby="expense-dialog-title" onClick={e => e.stopPropagation()}>
@@ -2229,10 +2585,10 @@ export default function App() {
             </div>
             
             <div className={`p-4 rounded-xl mb-6 text-sm border flex justify-between items-center gap-2 shadow-inner ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-slate-300' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-700'}`}>
-              <div><p className="font-medium">Tenant: <strong className={`text-base block mt-0.5 ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{selectedTenant.name}</strong></p></div>
+              <div><p className="font-medium">Tenant: <strong className={`text-base block mt-0.5 ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{selectedTenant.name}</strong></p><p className="mt-1 text-[10px] font-semibold text-gray-500">{activeCycle?.month || 'No open cycle'}</p></div>
               <div className="text-right shrink-0 whitespace-nowrap text-xs">
-                <p className="font-medium">Owes Rent: <strong className={`font-bold ${theme === 'dark' ? 'text-rose-500' : 'text-rose-600'}`}>{formatKes(selectedTenant.expectedRent - selectedTenant.paidRent)}</strong></p>
-                <p className="font-medium mt-0.5">Owes Water: <strong className={`font-bold ${theme === 'dark' ? 'text-rose-500' : 'text-rose-600'}`}>{formatKes(selectedTenant.expectedWater - selectedTenant.paidWater)}</strong></p>
+                <p className="font-medium">Owes Rent: <strong className={`font-bold ${theme === 'dark' ? 'text-rose-500' : 'text-rose-600'}`}>{formatKes(Number(selectedTenantCycle?.expectedRent || 0) - Number(selectedTenantCycle?.paidRent || 0))}</strong></p>
+                <p className="font-medium mt-0.5">Owes Water: <strong className={`font-bold ${theme === 'dark' ? 'text-rose-500' : 'text-rose-600'}`}>{formatKes(Number(selectedTenantCycle?.expectedWater || 0) - Number(selectedTenantCycle?.paidWater || 0))}</strong></p>
               </div>
             </div>
             
