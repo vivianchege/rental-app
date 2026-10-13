@@ -2,18 +2,18 @@
 
 :root {
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  color: #172033;
-  background: #f6f8fb;
+  color: #26332d;
+  background: #f6f4ef;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
-  --page-light: #f6f8fb;
-  --surface-light: #ffffff;
-  --line-light: #e6ebf2;
-  --ink-light: #172033;
-  --muted-light: #6c778b;
-  --brand: #0f2d4a;
-  --brand-soft: #e8eff6;
+  --page-light: #f6f4ef;
+  --surface-light: #fffdf9;
+  --line-light: #e7e1d7;
+  --ink-light: #26332d;
+  --muted-light: #6f776f;
+  --brand: #2f5542;
+  --brand-soft: #e8efe9;
 }
 
 * { box-sizing: border-box; }
@@ -22,8 +22,8 @@ body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--page-li
 button, input, select, textarea { font: inherit; }
 button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
 button:disabled { cursor: not-allowed; }
-:focus-visible { outline: 3px solid rgb(201 162 39 / 45%); outline-offset: 2px; }
-::selection { color: #fff; background: #0f2d4a; }
+:focus-visible { outline: 3px solid rgb(185 161 106 / 55%); outline-offset: 2px; }
+::selection { color: #fff; background: #2f5542; }
 
 body,
 button,
@@ -34,37 +34,37 @@ textarea { transition: background-color 180ms ease, border-color 180ms ease, col
 button:not(:disabled):hover { transform: translateY(-1px); }
 button:not(:disabled):active { transform: translateY(0); }
 
-/* The portal is intentionally quiet: white surfaces, a cool neutral page, and
-   the navy/gold brand colors from the supplied logo. */
+/* The portal is intentionally quiet: warm neutral surfaces, deep greens, and
+   a muted gold accent from the supplied logo. */
 .app-shell.light,
 .app-shell.light main { background: var(--page-light); }
 .app-shell.light [class*="bg-[#F4EFE6]"],
 .app-shell.light [class*="bg-[#FDFBF7]"],
 .app-shell.light [class*="bg-[#0A0A0A]"] { background-color: var(--surface-light) !important; }
-.app-shell.light [class*="bg-[#F7F7F5]"] { background-color: #f0f4f8 !important; }
+.app-shell.light [class*="bg-[#F7F7F5]"] { background-color: #f1eee7 !important; }
 .app-shell.light [class*="border-[#E8DFCE]"],
 .app-shell.light [class*="border-[#E5E5E5]"],
 .app-shell.light [class*="border-[#DCD4C6]"] { border-color: var(--line-light) !important; }
-.app-shell.light [class*="hover:bg-[#E8DFCE]"]:hover { background-color: #eef3f8 !important; }
-.app-shell.light [class*="hover:bg-[#FDFBF7]"]:hover { background-color: #f8fafc !important; }
+.app-shell.light [class*="hover:bg-[#E8DFCE]"]:hover { background-color: #f0ede6 !important; }
+.app-shell.light [class*="hover:bg-[#FDFBF7]"]:hover { background-color: #faf8f2 !important; }
 
 .app-shell.dark,
-.app-shell.dark main { background: #0d1420; }
-.app-shell.dark .bg-black { background-color: #0d1420 !important; }
-.app-shell.dark .bg-slate-900 { background-color: #111c2b !important; }
-.app-shell.dark .bg-slate-950 { background-color: #0a111c !important; }
-.app-shell.dark .bg-slate-800 { background-color: #172437 !important; }
+.app-shell.dark main { background: #16211c; }
+.app-shell.dark .bg-black { background-color: #16211c !important; }
+.app-shell.dark .bg-slate-900 { background-color: #1e2d25 !important; }
+.app-shell.dark .bg-slate-950 { background-color: #121c17 !important; }
+.app-shell.dark .bg-slate-800 { background-color: #263a30 !important; }
 .app-shell.dark .border-slate-800,
 .app-shell.dark .border-slate-700,
 .app-shell.dark [class*="border-[#262626]"],
-.app-shell.dark [class*="border-[#303030]"] { border-color: #223248 !important; }
+.app-shell.dark [class*="border-[#303030]"] { border-color: #34453b !important; }
 
-.app-shell main { scrollbar-width: thin; scrollbar-color: #c5cfdb transparent; }
-.app-shell.dark main { scrollbar-color: #33445b transparent; }
+.app-shell main { scrollbar-width: thin; scrollbar-color: #c9c5ba transparent; }
+.app-shell.dark main { scrollbar-color: #456052 transparent; }
 .app-shell main::-webkit-scrollbar { width: 10px; }
 .app-shell main::-webkit-scrollbar-track { background: transparent; }
-.app-shell main::-webkit-scrollbar-thumb { background: #c5cfdb; border: 3px solid transparent; border-radius: 999px; background-clip: padding-box; }
-.app-shell.dark main::-webkit-scrollbar-thumb { background: #33445b; background-clip: padding-box; }
+.app-shell main::-webkit-scrollbar-thumb { background: #c9c5ba; border: 3px solid transparent; border-radius: 999px; background-clip: padding-box; }
+.app-shell.dark main::-webkit-scrollbar-thumb { background: #456052; background-clip: padding-box; }
 
 .app-shell input,
 .app-shell select,

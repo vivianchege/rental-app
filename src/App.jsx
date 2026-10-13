@@ -1747,8 +1747,8 @@ export default function App() {
 
   if (!user) {
     return (
-      <main className={`flex min-h-[100svh] flex-col md:flex-row ${theme === 'dark' ? 'bg-slate-950' : 'bg-[#f4f6f3]'}`}>
-        <section aria-label="Ruiru Rentals" className="relative isolate flex min-h-[250px] flex-col overflow-hidden bg-gradient-to-br from-slate-950 via-slate-900 to-emerald-950 px-6 py-6 text-white sm:px-10 sm:py-8 md:min-h-screen md:w-[46%] md:px-12 md:py-10 lg:px-16">
+      <main className={`flex min-h-[100svh] flex-col md:flex-row ${theme === 'dark' ? 'bg-slate-950' : 'bg-[#f6f4ef]'}`}>
+        <section aria-label="Ruiru Rentals" className="relative isolate flex min-h-[250px] flex-col overflow-hidden bg-[#1f2d25] px-6 py-6 text-white sm:px-10 sm:py-8 md:min-h-screen md:w-[46%] md:px-12 md:py-10 lg:px-16">
           <div aria-hidden="true" className="pointer-events-none absolute -right-24 -top-24 h-80 w-80 rounded-full border border-white/[0.06]" />
           <div aria-hidden="true" className="pointer-events-none absolute -right-10 -top-10 h-52 w-52 rounded-full border border-white/[0.08]" />
           <div className="relative z-10 flex items-center gap-3">
