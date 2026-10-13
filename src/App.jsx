@@ -61,6 +61,20 @@ const DEFAULT_CURRENCY = import.meta.env.VITE_DEFAULT_CURRENCY || 'KES';
 const DEFAULT_TIMEZONE = import.meta.env.VITE_DEFAULT_TIMEZONE || 'Africa/Nairobi';
 const DEFAULT_WORKSPACE_ID = import.meta.env.VITE_DEFAULT_WORKSPACE_ID || 'main-workspace';
 const compareNatural = (left, right) => String(left || '').localeCompare(String(right || ''), undefined, { numeric: true, sensitivity: 'base' });
+const DATA_COLLECTION_LABELS = {
+  houses: 'houses', tenants: 'tenants', payments: 'payments', repairs: 'maintenance',
+  septicLogs: 'septic logs', masterWaterBills: 'water bills', waterVaultResets: 'water vault',
+  expenses: 'expenses', auditLogs: 'activity history', notifications: 'notifications',
+  billingCycles: 'billing cycles', tenantCycles: 'tenant billing records',
+};
+const sortByDateDescending = (records, field = 'date') => (
+  [...records].sort((left, right) => new Date(right[field] || 0) - new Date(left[field] || 0))
+);
+const describeSnapshotError = (error, collectionName) => {
+  if (error?.code === 'permission-denied') return `Access to ${DATA_COLLECTION_LABELS[collectionName] || collectionName} was denied by Firebase rules.`;
+  if (error?.code === 'unavailable') return `${DATA_COLLECTION_LABELS[collectionName] || collectionName} are temporarily unavailable. Check your connection.`;
+  return `${DATA_COLLECTION_LABELS[collectionName] || collectionName} could not be synchronized.`;
+};
 
 // Temporary compatibility bridge for the existing live accounts. Create users/{uid}
 // profiles and remove this bridge after the migration is complete.
@@ -166,6 +180,7 @@ export default function App() {
   // Global states for errors and visual loading states
   const [isProcessing, setIsProcessing] = useState(false);
   const [modalError, setModalError] = useState('');
+  const [syncIssues, setSyncIssues] = useState([]);
   const [confirmationAction, setConfirmationAction] = useState(null);
   const [isCycleModalOpen, setIsCycleModalOpen] = useState(false);
   const [cycleMonth, setCycleMonth] = useState(() => new Date().getMonth());
@@ -228,6 +243,21 @@ export default function App() {
     workspaceId,
     [isUpdate ? 'updatedBy' : 'createdBy']: actor?.uid || ''
   });
+  const clearWorkspaceData = () => {
+    setHouses([]);
+    setTenants([]);
+    setPayments([]);
+    setRepairs([]);
+    setSepticLogs([]);
+    setMasterWaterBills([]);
+    setWaterVaultResets([]);
+    setExpenses([]);
+    setActivityLogs([]);
+    setNotifications([]);
+    setBillingCycles([]);
+    setTenantCycles([]);
+    setSyncIssues([]);
+  };
 
   useEffect(() => {
     localStorage.setItem('ruiru_theme', theme);
@@ -252,7 +282,16 @@ export default function App() {
       return undefined;
     }
 
+    let authResolved = false;
+    const authTimeout = setTimeout(() => {
+      if (!authResolved) {
+        setLoading(false);
+        setLoginError(current => current || 'Firebase is taking too long to respond. Check your connection and try again.');
+      }
+    }, 10000);
+
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      authResolved = true;
       if (currentUser) {
         if (rejectedGoogleUserUid.current === currentUser.uid) {
           setLoading(false);
@@ -294,96 +333,62 @@ export default function App() {
           setUser(null);
           setRole(null);
           setUserProfile(null);
+          clearWorkspaceData();
           setLoading(false);
         }
       } else {
         setUser(null);
         setRole(null);
         setUserProfile(null);
+        clearWorkspaceData();
         setLoading(false);
       }
     });
-    return () => unsubscribe();
+    return () => {
+      clearTimeout(authTimeout);
+      unsubscribe();
+    };
   }, []);
 
   useEffect(() => {
     if (!user || !db) return undefined;
-    
+
     const getColRef = (colName) => {
       const ref = collection(db, 'artifacts', appId, 'public', 'data', colName);
       const isLegacyAccount = Boolean(LEGACY_ROLE_BY_UID[user?.uid]);
       const needsWorkspaceQuery = [ROLES.LANDLORD, ROLES.MANAGER].includes(role) && !isLegacyAccount;
       return needsWorkspaceQuery ? query(ref, where('workspaceId', '==', workspaceId)) : ref;
     };
-    // Individual subscriptions can fail for legacy records or during a brief
-    // offline period. Keep the rest of the portal usable without blocking the UI
-    // with a generic global error banner.
-    const handleSnapshotError = () => {};
 
-    const unsubHouses = onSnapshot(getColRef('houses'), (snap) => {
-        const fetchedHouses = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-        
-        // Natural alphanumeric sort (e.g., "House 2" comes before "House 10")
-        fetchedHouses.sort((a, b) => compareNatural(a.name, b.name));
-        
-        setHouses(fetchedHouses);
-    }, handleSnapshotError);
-
-    const unsubTenants = onSnapshot(getColRef('tenants'), (snap) => {
-        setTenants(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    }, handleSnapshotError);
-
-    const unsubPayments = onSnapshot(getColRef('payments'), (snap) => {
-      setPayments(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
-    }, handleSnapshotError);
-
-    const unsubRepairs = onSnapshot(getColRef('repairs'), (snap) => {
-      setRepairs(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
-    }, handleSnapshotError);
-
-    const unsubSeptic = onSnapshot(getColRef('septicLogs'), (snap) => {
-      setSepticLogs(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
-    }, handleSnapshotError);
-
-    const unsubWaterBills = onSnapshot(getColRef('masterWaterBills'), (snap) => {
-      setMasterWaterBills(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
-    }, handleSnapshotError);
-
-    const unsubWaterVaultResets = role === ROLES.LANDLORD
-      ? onSnapshot(getColRef('waterVaultResets'), (snap) => {
-        setWaterVaultResets(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
-      }, handleSnapshotError)
-      : () => {};
-
-    const unsubExpenses = onSnapshot(getColRef('expenses'), (snap) => {
-      setExpenses(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date)));
-    }, handleSnapshotError);
-
-    const unsubActivity = role === ROLES.LANDLORD
-      ? onSnapshot(getColRef('auditLogs'), (snap) => {
-        setActivityLogs(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)));
-      }, handleSnapshotError)
-      : () => {};
-
-    const unsubNotifications = onSnapshot(getColRef('notifications'), (snap) => {
-      setNotifications(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)));
-    }, handleSnapshotError);
-
-    const unsubCycles = onSnapshot(getColRef('billingCycles'), (snap) => {
-      const cycles = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-      cycles.sort((a, b) => new Date(b.openedAt) - new Date(a.openedAt));
-      setBillingCycles(cycles);
-    }, handleSnapshotError);
-
-    const unsubTenantCycles = onSnapshot(getColRef('tenantCycles'), (snap) => {
-      setTenantCycles(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    }, handleSnapshotError);
-
-    return () => { 
-      unsubHouses(); unsubTenants(); unsubPayments();
-      unsubRepairs(); unsubSeptic(); unsubWaterBills(); unsubWaterVaultResets(); unsubExpenses();
-      unsubActivity(); unsubNotifications(); unsubCycles(); unsubTenantCycles();
+    const subscriptions = [];
+    const subscribe = (collectionName, setter, sortField, transform = records => records) => {
+      const unsubscribe = onSnapshot(getColRef(collectionName), (snap) => {
+        const records = snap.docs.map(snapshot => ({ id: snapshot.id, ...snapshot.data() }));
+        setter(transform(sortField ? sortByDateDescending(records, sortField) : records));
+        setSyncIssues(current => current.filter(issue => issue.collectionName !== collectionName));
+      }, (error) => {
+        setSyncIssues(current => [
+          ...current.filter(issue => issue.collectionName !== collectionName),
+          { collectionName, message: describeSnapshotError(error, collectionName) },
+        ]);
+      });
+      subscriptions.push(unsubscribe);
     };
+
+    subscribe('houses', setHouses, null, records => records.sort((left, right) => compareNatural(left.name, right.name)));
+    subscribe('tenants', setTenants);
+    subscribe('payments', setPayments, 'date');
+    subscribe('repairs', setRepairs, 'date');
+    subscribe('septicLogs', setSepticLogs, 'date');
+    subscribe('masterWaterBills', setMasterWaterBills, 'date');
+    if (role === ROLES.LANDLORD) subscribe('waterVaultResets', setWaterVaultResets, 'date');
+    subscribe('expenses', setExpenses, 'date');
+    if (role === ROLES.LANDLORD) subscribe('auditLogs', setActivityLogs, 'timestamp');
+    subscribe('notifications', setNotifications, 'createdAt');
+    subscribe('billingCycles', setBillingCycles, null, records => records.sort((left, right) => new Date(right.openedAt || 0) - new Date(left.openedAt || 0)));
+    subscribe('tenantCycles', setTenantCycles);
+
+    return () => subscriptions.forEach(unsubscribe => unsubscribe());
   }, [user, role, workspaceId]);
 
   const activeCycle = useMemo(() => billingCycles.find(cycle => cycle.status === 'OPEN') || null, [billingCycles]);
@@ -561,6 +566,7 @@ export default function App() {
         setUserProfile(null);
         setSelectedTenant(null);
         setSelectedTenantForDetails(null);
+        clearWorkspaceData();
       }
     }
   };
@@ -1168,14 +1174,23 @@ export default function App() {
     try {
       const formData = new FormData(e.target);
       const houseId = formData.get('houseId');
-      const repairPromise = addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'repairs'), {
-        ...recordDefaults(),
-        description: formData.get('description').trim(), houseId, status: 'OPEN', cost: 0,
-        date: new Date().toISOString(), createdAt: new Date().toISOString(), loggedBy: role, loggedByUserId: user.uid, cycleId: activeCycle?.id || null
-      });
-      const created = await promiseTimeout(repairPromise, 5000);
-      await promiseTimeout(updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', houseId), { repairStatus: 'NEEDS_REPAIR', updatedBy: user.uid }), 5000);
-      await recordAudit('MAINTENANCE_CREATED', 'maintenance', created.id, { houseId });
+      if (!houseId) throw new Error('Please select a house unit.');
+      const now = new Date().toISOString();
+      const repairRef = doc(collectionRef('repairs'));
+      await promiseTimeout(runTransaction(db, async (transaction) => {
+        const houseRef = documentRef('houses', houseId);
+        const houseSnapshot = await transaction.get(houseRef);
+        if (!houseSnapshot.exists() || houseSnapshot.data().status === 'ARCHIVED') {
+          throw new Error('That house unit is no longer available.');
+        }
+        transaction.set(repairRef, {
+          ...recordDefaults(),
+          description: formData.get('description').trim(), houseId, status: 'OPEN', cost: 0,
+          date: now, createdAt: now, loggedBy: role, loggedByUserId: user.uid, cycleId: activeCycle?.id || null
+        });
+        transaction.update(houseRef, { repairStatus: 'NEEDS_REPAIR', updatedBy: user.uid, updatedAt: now });
+      }), 5000);
+      await recordAudit('MAINTENANCE_CREATED', 'maintenance', repairRef.id, { houseId });
       closeAnyModal(setIsRepairModalOpen);
     } catch(err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
@@ -1904,6 +1919,19 @@ export default function App() {
               </button>
             </div>
           </header>
+
+          {syncIssues.length > 0 && (
+            <div className={`mb-6 flex items-start gap-3 rounded-xl border px-4 py-3 text-sm ${theme === 'dark' ? 'border-amber-400/20 bg-amber-400/10 text-amber-200' : 'border-amber-200 bg-amber-50 text-amber-900'}`} role="alert">
+              <AlertCircle size={18} className="mt-0.5 shrink-0" aria-hidden="true" />
+              <div className="min-w-0 flex-1">
+                <p className="font-semibold">Some workspace data needs attention</p>
+                <p className="mt-1 text-xs opacity-80">{syncIssues.map(issue => issue.message).join(' ')}</p>
+              </div>
+              <button type="button" onClick={() => window.location.reload()} className="shrink-0 rounded-lg px-2.5 py-1 text-xs font-semibold underline underline-offset-2 hover:no-underline">
+                Retry
+              </button>
+            </div>
+          )}
 
           <div className="flex-1">
             {activeTab === 'dashboard' && isLandlord && (
