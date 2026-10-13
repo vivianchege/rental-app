@@ -2,26 +2,74 @@
 
 :root {
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  color: #111111;
-  background: #f7f7f5;
+  color: #172033;
+  background: #f6f8fb;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  --page-light: #f6f8fb;
+  --surface-light: #ffffff;
+  --line-light: #e6ebf2;
+  --ink-light: #172033;
+  --muted-light: #6c778b;
+  --brand: #0f2d4a;
+  --brand-soft: #e8eff6;
 }
 
 * { box-sizing: border-box; }
-body { margin: 0; min-width: 320px; min-height: 100vh; background: #f7f7f5; }
+html { min-width: 320px; background: var(--page-light); }
+body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--page-light); }
 button, input, select, textarea { font: inherit; }
-button { cursor: pointer; }
+button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
 button:disabled { cursor: not-allowed; }
-:focus-visible { outline: 2px solid #c9a227; outline-offset: 2px; }
+:focus-visible { outline: 3px solid rgb(201 162 39 / 45%); outline-offset: 2px; }
+::selection { color: #fff; background: #0f2d4a; }
 
-.app-shell.dark { background: #000000; color: #f5f5f5; }
-.app-shell.dark .bg-slate-950 { background-color: #000000 !important; }
-.app-shell.dark .bg-slate-900 { background-color: #111111 !important; }
-.app-shell.dark .bg-slate-800 { background-color: #171717 !important; }
-.app-shell.dark .border-slate-800 { border-color: #262626 !important; }
-.app-shell.dark .border-slate-700 { border-color: #303030 !important; }
-.app-shell.light { background: #f7f7f5; }
+body,
+button,
+input,
+select,
+textarea { transition: background-color 180ms ease, border-color 180ms ease, color 180ms ease, box-shadow 180ms ease; }
+
+button:not(:disabled):hover { transform: translateY(-1px); }
+button:not(:disabled):active { transform: translateY(0); }
+
+/* The portal is intentionally quiet: white surfaces, a cool neutral page, and
+   the navy/gold brand colors from the supplied logo. */
+.app-shell.light,
+.app-shell.light main { background: var(--page-light); }
+.app-shell.light [class*="bg-[#F4EFE6]"],
+.app-shell.light [class*="bg-[#FDFBF7]"],
+.app-shell.light [class*="bg-[#0A0A0A]"] { background-color: var(--surface-light) !important; }
+.app-shell.light [class*="bg-[#F7F7F5]"] { background-color: #f0f4f8 !important; }
+.app-shell.light [class*="border-[#E8DFCE]"],
+.app-shell.light [class*="border-[#E5E5E5]"],
+.app-shell.light [class*="border-[#DCD4C6]"] { border-color: var(--line-light) !important; }
+.app-shell.light [class*="hover:bg-[#E8DFCE]"]:hover { background-color: #eef3f8 !important; }
+.app-shell.light [class*="hover:bg-[#FDFBF7]"]:hover { background-color: #f8fafc !important; }
+
+.app-shell.dark,
+.app-shell.dark main { background: #0d1420; }
+.app-shell.dark .bg-black { background-color: #0d1420 !important; }
+.app-shell.dark .bg-slate-900 { background-color: #111c2b !important; }
+.app-shell.dark .bg-slate-950 { background-color: #0a111c !important; }
+.app-shell.dark .bg-slate-800 { background-color: #172437 !important; }
+.app-shell.dark .border-slate-800,
+.app-shell.dark .border-slate-700,
+.app-shell.dark [class*="border-[#262626]"],
+.app-shell.dark [class*="border-[#303030]"] { border-color: #223248 !important; }
+
+.app-shell main { scrollbar-width: thin; scrollbar-color: #c5cfdb transparent; }
+.app-shell.dark main { scrollbar-color: #33445b transparent; }
+.app-shell main::-webkit-scrollbar { width: 10px; }
+.app-shell main::-webkit-scrollbar-track { background: transparent; }
+.app-shell main::-webkit-scrollbar-thumb { background: #c5cfdb; border: 3px solid transparent; border-radius: 999px; background-clip: padding-box; }
+.app-shell.dark main::-webkit-scrollbar-thumb { background: #33445b; background-clip: padding-box; }
+
+.app-shell input,
+.app-shell select,
+.app-shell textarea { min-height: 42px; }
+.app-shell input::placeholder { opacity: .65; }
 
 @media (max-width: 767px) {
   .app-shell main { padding: 1rem; }

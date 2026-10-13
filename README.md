@@ -55,10 +55,11 @@ The app will show a configuration message when the Firebase variables are missin
 
 ```bash
 npm run lint
+npm test
 npm run build
 ```
 
-There is currently no `npm test` script in the original project. The critical money helpers are isolated in `src/lib/money.js` so they can be covered by a unit-test runner in the next hardening pass.
+The critical money helpers are isolated in `src/lib/money.js` and covered by the built-in Node test runner.
 
 ## Data integrity and security notes
 
