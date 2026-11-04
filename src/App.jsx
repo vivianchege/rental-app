@@ -2342,7 +2342,7 @@ export default function App() {
                         {(isLandlord || (canManageProperties && !isOccupied)) && (
                           <div className={`ml-2 mt-4 pt-4 border-t ${theme === 'dark' ? 'border-white/10' : 'border-black/5'}`}>
                             <div className="flex flex-col gap-2">
-                              {isLandlord && <button type="button" onClick={() => { setSelectedHouseForEdit(house); setModalError(''); setIsHouseModalOpen(true); }} disabled={isProcessing} className="w-full rounded-xl border border-[#d8d2c8] px-3 py-2.5 text-xs font-semibold text-[#34483b] transition hover:bg-white disabled:opacity-50 dark:border-[#383838] dark:text-slate-200 dark:hover:bg-[#292929]"><span className="inline-flex items-center justify-center gap-2"><Edit size={15}/> Edit unit details</span></button>}
+                              {isLandlord && <button type="button" onClick={() => { setSelectedHouseForEdit(house); setModalError(''); setIsHouseModalOpen(true); }} disabled={isProcessing} className={`w-full rounded-xl border px-3 py-2.5 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-80 ${theme === 'dark' ? 'border-[#505050] bg-[#1c1c1c] text-slate-100 hover:bg-[#292929]' : 'border-[#b8b1a5] bg-[#fffdf9] text-[#26332d] hover:bg-[#f4f1ea]'}`}><span className="inline-flex items-center justify-center gap-2"><Edit size={15}/> Edit unit details</span></button>}
                               {canManageProperties && !isOccupied && <button
                                 onClick={() => handleToggleHouseRepairMode(house)}
                                 disabled={isProcessing}

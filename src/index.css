@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
 
 :root {
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -59,6 +60,11 @@ button:not(:disabled):active { transform: translateY(0); }
 .app-shell.dark [class*="border-[#303030]"],
 .app-shell.dark .border-slate-800,
 .app-shell.dark .border-slate-700 { border-color: #383838 !important; }
+.app-shell.dark .text-gray-500 { color: #a3a3a3 !important; }
+.app-shell.dark .text-gray-600 { color: #b8b8b8 !important; }
+.app-shell.dark .text-gray-700 { color: #d4d4d4 !important; }
+
+button:disabled { opacity: .8 !important; }
 
 .app-shell main { scrollbar-width: thin; scrollbar-color: #c9c5ba transparent; }
 .app-shell.dark main { scrollbar-color: #5a5a5a transparent; }
