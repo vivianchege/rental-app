@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
+import { Capacitor } from '@capacitor/core';
 import { 
   Users, Home, Wallet, Wrench, LayoutDashboard, LogOut, 
   CheckCircle2, Plus, AlertCircle, Phone, X, ShieldCheck,
@@ -39,6 +40,27 @@ import {
   where,
   writeBatch
 } from 'firebase/firestore';
+
+const PORTFOLIO_URL = 'https://gikunjucreates.work.gd/';
+const handlePortfolioLinkClick = event => {
+  event.preventDefault();
+  if (Capacitor.isNativePlatform()) {
+    window.location.assign(PORTFOLIO_URL);
+    return;
+  }
+  window.open(PORTFOLIO_URL, '_blank', 'noopener,noreferrer');
+};
+const PortfolioLink = ({ theme, children }) => (
+  <a
+    href={PORTFOLIO_URL}
+    target="_blank"
+    rel="noopener noreferrer"
+    onClick={handlePortfolioLinkClick}
+    className={`text-sm font-semibold underline decoration-1 underline-offset-4 transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${theme === 'dark' ? 'text-slate-200 decoration-slate-500 hover:text-white focus-visible:outline-slate-200' : 'text-[#34483b] decoration-[#849286] hover:text-[#17261d] focus-visible:outline-[#34483b]'}`}
+  >
+    {children}
+  </a>
+);
 
 // --- FIREBASE SETUP ---
 const firebaseConfig = {
@@ -1958,6 +1980,10 @@ export default function App() {
               </button>
             </div>
             <p className={`mt-5 text-center text-xs ${theme === 'dark' ? 'text-slate-400' : 'text-slate-600'}`}><span className="inline-flex items-center gap-1.5"><ShieldCheck size={14} />Secure sign-in for authorized users</span></p>
+            <p className={`mt-2 text-center text-sm font-semibold ${theme === 'dark' ? 'text-slate-200' : 'text-[#34483b]'}`}>
+              <span className="mr-1">Portfolio:</span>
+              <PortfolioLink theme={theme}>www.Gikunjucreates.work.gd</PortfolioLink>
+            </p>
           </div>
         </section>
       </main>
@@ -2707,7 +2733,10 @@ export default function App() {
 
           <footer className={`mt-10 py-6 border-t text-center text-sm font-medium flex flex-col gap-1 items-center justify-center transition-colors ${theme === 'dark' ? 'border-slate-800 text-slate-500' : 'border-[#E8DFCE] text-gray-500'}`}>
             <p>&copy; {new Date().getFullYear()} Ruiru Rentals. All rights reserved.</p>
-            <p className="text-xs opacity-70">@Gikunju creates</p>
+            <p className={`text-sm font-semibold ${theme === 'dark' ? 'text-slate-200' : 'text-[#34483b]'}`}>
+              <span className="mr-1">@Gikunju creates ·</span>
+              <PortfolioLink theme={theme}>www.Gikunjucreates.work.gd</PortfolioLink>
+            </p>
           </footer>
 
         </main>
