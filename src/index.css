@@ -34,8 +34,7 @@ textarea { transition: background-color 180ms ease, border-color 180ms ease, col
 button:not(:disabled):hover { transform: translateY(-1px); }
 button:not(:disabled):active { transform: translateY(0); }
 
-/* The portal is intentionally quiet: warm neutral surfaces, deep greens, and
-   a muted gold accent from the supplied logo. */
+/* Warm neutral surfaces and the muted gold accent from the supplied logo. */
 .app-shell.light,
 .app-shell.light main { background: var(--page-light); }
 .app-shell.light [class*="bg-[#F4EFE6]"],
@@ -48,28 +47,47 @@ button:not(:disabled):active { transform: translateY(0); }
 .app-shell.light [class*="hover:bg-[#E8DFCE]"]:hover { background-color: #f0ede6 !important; }
 .app-shell.light [class*="hover:bg-[#FDFBF7]"]:hover { background-color: #faf8f2 !important; }
 
+/* Keep the dark theme charcoal across both standard and custom surfaces. */
 .app-shell.dark,
-.app-shell.dark main { background: #16211c; }
-.app-shell.dark .bg-black { background-color: #16211c !important; }
-.app-shell.dark .bg-slate-900 { background-color: #1e2d25 !important; }
-.app-shell.dark .bg-slate-950 { background-color: #121c17 !important; }
-.app-shell.dark .bg-slate-800 { background-color: #263a30 !important; }
-.app-shell.dark .border-slate-800,
-.app-shell.dark .border-slate-700,
+.app-shell.dark main { background: #171717; color: #f2f2f0; }
+.app-shell.dark .bg-black,
+.app-shell.dark .bg-slate-950 { background-color: #111111 !important; }
+.app-shell.dark .bg-slate-900 { background-color: #1c1c1c !important; }
+.app-shell.dark .bg-slate-800 { background-color: #292929 !important; }
+.app-shell.dark [class*="bg-[#0A0A0A]"] { background-color: #141414 !important; }
 .app-shell.dark [class*="border-[#262626]"],
-.app-shell.dark [class*="border-[#303030]"] { border-color: #34453b !important; }
+.app-shell.dark [class*="border-[#303030]"],
+.app-shell.dark .border-slate-800,
+.app-shell.dark .border-slate-700 { border-color: #383838 !important; }
 
 .app-shell main { scrollbar-width: thin; scrollbar-color: #c9c5ba transparent; }
-.app-shell.dark main { scrollbar-color: #456052 transparent; }
+.app-shell.dark main { scrollbar-color: #5a5a5a transparent; }
 .app-shell main::-webkit-scrollbar { width: 10px; }
 .app-shell main::-webkit-scrollbar-track { background: transparent; }
 .app-shell main::-webkit-scrollbar-thumb { background: #c9c5ba; border: 3px solid transparent; border-radius: 999px; background-clip: padding-box; }
-.app-shell.dark main::-webkit-scrollbar-thumb { background: #456052; background-clip: padding-box; }
+.app-shell.dark main::-webkit-scrollbar-thumb { background: #5a5a5a; background-clip: padding-box; }
 
 .app-shell input,
 .app-shell select,
 .app-shell textarea { min-height: 42px; }
 .app-shell input::placeholder { opacity: .65; }
+
+@keyframes soft-enter {
+  from { opacity: 0; transform: translateY(7px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.app-enter,
+.tab-panel-enter,
+.app-shell .animate-in { animation: soft-enter 240ms cubic-bezier(.2, .7, .25, 1) both; }
+.app-shell button,
+.app-shell a { transition: color 160ms ease, background-color 160ms ease, border-color 160ms ease, box-shadow 180ms ease, transform 160ms ease; }
+.app-shell button:not(:disabled):active { transform: scale(.985); }
+.app-shell [class*="rounded-2xl"][class*="border"] { transition: border-color 180ms ease, box-shadow 180ms ease; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
 
 @media (max-width: 767px) {
   .app-shell main { padding: 1rem; }

@@ -97,6 +97,22 @@ service cloud.firestore {
         sameWorkspace(get(tenantCyclePath).data);
     }
 
+    function paymentCycleAllowsLandlord(appId, paymentData) {
+      let tenantCycleId = paymentData.tenantId + '_' + paymentData.cycleId;
+      let billingCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/billingCycles/$(paymentData.cycleId);
+      let tenantCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/tenantCycles/$(tenantCycleId);
+      let tenantPath = /databases/$(database)/documents/artifacts/$(appId)/public/data/tenants/$(paymentData.tenantId);
+      return isLandlord() && paymentData.loggedBy == 'LANDLORD' &&
+        existsAfter(billingCyclePath) &&
+        getAfter(billingCyclePath).data.status in ['OPEN', 'CLOSED'] &&
+        sameWorkspace(getAfter(billingCyclePath).data) &&
+        exists(tenantPath) && sameWorkspace(get(tenantPath).data) &&
+        existsAfter(tenantCyclePath) &&
+        getAfter(tenantCyclePath).data.tenantId == paymentData.tenantId &&
+        getAfter(tenantCyclePath).data.cycleId == paymentData.cycleId &&
+        sameWorkspace(getAfter(tenantCyclePath).data);
+    }
+
     function isValidPayment(data) {
       return data.keys().hasAll([
           'tenantId', 'tenantName', 'amount', 'appliedRent', 'appliedWater', 'excessAmount',
@@ -233,10 +249,42 @@ service cloud.firestore {
         sameWorkspace(getAfter(billingCyclePath).data);
     }
 
+    function validHistoricalTenantCycleCreate(appId, data, recordId) {
+      let billingCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/billingCycles/$(data.cycleId);
+      return isLandlord() && isValidTenantCycle(data, recordId) &&
+        existsAfter(billingCyclePath) &&
+        getAfter(billingCyclePath).data.status == 'CLOSED' &&
+        sameWorkspace(getAfter(billingCyclePath).data);
+    }
+
     function tenantCycleParentIsOpen(appId, data) {
       let billingCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/billingCycles/$(data.cycleId);
       return exists(billingCyclePath) && get(billingCyclePath).data.status == 'OPEN' &&
         sameWorkspace(get(billingCyclePath).data);
+    }
+
+    function tenantCycleParentIsClosed(appId, data) {
+      let billingCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/billingCycles/$(data.cycleId);
+      return exists(billingCyclePath) && get(billingCyclePath).data.status == 'CLOSED' &&
+        sameWorkspace(get(billingCyclePath).data);
+    }
+
+    function closedTenantCycleStatusMatchesBalances(data) {
+      let rentDue = data.expectedRent - data.paidRent;
+      let waterDue = data.expectedWater - data.paidWater;
+      return data.paidRent <= data.expectedRent && data.paidWater <= data.expectedWater &&
+        (((rentDue <= 0 && waterDue <= 0) && data.status == 'CLEARED') ||
+         ((rentDue > 0 || waterDue > 0) && data.status == 'ARREARS'));
+    }
+
+    function landlordClosedTenantCycleUpdateIsValid(appId, recordId) {
+      let data = request.resource.data;
+      return isLandlord() && isValidTenantCycle(data, recordId) &&
+        tenantCycleParentIsClosed(appId, data) &&
+        data.diff(resource.data).affectedKeys().hasOnly([
+          'expectedRent', 'expectedWater', 'paidRent', 'paidWater', 'status', 'updatedBy'
+        ]) &&
+        closedTenantCycleStatusMatchesBalances(data);
     }
 
     function tenantCycleResetIsValid(appId, recordId) {
@@ -291,9 +339,10 @@ service cloud.firestore {
 
     function isValidCollectionCreate(collectionName, appId, data, recordId) {
       return (collectionName == 'payments' && isValidPayment(data) &&
-          !('updatedBy' in data) && paymentCycleIsOpen(appId, data)) ||
+          !('updatedBy' in data) && paymentCycleAllowsLandlord(appId, data)) ||
         (collectionName == 'billingCycles' && isValidBillingCycle(data, recordId)) ||
-        (collectionName == 'tenantCycles' && validTenantCycleCreate(appId, data, recordId)) ||
+        (collectionName == 'tenantCycles' &&
+          (validTenantCycleCreate(appId, data, recordId) || validHistoricalTenantCycleCreate(appId, data, recordId))) ||
         (collectionName == 'tenants' && isValidTenantLeaseCreate(appId, data)) ||
         (!isCycleCollection(collectionName) && collectionName != 'payments' && collectionName != 'tenants');
     }
@@ -312,6 +361,7 @@ service cloud.firestore {
             'tenantName', 'houseId', 'expectedRent', 'expectedWater', 'paidRent',
             'paidWater', 'status', 'updatedBy'
           ])) ||
+        (collectionName == 'tenantCycles' && landlordClosedTenantCycleUpdateIsValid(appId, recordId)) ||
         (collectionName == 'payments' &&
           isValidPayment(request.resource.data) &&
           resource.data.status == 'PENDING' && request.resource.data.status == 'CONFIRMED' &&
