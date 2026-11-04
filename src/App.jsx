@@ -1876,7 +1876,7 @@ export default function App() {
     return (
       <div className={`min-h-screen flex flex-col gap-4 items-center justify-center ${theme === 'dark' ? 'bg-slate-950' : 'bg-[#FDFBF7]'}`}>
         <div className={`animate-spin rounded-full h-12 w-12 border-4 border-t-transparent shadow-lg ${theme === 'dark' ? 'border-slate-400' : 'border-gray-800'}`}></div>
-        <p className={`font-bold text-sm tracking-widest uppercase opacity-80 animate-pulse ${theme === 'dark' ? 'text-slate-400' : 'text-gray-500'}`}>Ruiru Rentals Syncing...</p>
+        <p className={`font-bold text-sm tracking-widest uppercase opacity-80 animate-pulse ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>Ruiru Rentals Syncing...</p>
       </div>
     );
   }
@@ -1889,14 +1889,14 @@ export default function App() {
           <CheckCircle2 size={72} className="text-emerald-500"/>
         </div>
         <h1 className="text-4xl md:text-5xl font-extrabold mb-3 animate-pulse text-center px-4">Welcome Back!</h1>
-        <p className="text-gray-500 font-medium text-lg">Preparing your secure workspace...</p>
+        <p className={`font-medium text-lg ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>Preparing your secure workspace...</p>
       </div>
     );
   }
 
   if (!user) {
     return (
-      <main className={`flex min-h-[100svh] items-center justify-center px-5 py-10 ${theme === 'dark' ? 'bg-[#171717]' : 'bg-[#f6f4ef]'}`}>
+      <main className={`auth-shell ${theme === 'dark' ? 'dark' : 'light'} flex min-h-[100svh] items-center justify-center px-5 py-10 ${theme === 'dark' ? 'bg-[#171717]' : 'bg-[#f6f4ef]'}`}>
         <section className={`flex w-full max-w-[520px] items-center justify-center ${theme === 'dark' ? 'text-slate-100' : 'text-slate-900'}`}>
           <div className="w-full max-w-[440px]">
             <div className={`app-enter rounded-2xl border p-6 shadow-xl sm:p-9 ${theme === 'dark' ? 'border-[#383838] bg-[#1f1f1f]' : 'border-[#e7e1d7] bg-[#fffdf9]'}`}>
@@ -1905,7 +1905,7 @@ export default function App() {
                   <img src="/HSlogo.png" alt="Ruiru Rentals logo" className="h-12 w-12 rounded-xl border border-black/5 object-cover" />
                   <div>
                     <p className={`font-semibold ${theme === 'dark' ? 'text-white' : 'text-[#26332d]'}`}>Ruiru Rentals</p>
-                    <p className="text-xs text-gray-500">Property management</p>
+                    <p className={`text-xs ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>Property management</p>
                   </div>
                 </div>
                 <p className={`text-xs font-semibold uppercase tracking-[0.14em] ${theme === 'dark' ? 'text-emerald-300' : 'text-[#2f5542]'}`}>Welcome back</p>
@@ -1923,7 +1923,7 @@ export default function App() {
               <form onSubmit={handleLoginSubmit} className="space-y-5">
                 <div>
                   <label htmlFor="login-email" className={`mb-2 block text-sm font-semibold ${theme === 'dark' ? 'text-slate-300' : 'text-slate-700'}`}>Email address</label>
-                  <input id="login-email" required type="email" autoComplete="username" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@example.com" className={`w-full rounded-xl border px-4 py-3.5 text-sm outline-none transition placeholder:text-slate-500 focus:border-emerald-600 focus:ring-4 focus:ring-emerald-600/10 ${theme === 'dark' ? 'border-slate-700 bg-slate-950 text-white' : 'border-slate-300 bg-white text-slate-900'}`} />
+                  <input id="login-email" required type="email" autoComplete="username" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@example.com" className={`w-full rounded-xl border px-4 py-3.5 text-sm outline-none transition placeholder:text-slate-500 focus:border-emerald-600 focus:ring-4 focus:ring-emerald-600/10 ${theme === 'dark' ? 'border-slate-700 bg-slate-950 text-white placeholder:text-slate-400' : 'border-slate-300 bg-white text-slate-900 placeholder:text-gray-500'}`} />
                 </div>
                 <div>
                   <div className="mb-2 flex items-center justify-between gap-3">
@@ -1931,13 +1931,13 @@ export default function App() {
                     <button type="button" onClick={handleForgotPassword} className={`text-xs font-semibold transition ${theme === 'dark' ? 'text-emerald-400 hover:text-emerald-300' : 'text-emerald-700 hover:text-emerald-800'}`}>Forgot password?</button>
                   </div>
                   <div className="relative">
-                    <input id="login-password" required type={showPassword ? 'text' : 'password'} autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Enter your password" className={`w-full rounded-xl border px-4 py-3.5 pr-12 text-sm outline-none transition placeholder:text-slate-500 focus:border-emerald-600 focus:ring-4 focus:ring-emerald-600/10 ${theme === 'dark' ? 'border-slate-700 bg-slate-950 text-white' : 'border-slate-300 bg-white text-slate-900'}`} />
+                    <input id="login-password" required type={showPassword ? 'text' : 'password'} autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Enter your password" className={`w-full rounded-xl border px-4 py-3.5 pr-12 text-sm outline-none transition placeholder:text-slate-500 focus:border-emerald-600 focus:ring-4 focus:ring-emerald-600/10 ${theme === 'dark' ? 'border-slate-700 bg-slate-950 text-white placeholder:text-slate-400' : 'border-slate-300 bg-white text-slate-900 placeholder:text-gray-500'}`} />
                     <button type="button" aria-label={showPassword ? 'Hide password' : 'Show password'} aria-pressed={showPassword} onClick={() => setShowPassword(!showPassword)} className={`absolute right-2 top-1/2 -translate-y-1/2 rounded-lg p-2 transition ${theme === 'dark' ? 'text-slate-400 hover:bg-slate-800 hover:text-white' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-900'}`}>
                       {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
                     </button>
                   </div>
                 </div>
-                <button type="submit" disabled={isProcessing} className={`flex w-full items-center justify-center gap-2 rounded-xl py-3.5 text-sm font-bold text-white shadow-sm transition focus-visible:outline-emerald-600 disabled:cursor-not-allowed disabled:opacity-50 ${theme === 'dark' ? 'bg-emerald-700 hover:bg-emerald-600' : 'bg-slate-900 hover:bg-slate-800'}`}>
+                <button type="submit" disabled={isProcessing} className={`flex w-full items-center justify-center gap-2 rounded-xl py-3.5 text-sm font-bold text-white shadow-sm transition focus-visible:outline-emerald-600 disabled:cursor-not-allowed disabled:opacity-50 ${theme === 'dark' ? 'bg-[#383838] hover:bg-[#505050]' : 'bg-slate-900 hover:bg-slate-800'}`}>
                   {isProcessing ? <div className="h-5 w-5 animate-spin rounded-full border-2 border-white border-t-transparent" /> : 'Sign in to your workspace'}
                 </button>
               </form>

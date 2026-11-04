@@ -23,6 +23,8 @@ body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--page-li
 button, input, select, textarea { font: inherit; }
 button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
 button:disabled { cursor: not-allowed; }
+input::placeholder,
+textarea::placeholder { color: #6b7280; opacity: 1; }
 :focus-visible { outline: 3px solid rgb(185 161 106 / 55%); outline-offset: 2px; }
 ::selection { color: #fff; background: #2f5542; }
 
@@ -63,6 +65,10 @@ button:not(:disabled):active { transform: translateY(0); }
 .app-shell.dark .text-gray-500 { color: #a3a3a3 !important; }
 .app-shell.dark .text-gray-600 { color: #b8b8b8 !important; }
 .app-shell.dark .text-gray-700 { color: #d4d4d4 !important; }
+.app-shell.dark input::placeholder,
+.app-shell.dark textarea::placeholder,
+.auth-shell.dark input::placeholder,
+.auth-shell.dark textarea::placeholder { color: #a3a3a3 !important; }
 
 button:disabled { opacity: .8 !important; }
 
