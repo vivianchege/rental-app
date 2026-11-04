@@ -69,14 +69,14 @@ service cloud.firestore {
 
     function managerCollectionAllowed(collectionName) {
       return collectionName in [
-        'houses', 'tenants', 'payments', 'repairs', 'septicLogs', 'masterWaterBills',
+        'houses', 'tenants', 'payments', 'repairs', 'septicLogs', 'garbageLogs', 'masterWaterBills',
         'billingCycles', 'tenantCycles', 'expenses', 'notifications', 'paymentReferences'
       ];
     }
 
     function managerCanCreate(collectionName) {
       return collectionName in [
-        'payments', 'repairs', 'septicLogs', 'masterWaterBills', 'expenses',
+        'payments', 'repairs', 'septicLogs', 'garbageLogs', 'masterWaterBills', 'expenses',
         'notifications', 'paymentReferences', 'auditLogs'
       ];
     }
@@ -130,7 +130,7 @@ service cloud.firestore {
         data.excessAmount is number && data.excessAmount >= 0 && data.excessAmount <= data.amount &&
         data.type in ['RENT', 'WATER', 'COMBINED'] &&
         data.method is string && data.method.size() > 0 && data.method.size() <= 40 &&
-        data.messageCode is string && data.messageCode.size() <= 100 &&
+        data.messageCode is string && data.messageCode.size() <= 100 && data.messageCode != 'N/A' &&
         data.status in ['PENDING', 'CONFIRMED'] &&
         data.date is string && data.date.size() > 0 && data.date.size() <= 40 &&
         data.loggedBy in ['LANDLORD', 'MANAGER'] &&
@@ -140,7 +140,7 @@ service cloud.firestore {
         (!('updatedBy' in data) || (data.updatedBy is string && data.updatedBy.size() <= 128)) &&
         ((data.status == 'PENDING' && data.loggedBy == 'MANAGER' &&
           data.appliedRent == 0 && data.appliedWater == 0 && data.excessAmount == 0) ||
-         (data.status == 'CONFIRMED' &&
+         (data.status == 'CONFIRMED' && data.messageCode.size() > 0 &&
           math.abs(data.amount - data.appliedRent - data.appliedWater - data.excessAmount) <= 0.01));
     }
 
@@ -337,9 +337,30 @@ service cloud.firestore {
           tenantCycleStatusMatchesBalances(request.resource.data));
     }
 
+    function isValidGarbageLog(data) {
+      return data.keys().hasAll([
+          'provider', 'cost', 'date', 'notes', 'loggedBy', 'cycleId',
+          'createdAt', 'workspaceId', 'createdBy', 'updatedBy'
+        ]) &&
+        data.keys().hasOnly([
+          'provider', 'cost', 'date', 'notes', 'loggedBy', 'cycleId',
+          'createdAt', 'workspaceId', 'createdBy', 'updatedBy'
+        ]) &&
+        data.provider is string && data.provider.size() > 0 && data.provider.size() <= 80 &&
+        data.cost is number && data.cost >= 0 && data.cost <= 1000000000000 &&
+        data.date is string && data.date.size() == 10 &&
+        data.notes is string && data.notes.size() <= 300 &&
+        data.loggedBy in ['LANDLORD', 'MANAGER'] &&
+        (data.cycleId == null || (data.cycleId is string && data.cycleId.size() <= 128)) &&
+        data.createdAt is string && data.createdAt.size() > 0 && data.createdAt.size() <= 40 &&
+        data.workspaceId is string && data.workspaceId.size() > 0 && data.workspaceId.size() <= 120 &&
+        data.createdBy == request.auth.uid && data.updatedBy == request.auth.uid;
+    }
+
     function isValidCollectionCreate(collectionName, appId, data, recordId) {
       return (collectionName == 'payments' && isValidPayment(data) &&
           !('updatedBy' in data) && paymentCycleAllowsLandlord(appId, data)) ||
+        (collectionName == 'garbageLogs' && isValidGarbageLog(data)) ||
         (collectionName == 'billingCycles' && isValidBillingCycle(data, recordId)) ||
         (collectionName == 'tenantCycles' &&
           (validTenantCycleCreate(appId, data, recordId) || validHistoricalTenantCycleCreate(appId, data, recordId))) ||
@@ -368,7 +389,7 @@ service cloud.firestore {
           request.resource.data.updatedBy == request.auth.uid &&
           paymentCycleIsOpen(appId, request.resource.data) &&
           request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-            'status', 'appliedRent', 'appliedWater', 'excessAmount', 'updatedBy'
+            'status', 'messageCode', 'appliedRent', 'appliedWater', 'excessAmount', 'updatedBy'
           ]));
     }
 
@@ -408,6 +429,7 @@ service cloud.firestore {
         sameWorkspace(request.resource.data) &&
         request.resource.data.createdBy == request.auth.uid &&
         !isCycleCollection(collectionName) &&
+        (collectionName != 'garbageLogs' || isValidGarbageLog(request.resource.data)) &&
         (collectionName != 'payments' || managerPaymentCreateIsPending(appId));
 
       allow update: if isLandlord() &&
@@ -428,7 +450,7 @@ service cloud.firestore {
         managerCanUpdateRecord(collectionName, appId, recordId);
 
       allow delete: if isLandlord() &&
-        collectionName in ['payments', 'paymentReferences', 'repairs', 'septicLogs', 'masterWaterBills'] &&
+        collectionName in ['payments', 'paymentReferences', 'repairs', 'septicLogs', 'garbageLogs', 'masterWaterBills'] &&
         (sameWorkspace(resource.data) || (isLegacyLandlord() && legacyRecord(resource.data)));
     }
   }

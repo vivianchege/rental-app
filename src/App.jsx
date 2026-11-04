@@ -1,16 +1,22 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Capacitor } from '@capacitor/core';
+import { FirebaseAuthentication } from '@capacitor-firebase/authentication';
+import { App as CapacitorApp } from '@capacitor/app';
+import { BiometricAuth } from '@aparajita/capacitor-biometric-auth';
+import { Preferences } from '@capacitor/preferences';
 import { 
-  Users, Home, Wallet, Wrench, LayoutDashboard, LogOut, 
+  Users, Home, Wallet, Wrench, LayoutDashboard, LogOut, Trash2,
   CheckCircle2, Plus, AlertCircle, Phone, X, ShieldCheck,
   Check, Clock, FileText, Calendar, Edit, Info, Coins, ListOrdered,
   Droplet, Truck, Sun, Moon, BellRing, Menu,
-  Eye, EyeOff, Download, Search, ReceiptText, FileBarChart,
+  Eye, EyeOff, Download, Search, ReceiptText, FileBarChart, Fingerprint,
   Settings, Bell, Building2, Activity,
-  SlidersHorizontal, Database, ArrowUpRight, RotateCcw
+  SlidersHorizontal, Database, ArrowUpRight, ArrowLeft, RotateCcw
 } from 'lucide-react';
 import { allocatePayment, parseMoney } from './lib/money.js';
 import { canAccessWorkspaceRecord, hasPermission, normalizeRole, PERMISSIONS, ROLES } from './lib/permissions.js';
+import { APP_IDLE_TIMEOUT_MS, formatLockoutDuration, getCurrentTimestamp, getNextPasswordFailure, getRemainingLockoutSeconds } from './lib/authSecurity.js';
+import { firebaseClientConfig } from './lib/firebaseClientConfig.js';
 
 // --- FIREBASE IMPORTS ---
 import { initializeApp, getApps, getApp } from 'firebase/app';
@@ -22,7 +28,10 @@ import {
   sendPasswordResetEmail,
   getIdTokenResult,
   GoogleAuthProvider,
-  signInWithPopup
+  signInWithPopup,
+  signInWithCredential,
+  initializeAuth,
+  indexedDBLocalPersistence
 } from 'firebase/auth';
 import { 
   initializeFirestore,
@@ -64,17 +73,20 @@ const PortfolioLink = ({ theme, children }) => (
 
 // --- FIREBASE SETUP ---
 const firebaseConfig = {
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY || '',
-  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || '',
-  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || '',
-  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || '',
-  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || '',
-  appId: import.meta.env.VITE_FIREBASE_APP_ID || ''
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY || firebaseClientConfig.apiKey,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || firebaseClientConfig.authDomain,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || firebaseClientConfig.projectId,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || firebaseClientConfig.storageBucket,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || firebaseClientConfig.messagingSenderId,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID || firebaseClientConfig.appId
 };
 
 const isFirebaseConfigured = Object.values(firebaseConfig).every(Boolean);
+const useLegacyAndroidGoogleAuth = import.meta.env.VITE_ANDROID_LEGACY_GOOGLE_AUTH === 'true';
 const app = isFirebaseConfigured ? (getApps().length === 0 ? initializeApp(firebaseConfig) : getApp()) : null;
-const auth = app ? getAuth(app) : null;
+const auth = app ? (Capacitor.isNativePlatform()
+  ? initializeAuth(app, { persistence: indexedDBLocalPersistence })
+  : getAuth(app)) : null;
 const db = app ? initializeFirestore(app, {
   localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
 }) : null;
@@ -85,7 +97,7 @@ const DEFAULT_WORKSPACE_ID = import.meta.env.VITE_DEFAULT_WORKSPACE_ID || 'main-
 const compareNatural = (left, right) => String(left || '').localeCompare(String(right || ''), undefined, { numeric: true, sensitivity: 'base' });
 const DATA_COLLECTION_LABELS = {
   houses: 'houses', tenants: 'tenants', payments: 'payments', repairs: 'maintenance',
-  septicLogs: 'septic logs', masterWaterBills: 'water bills', waterVaultResets: 'water vault',
+  septicLogs: 'septic logs', garbageLogs: 'garbage collection logs', masterWaterBills: 'water bills', waterVaultResets: 'water vault',
   expenses: 'expenses', auditLogs: 'activity history', notifications: 'notifications',
   billingCycles: 'billing cycles', tenantCycles: 'tenant billing records',
 };
@@ -187,11 +199,32 @@ const escapeHtml = (value) => String(value ?? '')
 export default function App() {
   const [theme, setTheme] = useState(() => localStorage.getItem('ruiru_theme') || 'light');
   const [user, setUser] = useState(null);
+  const [isAppLocked, setIsAppLocked] = useState(false);
+  const [biometricLabel, setBiometricLabel] = useState('biometric');
+  const [biometricError, setBiometricError] = useState('');
+  const [loginSecurity, setLoginSecurity] = useState({ failedAttempts: 0, lockedUntil: 0 });
+  const [lockoutClock, setLockoutClock] = useState(0);
   const [role, setRole] = useState(null);
   const [userProfile, setUserProfile] = useState(null);
   const [billingCycles, setBillingCycles] = useState([]);
   const [tenantCycles, setTenantCycles] = useState([]);
   const [activeTab, setActiveTab] = useState('dashboard');
+  useEffect(() => {
+    if (!Capacitor.isNativePlatform() || activeTab !== 'billing') return undefined;
+    let registration;
+    let disposed = false;
+    CapacitorApp.addListener('backButton', () => {
+      if (document.querySelector('[aria-modal="true"]')) return;
+      setActiveTab('dashboard');
+    }).then(listener => {
+      if (disposed) void listener.remove();
+      else registration = listener;
+    });
+    return () => {
+      disposed = true;
+      if (registration) void registration.remove();
+    };
+  }, [activeTab]);
   const [loading, setLoading] = useState(() => Boolean(auth));
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [globalSearch, setGlobalSearch] = useState('');
@@ -214,12 +247,15 @@ export default function App() {
   const [tenantStatusFilter, setTenantStatusFilter] = useState('ALL');
   const [paymentMonthFilter, setPaymentMonthFilter] = useState(createCurrentMonthKey);
   const rejectedGoogleUserUid = useRef(null);
+  const biometricInfoRef = useRef(null);
+  const biometricPromptInProgress = useRef(false);
+  const skipBiometricGateRef = useRef(false);
 
   // Authentication State Variables
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
-  const [loginError, setLoginError] = useState(() => auth ? '' : 'The portal is not configured yet. Add the Firebase values from .env.example.');
+  const [loginError, setLoginError] = useState(() => auth ? '' : 'Firebase is not configured for this app.');
   const [showWelcomeScreen, setShowWelcomeScreen] = useState(false);
 
   // Live Database States
@@ -228,6 +264,7 @@ export default function App() {
   const [payments, setPayments] = useState([]);
   const [repairs, setRepairs] = useState([]);
   const [septicLogs, setSepticLogs] = useState([]);
+  const [garbageLogs, setGarbageLogs] = useState([]);
   const [masterWaterBills, setMasterWaterBills] = useState([]);
   const [waterVaultResets, setWaterVaultResets] = useState([]);
   const [expenses, setExpenses] = useState([]);
@@ -240,6 +277,10 @@ export default function App() {
   const canRecordRent = hasPermission(role, PERMISSIONS.RECORD_RENT);
   const canRecordWater = hasPermission(role, PERMISSIONS.RECORD_WATER);
   const canApproveRent = hasPermission(role, PERMISSIONS.APPROVE_RENT);
+  const loginLockoutSeconds = getRemainingLockoutSeconds(loginSecurity.lockedUntil, lockoutClock);
+  const loginFeedback = loginLockoutSeconds > 0
+    ? `Too many incorrect passwords. Try again in ${formatLockoutDuration(loginLockoutSeconds)}.`
+    : loginError;
 
   // Modals Visibility Controllers
   const [isHouseModalOpen, setIsHouseModalOpen] = useState(false);
@@ -251,6 +292,7 @@ export default function App() {
   const [isResolveRepairModalOpen, setIsResolveRepairModalOpen] = useState(false);
   const [isHistoryModalOpen, setIsHistoryModalOpen] = useState(false);
   const [isSepticModalOpen, setIsSepticModalOpen] = useState(false);
+  const [isGarbageModalOpen, setIsGarbageModalOpen] = useState(false);
   const [isWaterBillModalOpen, setIsWaterBillModalOpen] = useState(false);
   const [isEditTenantModalOpen, setIsEditTenantModalOpen] = useState(false);
   const [isExpenseModalOpen, setIsExpenseModalOpen] = useState(false);
@@ -270,12 +312,13 @@ export default function App() {
     workspaceId,
     [isUpdate ? 'updatedBy' : 'createdBy']: actor?.uid || ''
   });
-  const clearWorkspaceData = () => {
+  const clearWorkspaceData = useCallback(() => {
     setHouses([]);
     setTenants([]);
     setPayments([]);
     setRepairs([]);
     setSepticLogs([]);
+    setGarbageLogs([]);
     setMasterWaterBills([]);
     setWaterVaultResets([]);
     setExpenses([]);
@@ -284,7 +327,81 @@ export default function App() {
     setBillingCycles([]);
     setTenantCycles([]);
     setSyncIssues([]);
-  };
+  }, []);
+
+  const loadLoginSecurityState = useCallback(async () => {
+    try {
+      const { value } = await Preferences.get({ key: 'ruiru_login_security' });
+      const saved = value ? JSON.parse(value) : {};
+      return {
+        failedAttempts: Math.max(0, Math.floor(Number(saved.failedAttempts) || 0)),
+        lockedUntil: Math.max(0, Number(saved.lockedUntil) || 0),
+      };
+    } catch {
+      return { failedAttempts: 0, lockedUntil: 0 };
+    }
+  }, []);
+
+  const saveLoginSecurityState = useCallback(async (nextState) => {
+    try {
+      await Preferences.set({ key: 'ruiru_login_security', value: JSON.stringify(nextState) });
+    } catch {
+      // Keep the current process protected if native storage is temporarily unavailable.
+    }
+    setLoginSecurity(nextState);
+    setLockoutClock(getCurrentTimestamp());
+  }, []);
+
+  const clearLoginSecurityState = useCallback(async () => {
+    try {
+      await Preferences.remove({ key: 'ruiru_login_security' });
+    } catch {
+      // A successful sign-in still clears the in-memory counter.
+    }
+    setLoginSecurity({ failedAttempts: 0, lockedUntil: 0 });
+    setLockoutClock(getCurrentTimestamp());
+  }, []);
+
+  const refreshDeviceBiometrics = useCallback(async () => {
+    if (!Capacitor.isNativePlatform()) return null;
+    try {
+      const info = await BiometricAuth.checkBiometry();
+      biometricInfoRef.current = info;
+      const types = (info.biometryTypes || []).map(type => String(type).toLowerCase());
+      const primaryType = String(info.biometryType || '').toLowerCase();
+      setBiometricLabel(types.includes('fingerprintauthentication') || primaryType.includes('fingerprint') ? 'fingerprint' : 'biometric');
+      return info;
+    } catch {
+      biometricInfoRef.current = null;
+      return null;
+    }
+  }, []);
+
+  const requestBiometricUnlock = useCallback(async () => {
+    if (!Capacitor.isNativePlatform() || !biometricInfoRef.current?.isAvailable || biometricPromptInProgress.current) return false;
+    biometricPromptInProgress.current = true;
+    setBiometricError('');
+    try {
+      await BiometricAuth.authenticate({
+        reason: 'Unlock Ruiru Rentals',
+        cancelTitle: 'Cancel',
+        allowDeviceCredential: false,
+        androidTitle: 'Unlock Ruiru Rentals',
+        androidSubtitle: 'Verify with your fingerprint',
+        androidConfirmationRequired: false,
+      });
+      await Preferences.remove({ key: 'ruiru_last_background_at' }).catch(() => {});
+      setIsAppLocked(false);
+      return true;
+    } catch (error) {
+      if (!['userCancel', 'appCancel', 'systemCancel'].includes(error?.code)) {
+        setBiometricError('Fingerprint was not recognized. Try again or sign in with your password.');
+      }
+      return false;
+    } finally {
+      biometricPromptInProgress.current = false;
+    }
+  }, []);
 
   useEffect(() => {
     localStorage.setItem('ruiru_theme', theme);
@@ -296,6 +413,83 @@ export default function App() {
     const timer = setTimeout(() => setToastMessage(''), 4000);
     return () => clearTimeout(timer);
   }, [toastMessage]);
+
+  useEffect(() => {
+    let disposed = false;
+    void loadLoginSecurityState().then(saved => {
+      if (!disposed) {
+        setLoginSecurity(saved);
+        setLockoutClock(getCurrentTimestamp());
+      }
+    });
+    return () => { disposed = true; };
+  }, [loadLoginSecurityState]);
+
+  useEffect(() => {
+    if (!loginSecurity.lockedUntil || loginSecurity.lockedUntil <= getCurrentTimestamp()) return undefined;
+    const timer = window.setInterval(() => {
+      const now = getCurrentTimestamp();
+      setLockoutClock(now);
+      if (loginSecurity.lockedUntil <= now) {
+        setLoginSecurity(current => ({ ...current, lockedUntil: 0 }));
+        setLoginError('');
+      }
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [loginSecurity.lockedUntil]);
+
+  useEffect(() => {
+    if (!Capacitor.isNativePlatform() || !auth) return undefined;
+    let registration;
+    let disposed = false;
+
+    const handleAppStateChange = async ({ isActive }) => {
+      if (!auth.currentUser) return;
+      if (!isActive) {
+        try {
+          await Preferences.set({ key: 'ruiru_last_background_at', value: String(getCurrentTimestamp()) });
+        } catch {
+          // Session checks still run for the current process.
+        }
+        if (biometricInfoRef.current?.isAvailable) setIsAppLocked(true);
+        return;
+      }
+
+      const biometricInfo = biometricInfoRef.current || await refreshDeviceBiometrics();
+      if (biometricInfo?.isAvailable) {
+        setIsAppLocked(true);
+        void requestBiometricUnlock();
+        return;
+      }
+
+      const lastBackgroundAt = await Preferences.get({ key: 'ruiru_last_background_at' })
+        .then(({ value }) => Number(value) || 0)
+        .catch(() => 0);
+      if (lastBackgroundAt && getCurrentTimestamp() - lastBackgroundAt >= APP_IDLE_TIMEOUT_MS) {
+        setLoginError('Your session expired after 15 minutes away. Sign in again.');
+        setIsAppLocked(false);
+        await signOut(auth);
+      } else {
+        await Preferences.remove({ key: 'ruiru_last_background_at' }).catch(() => {});
+      }
+    };
+
+    const startListener = async () => {
+      try {
+        await refreshDeviceBiometrics();
+        const listener = await CapacitorApp.addListener('appStateChange', handleAppStateChange);
+        if (disposed) await listener.remove();
+        else registration = listener;
+      } catch {
+        biometricInfoRef.current = null;
+      }
+    };
+    void startListener();
+    return () => {
+      disposed = true;
+      if (registration) void registration.remove();
+    };
+  }, [refreshDeviceBiometrics, requestBiometricUnlock]);
 
   // Authentication is intentionally role-agnostic in the client. The role is resolved
   // from a protected profile/custom claim instead of a hard-coded email allowlist.
@@ -320,6 +514,32 @@ export default function App() {
           return;
         }
         try {
+          let shouldPromptBiometric = false;
+          if (Capacitor.isNativePlatform()) {
+            const freshPasswordOrGoogleSignIn = skipBiometricGateRef.current;
+            skipBiometricGateRef.current = false;
+            const biometricInfo = await refreshDeviceBiometrics();
+            if (biometricInfo?.isAvailable) {
+              setIsAppLocked(!freshPasswordOrGoogleSignIn);
+              shouldPromptBiometric = !freshPasswordOrGoogleSignIn;
+            } else if (!freshPasswordOrGoogleSignIn) {
+              const lastBackgroundAt = await Preferences.get({ key: 'ruiru_last_background_at' })
+                .then(({ value }) => Number(value) || 0)
+                .catch(() => 0);
+              if (lastBackgroundAt && getCurrentTimestamp() - lastBackgroundAt >= APP_IDLE_TIMEOUT_MS) {
+                setLoginError('Your session expired after 15 minutes away. Sign in again.');
+                await Preferences.remove({ key: 'ruiru_last_background_at' }).catch(() => {});
+                await signOut(auth);
+                setLoading(false);
+                return;
+              }
+              setIsAppLocked(false);
+              await Preferences.remove({ key: 'ruiru_last_background_at' }).catch(() => {});
+            } else {
+              setIsAppLocked(false);
+              await Preferences.remove({ key: 'ruiru_last_background_at' }).catch(() => {});
+            }
+          }
           const token = await getIdTokenResult(currentUser);
           const profileSnapshot = db ? await getDoc(doc(db, 'users', currentUser.uid)) : null;
           const profile = profileSnapshot?.exists() ? profileSnapshot.data() : {};
@@ -349,6 +569,7 @@ export default function App() {
             });
           }
           setLoading(false);
+          if (shouldPromptBiometric) void requestBiometricUnlock();
         } catch {
           setLoginError('Your Firebase account was found, but it has no verified portal role. Create a users/{UID} profile with role LANDLORD or MANAGER, then sign in again.');
           await signOut(auth);
@@ -359,6 +580,9 @@ export default function App() {
           setLoading(false);
         }
       } else {
+        skipBiometricGateRef.current = false;
+        setIsAppLocked(false);
+        setBiometricError('');
         setUser(null);
         setRole(null);
         setUserProfile(null);
@@ -370,7 +594,7 @@ export default function App() {
       clearTimeout(authTimeout);
       unsubscribe();
     };
-  }, []);
+  }, [refreshDeviceBiometrics, requestBiometricUnlock, clearWorkspaceData]);
 
   useEffect(() => {
     if (!user || !db) return undefined;
@@ -402,6 +626,7 @@ export default function App() {
     subscribe('payments', setPayments, 'date');
     subscribe('repairs', setRepairs, 'date');
     subscribe('septicLogs', setSepticLogs, 'date');
+    subscribe('garbageLogs', setGarbageLogs, 'date');
     subscribe('masterWaterBills', setMasterWaterBills, 'date');
     if (role === ROLES.LANDLORD) subscribe('waterVaultResets', setWaterVaultResets, 'date');
     subscribe('expenses', setExpenses, 'date');
@@ -497,26 +722,54 @@ export default function App() {
     if (isProcessing) return;
     setLoginError('');
     if (!auth) {
-      setLoginError('The portal is not configured yet. Add the Firebase values from .env.example.');
+      setLoginError('Firebase is not configured for this app.');
       return;
     }
     setIsProcessing(true);
+    let knownFailures = loginSecurity.failedAttempts;
     try {
-      await signInWithEmailAndPassword(auth, email, password);
+      const savedSecurity = await loadLoginSecurityState();
+      knownFailures = Math.max(knownFailures, savedSecurity.failedAttempts);
+      const activeSecurity = {
+        failedAttempts: knownFailures,
+        lockedUntil: Math.max(loginSecurity.lockedUntil, savedSecurity.lockedUntil),
+      };
+      setLoginSecurity(activeSecurity);
+      const now = getCurrentTimestamp();
+      setLockoutClock(now);
+      if (activeSecurity.lockedUntil > now) {
+        setLoginError(`Too many incorrect passwords. Try again in ${formatLockoutDuration(getRemainingLockoutSeconds(activeSecurity.lockedUntil))}.`);
+        return;
+      }
+      rejectedGoogleUserUid.current = null;
+      if (Capacitor.isNativePlatform()) skipBiometricGateRef.current = true;
+      await signInWithEmailAndPassword(auth, email.trim(), password);
+      await clearLoginSecurityState();
       triggerWelcome();
-    } catch {
-      setLoginError('Invalid credentials.');
+    } catch (error) {
+      skipBiometricGateRef.current = false;
+      if (['auth/invalid-credential', 'auth/wrong-password', 'auth/user-not-found', 'auth/invalid-login-credentials'].includes(error?.code)) {
+        const savedSecurity = await loadLoginSecurityState();
+        const nextSecurity = getNextPasswordFailure(Math.max(knownFailures, savedSecurity.failedAttempts));
+        await saveLoginSecurityState(nextSecurity);
+        const now = getCurrentTimestamp();
+        setLoginError(nextSecurity.lockedUntil > now ? `Too many incorrect passwords. Try again in ${formatLockoutDuration(getRemainingLockoutSeconds(nextSecurity.lockedUntil, now))}.` : 'Invalid credentials.');
+      } else if (error?.code === 'auth/too-many-requests') {
+        setLoginError('Firebase is temporarily limiting sign-in attempts. Wait a little, then try again.');
+      } else {
+        setLoginError(error?.message?.replace(/^Firebase:\s*/i, '') || 'Unable to sign in. Check your connection and try again.');
+      }
     } finally {
       setIsProcessing(false);
     }
   };
 
-  // Google Single-Sign On (SSO) Popup handler
+  // Use native Google credentials inside Android WebView; keep browser OAuth on the website.
   const handleGoogleSignIn = async () => {
     if (isProcessing) return;
     setLoginError('');
     if (!auth) {
-      setLoginError('The portal is not configured yet. Add the Firebase values from .env.example.');
+      setLoginError('Firebase is not configured for this app.');
       return;
     }
     setIsProcessing(true);
@@ -524,7 +777,19 @@ export default function App() {
     provider.setCustomParameters({ prompt: 'select_account' });
     rejectedGoogleUserUid.current = null;
     try {
-      const result = await signInWithPopup(auth, provider);
+      let result;
+      if (Capacitor.isNativePlatform()) {
+        const nativeResult = await FirebaseAuthentication.signInWithGoogle({
+          skipNativeAuth: true,
+          useCredentialManager: !useLegacyAndroidGoogleAuth,
+        });
+        const idToken = nativeResult.credential?.idToken;
+        if (!idToken) throw new Error('Google sign-in did not return an ID token. Try again.');
+        skipBiometricGateRef.current = true;
+        result = await signInWithCredential(auth, GoogleAuthProvider.credential(idToken));
+      } else {
+        result = await signInWithPopup(auth, provider);
+      }
       const token = await getIdTokenResult(result.user);
       const profileSnapshot = db ? await getDoc(doc(db, 'users', result.user.uid)) : null;
       const profile = profileSnapshot?.exists() ? profileSnapshot.data() : {};
@@ -540,7 +805,9 @@ export default function App() {
       }
       triggerWelcome();
     } catch (error) {
-      if (error.code !== 'auth/popup-closed-by-user') {
+      skipBiometricGateRef.current = false;
+      const cancelled = error.code === 'auth/popup-closed-by-user' || /cancel(?:led|ed)?/i.test(error.message || '');
+      if (!cancelled) {
         setLoginError(error.message?.replace(/^Firebase:\s*/i, '') || 'Google sign-in failed.');
       }
     } finally {
@@ -574,6 +841,9 @@ export default function App() {
 
   const handleLogout = async () => {
     setLoginError('');
+    setIsAppLocked(false);
+    setBiometricError('');
+    skipBiometricGateRef.current = false;
     try {
       if (db && user) {
         try {
@@ -590,6 +860,7 @@ export default function App() {
       } catch {
         setLoginError('Unable to contact Firebase, but this session has been cleared from the portal.');
       } finally {
+        await Preferences.remove({ key: 'ruiru_last_background_at' }).catch(() => {});
         setUser(null);
         setRole(null);
         setUserProfile(null);
@@ -1069,7 +1340,7 @@ export default function App() {
       const formData = new FormData(e.target);
       const amount = parseMoney(formData.get('amount'));
       const type = formData.get('type');
-      const messageCode = formData.get('messageCode').trim().toUpperCase();
+      const messageCode = String(formData.get('messageCode') || '').trim().toUpperCase();
       const method = formData.get('method');
       const paymentDateValue = formData.get('paymentDate');
       const paymentDate = new Date(`${paymentDateValue}T12:00:00`);
@@ -1077,10 +1348,13 @@ export default function App() {
       if (!paymentDateValue || Number.isNaN(paymentDate.getTime()) || getMonthKey(paymentDate) !== paymentMonthKey) {
         throw new Error(`Choose a payment date within ${paymentCycle.month}.`);
       }
+      if (isLandlord && (!messageCode || messageCode === 'N/A')) {
+        throw new Error('Enter the transaction reference before recording this payment.');
+      }
+      if (messageCode === 'N/A') throw new Error('Enter a valid transaction reference code.');
 
       const paymentRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'payments'));
-      const isCashMethod = method.trim().toLowerCase() === 'cash';
-      const referenceRef = messageCode && !isCashMethod && messageCode !== 'N/A'
+      const referenceRef = messageCode
         ? doc(db, 'artifacts', appId, 'public', 'data', 'paymentReferences', encodeURIComponent(messageCode))
         : null;
       const isConfirmed = role === ROLES.LANDLORD;
@@ -1147,12 +1421,16 @@ export default function App() {
     } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
-  const handleConfirmPayment = async (payment) => {
+  const handleConfirmPayment = async (payment, referenceInput) => {
     if (!user || !db || role !== ROLES.LANDLORD || isProcessing) return;
     setIsProcessing(true);
+    setModalError('');
     try {
+      const messageCode = String(referenceInput || '').trim().toUpperCase();
+      if (!messageCode || messageCode === 'N/A') throw new Error('Enter a valid transaction reference before confirming this payment.');
       const paymentRef = doc(db, 'artifacts', appId, 'public', 'data', 'payments', payment.id);
       const tenantRef = doc(db, 'artifacts', appId, 'public', 'data', 'tenants', payment.tenantId);
+      const referenceRef = doc(db, 'artifacts', appId, 'public', 'data', 'paymentReferences', encodeURIComponent(messageCode));
       if (!payment.cycleId) throw new Error('This older payment has no billing cycle and needs manual review.');
       const cycleRef = documentRef('billingCycles', payment.cycleId);
       const cycleTenantRef = documentRef('tenantCycles', tenantCycleDocumentId(payment.tenantId, payment.cycleId));
@@ -1161,11 +1439,20 @@ export default function App() {
         const tenantSnapshot = await transaction.get(tenantRef);
         const cycleSnapshot = await transaction.get(cycleRef);
         const cycleTenantSnapshot = await transaction.get(cycleTenantRef);
+        const referenceSnapshot = await transaction.get(referenceRef);
         if (!paymentSnapshot.exists() || paymentSnapshot.data().status !== 'PENDING') throw new Error('This payment has already been reviewed.');
         if (!tenantSnapshot.exists() || tenantSnapshot.data().status === 'ARCHIVED') throw new Error('Tenant is no longer in the directory.');
         if (!cycleSnapshot.exists() || cycleSnapshot.data().status !== 'OPEN') throw new Error('Only payments in an open billing cycle can be confirmed.');
         if (!cycleTenantSnapshot.exists()) throw new Error('The tenant billing record for this cycle is missing.');
         const currentPayment = paymentSnapshot.data();
+        const previousCode = String(currentPayment.messageCode || '').trim().toUpperCase();
+        const previousReferenceRef = previousCode && previousCode !== 'N/A' && previousCode !== messageCode
+          ? doc(db, 'artifacts', appId, 'public', 'data', 'paymentReferences', encodeURIComponent(previousCode))
+          : null;
+        const previousReferenceSnapshot = previousReferenceRef ? await transaction.get(previousReferenceRef) : null;
+        if (referenceSnapshot.exists() && referenceSnapshot.data().paymentId !== payment.id) {
+          throw new Error('That payment reference has already been recorded.');
+        }
         const currentTenant = tenantSnapshot.data();
         const currentCycleTenant = cycleTenantSnapshot.data();
         const allocation = allocatePayment(
@@ -1180,8 +1467,14 @@ export default function App() {
           paidWater: Number(currentCycleTenant.paidWater || 0) + allocation.appliedWater,
         };
         transaction.update(paymentRef, {
-          status: 'CONFIRMED', ...allocation, updatedBy: user.uid,
+          status: 'CONFIRMED', messageCode, ...allocation, updatedBy: user.uid,
         });
+        if (!referenceSnapshot.exists()) {
+          transaction.set(referenceRef, { ...recordDefaults(), paymentId: payment.id, reference: messageCode, createdAt: new Date().toISOString() });
+        }
+        if (previousReferenceRef && previousReferenceSnapshot?.exists() && previousReferenceSnapshot.data().paymentId === payment.id) {
+          transaction.delete(previousReferenceRef);
+        }
         transaction.update(cycleTenantRef, {
           paidRent: updatedCycleTenant.paidRent,
           paidWater: updatedCycleTenant.paidWater,
@@ -1281,6 +1574,34 @@ export default function App() {
       await recordAudit('EXPENSE_CREATED', 'septic', created.id, { provider, cost: Number(costStr) });
       closeAnyModal(setIsSepticModalOpen);
     } catch(err) { setModalError(err.message); } finally { setIsProcessing(false); }
+  };
+
+  const handleLogGarbage = async (e) => {
+    e.preventDefault();
+    if (!user || !db || isProcessing) return;
+    setIsProcessing(true);
+    setModalError('');
+    try {
+      const formData = new FormData(e.target);
+      const provider = String(formData.get('provider') || '').trim();
+      const notes = String(formData.get('notes') || '').trim();
+      const date = String(formData.get('date') || '');
+      if (!provider || provider.length > 80) throw new Error('Enter a collection provider (up to 80 characters).');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('Choose a valid collection date.');
+      if (notes.length > 300) throw new Error('Notes must be 300 characters or fewer.');
+      const cost = parseMoney(formData.get('cost'), { allowZero: true });
+      const createdAt = new Date().toISOString();
+      const created = await promiseTimeout(addDoc(collectionRef('garbageLogs'), {
+        ...recordDefaults(), provider, cost, date, notes,
+        loggedBy: role, cycleId: activeCycle?.id || null, createdAt,
+      }), 5000);
+      await recordAudit('GARBAGE_COLLECTION_LOGGED', 'garbage_collection', created.id, { provider, cost, date });
+      closeAnyModal(setIsGarbageModalOpen);
+    } catch (err) {
+      setModalError(err.message || 'Could not record the garbage collection.');
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
   const handleLogWaterBill = async (e) => {
@@ -1606,7 +1927,7 @@ export default function App() {
     };
     const collectionSnapshots = await promiseTimeout(
       Promise.all([
-        'payments', 'paymentReferences', 'repairs', 'septicLogs', 'masterWaterBills',
+        'payments', 'paymentReferences', 'repairs', 'septicLogs', 'garbageLogs', 'masterWaterBills',
         'tenants', 'tenantCycles', 'billingCycles',
       ].map(collectionName => getDocs(scopedCollection(collectionName)))),
       15000,
@@ -1620,7 +1941,7 @@ export default function App() {
       (total, snapshot, index) => total + snapshot.docs.length - scopedSnapshots[index].length,
       0,
     );
-    const [paymentDocs, referenceDocs, repairDocs, septicDocs, waterBillDocs, tenantDocs, tenantCycleDocs, cycleDocs] = scopedSnapshots;
+    const [paymentDocs, referenceDocs, repairDocs, septicDocs, garbageDocs, waterBillDocs, tenantDocs, tenantCycleDocs, cycleDocs] = scopedSnapshots;
     const openCycles = cycleDocs.filter(cycle => cycle.data().status === 'OPEN');
     if (openCycles.length > 1) throw new Error('More than one billing cycle is open. Resolve the duplicate open cycles before resetting data.');
     const cycleStatusById = new Map(cycleDocs.map(cycle => [cycle.id, cycle.data().status]));
@@ -1629,6 +1950,7 @@ export default function App() {
       ...referenceDocs.map(reference => batch => batch.delete(documentRef('paymentReferences', reference.id))),
       ...repairDocs.map(repair => batch => batch.delete(documentRef('repairs', repair.id))),
       ...septicDocs.map(log => batch => batch.delete(documentRef('septicLogs', log.id))),
+      ...garbageDocs.map(log => batch => batch.delete(documentRef('garbageLogs', log.id))),
       ...waterBillDocs.map(bill => batch => batch.delete(documentRef('masterWaterBills', bill.id))),
     ];
     const tenantBalanceOperations = tenantDocs.map(tenant => batch => batch.update(documentRef('tenants', tenant.id), {
@@ -1662,7 +1984,7 @@ export default function App() {
     // update is denied, the original payment records are still available.
     await commitResetStage('monthly tenant-cycle balances', cycleResetOperations, 15);
     await commitResetStage('tenant balance totals', tenantBalanceOperations);
-    await commitResetStage('payment, reference, repair, septic, and water-invoice records', deleteOperations);
+    await commitResetStage('payment, reference, repair, septic, garbage, and water-invoice records', deleteOperations);
     await recordAudit('OPERATIONAL_DATA_RESET', 'workspace', workspaceId, { deletedPayments: paymentDocs.length });
     const skippedNotice = skippedOutOfWorkspaceRecords > 0
       ? ` ${skippedOutOfWorkspaceRecords} record(s) outside this workspace were left unchanged.`
@@ -1715,7 +2037,7 @@ export default function App() {
   // --- REBUILT ACCOUNTING MATH ENGINE ---
   const stats = (() => {
     let collectedRentRev = 0, collectedWaterRev = 0, totalJosephBonus = 0, pendingPaymentsCount = 0;
-    let totalRepairExpenses = 0, totalSepticExpenses = 0, totalMasterWaterBills = 0;
+    let totalRepairExpenses = 0, totalSepticExpenses = 0, totalGarbageExpenses = 0, totalMasterWaterBills = 0;
 
     payments.forEach(p => {
       if (p.status === 'CONFIRMED') {
@@ -1743,13 +2065,14 @@ export default function App() {
 
     repairs.forEach(r => { if (r.status === 'RESOLVED' && r.cost) totalRepairExpenses += r.cost; });
     septicLogs.forEach(s => { if (s.cost) totalSepticExpenses += s.cost; });
+    garbageLogs.forEach(log => { totalGarbageExpenses += Number(log.cost || 0); });
     masterWaterBills.forEach(m => { if (m.amount) totalMasterWaterBills += m.amount; });
     const latestWaterVaultReset = waterVaultResets[0];
     const collectedWaterSinceReset = Math.max(0, collectedWaterRev - Number(latestWaterVaultReset?.collectedWaterAtReset || 0));
     const providerBillsSinceReset = Math.max(0, totalMasterWaterBills - Number(latestWaterVaultReset?.providerBillsAtReset || 0));
     const waterReserve = collectedWaterSinceReset - providerBillsSinceReset;
     const occupiedUnits = houses.filter(h => h.status === 'OCCUPIED' || occupiedHouseIds.has(h.id)).length;
-    const totalOperatingExpensesWithRecords = totalRepairExpenses + totalSepticExpenses + expenses
+    const totalOperatingExpensesWithRecords = totalRepairExpenses + totalSepticExpenses + totalGarbageExpenses + expenses
       .filter(expense => expense.status !== 'REJECTED')
       .reduce((sum, expense) => sum + Number(expense.amount || 0), 0);
 
@@ -1759,7 +2082,7 @@ export default function App() {
       pendingPaymentsCount, totalJosephBonus, totalOperatingExpenses: totalOperatingExpensesWithRecords, totalMasterWaterBills, waterReserve,
       vacantHouses: houses.filter(h => h.status === 'VACANT' && !occupiedHouseIds.has(h.id)).length,
       openRepairs: repairs.filter(r => r.status === 'OPEN').length,
-      totalRepairExpenses, totalSepticExpenses, totalUnits: houses.length, occupiedUnits,
+      totalRepairExpenses, totalSepticExpenses, totalGarbageExpenses, totalUnits: houses.length, occupiedUnits,
       occupancyRate: houses.length ? Math.round((occupiedUnits / houses.length) * 100) : 0,
       netOperatingResult: collectedRentRev - totalOperatingExpensesWithRecords,
     };
@@ -1778,6 +2101,7 @@ export default function App() {
     let activeWaterArrears = 0;
     let totalRepairExpenses = 0;
     let totalSepticExpenses = 0;
+    let totalGarbageExpenses = 0;
     let totalMasterWaterBills = 0;
     let totalOtherExpenses = 0;
     const cycleId = viewedCycle?.id;
@@ -1804,6 +2128,9 @@ export default function App() {
     septicLogs.forEach(log => {
       if (log.cycleId === cycleId) totalSepticExpenses += Number(log.cost || 0);
     });
+    garbageLogs.forEach(log => {
+      if (log.cycleId === cycleId) totalGarbageExpenses += Number(log.cost || 0);
+    });
     masterWaterBills.forEach(bill => {
       if (bill.cycleId === cycleId) totalMasterWaterBills += Number(bill.amount || 0);
     });
@@ -1821,15 +2148,16 @@ export default function App() {
       collectedWaterRev,
       pendingPaymentsCount,
       totalJosephBonus,
-      totalOperatingExpenses: totalRepairExpenses + totalSepticExpenses + totalOtherExpenses,
+      totalOperatingExpenses: totalRepairExpenses + totalSepticExpenses + totalGarbageExpenses + totalOtherExpenses,
       totalMasterWaterBills,
       waterReserve,
       vacantHouses: houses.filter(house => house.status === 'VACANT' && !occupiedHouseIds.has(house.id)).length,
       openRepairs: repairs.filter(repair => repair.cycleId === cycleId && repair.status === 'OPEN').length,
       totalRepairExpenses,
-      totalSepticExpenses
+      totalSepticExpenses,
+      totalGarbageExpenses
     };
-  }, [viewedCycle, cyclePayments, tenantCycles, repairs, septicLogs, masterWaterBills, expenses, houses, occupiedHouseIds]);
+  }, [viewedCycle, cyclePayments, tenantCycles, repairs, septicLogs, garbageLogs, masterWaterBills, expenses, houses, occupiedHouseIds]);
 
   const billingCycleHistory = useMemo(() => billingCycles
     .filter(cycle => cycle.status === 'CLOSED')
@@ -1878,7 +2206,13 @@ export default function App() {
   )), [filteredPayments, houseNameById, tenantById]);
 
   const can = (permission) => hasPermission(role, permission, userProfile?.permissions);
-  const paymentMethods = userProfile?.paymentMethods || ['M-Pesa', 'Bank Transfer', 'Cash', 'Other'];
+  const paymentMethods = useMemo(() => {
+    const configured = Array.isArray(userProfile?.paymentMethods)
+      ? userProfile.paymentMethods
+      : ['M-Pesa', 'Bank Transfer', 'Other'];
+    const available = configured.filter(method => typeof method === 'string' && method.trim() && method.trim().toLowerCase() !== 'cash');
+    return available.length ? available : ['M-Pesa', 'Bank Transfer', 'Other'];
+  }, [userProfile]);
 
   const navItems = [
     { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, permission: PERMISSIONS.VIEW_DASHBOARD },
@@ -1900,6 +2234,29 @@ export default function App() {
         <div className={`animate-spin rounded-full h-12 w-12 border-4 border-t-transparent shadow-lg ${theme === 'dark' ? 'border-slate-400' : 'border-gray-800'}`}></div>
         <p className={`font-bold text-sm tracking-widest uppercase opacity-80 animate-pulse ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>Ruiru Rentals Syncing...</p>
       </div>
+    );
+  }
+
+  if (user && isAppLocked) {
+    return (
+      <main className={`flex min-h-[100svh] items-center justify-center px-5 py-10 ${theme === 'dark' ? 'bg-[#171717] text-slate-100' : 'bg-[#f6f4ef] text-slate-900'}`}>
+        <section className={`w-full max-w-md rounded-2xl border p-8 text-center shadow-xl ${theme === 'dark' ? 'border-[#383838] bg-[#1f1f1f]' : 'border-[#e7e1d7] bg-[#fffdf9]'}`}>
+          <div className={`mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-full ${theme === 'dark' ? 'bg-[#303030] text-slate-100' : 'bg-[#eee9df] text-slate-800'}`}>
+            <Fingerprint size={34} aria-hidden="true" />
+          </div>
+          <h1 className="text-2xl font-semibold">Ruiru Rentals is locked</h1>
+          <p className={`mt-2 text-sm ${theme === 'dark' ? 'text-slate-300' : 'text-slate-600'}`}>
+            Use your {biometricLabel} to return to your workspace.
+          </p>
+          {biometricError && <p role="alert" className="mt-5 rounded-lg border border-rose-300 bg-rose-50 px-3 py-2 text-sm text-rose-700">{biometricError}</p>}
+          <button type="button" onClick={() => void requestBiometricUnlock()} className={`mt-6 flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3.5 text-sm font-semibold text-white ${theme === 'dark' ? 'bg-[#383838] hover:bg-[#505050]' : 'bg-slate-900 hover:bg-slate-800'}`}>
+            <Fingerprint size={18} aria-hidden="true" /> Unlock with {biometricLabel}
+          </button>
+          <button type="button" onClick={handleLogout} className={`mt-3 w-full rounded-xl px-4 py-3 text-sm font-semibold transition ${theme === 'dark' ? 'text-slate-300 hover:bg-white/5' : 'text-slate-600 hover:bg-black/5'}`}>
+            Sign in with password instead
+          </button>
+        </section>
+      </main>
     );
   }
 
@@ -1935,10 +2292,10 @@ export default function App() {
                 <p className={`mt-1 text-sm leading-5 ${theme === 'dark' ? 'text-slate-400' : 'text-slate-600'}`}>Use your authorized account to access the portal.</p>
               </div>
 
-              {loginError && (
+              {loginFeedback && (
               <p role="alert" className={`mb-5 flex items-start gap-2.5 rounded-xl border px-3.5 py-3 text-sm leading-5 ${theme === 'dark' ? 'border-rose-900/80 bg-rose-950/50 text-rose-300' : 'border-rose-200 bg-rose-50 text-rose-700'}`}>
                   <AlertCircle size={17} className="mt-0.5 shrink-0" />
-                  <span>{loginError}</span>
+                  <span>{loginFeedback}</span>
                 </p>
               )}
 
@@ -1959,7 +2316,7 @@ export default function App() {
                     </button>
                   </div>
                 </div>
-                <button type="submit" disabled={isProcessing} className={`flex w-full items-center justify-center gap-2 rounded-xl py-3.5 text-sm font-bold text-white shadow-sm transition focus-visible:outline-emerald-600 disabled:cursor-not-allowed disabled:opacity-50 ${theme === 'dark' ? 'bg-[#383838] hover:bg-[#505050]' : 'bg-slate-900 hover:bg-slate-800'}`}>
+                <button type="submit" disabled={isProcessing || loginLockoutSeconds > 0} className={`flex w-full items-center justify-center gap-2 rounded-xl py-3.5 text-sm font-bold text-white shadow-sm transition focus-visible:outline-emerald-600 disabled:cursor-not-allowed disabled:opacity-50 ${theme === 'dark' ? 'bg-[#383838] hover:bg-[#505050]' : 'bg-slate-900 hover:bg-slate-800'}`}>
                   {isProcessing ? <div className="h-5 w-5 animate-spin rounded-full border-2 border-white border-t-transparent" /> : 'Sign in to your workspace'}
                 </button>
               </form>
@@ -1980,10 +2337,7 @@ export default function App() {
               </button>
             </div>
             <p className={`mt-5 text-center text-xs ${theme === 'dark' ? 'text-slate-400' : 'text-slate-600'}`}><span className="inline-flex items-center gap-1.5"><ShieldCheck size={14} />Secure sign-in for authorized users</span></p>
-            <p className={`mt-2 text-center text-sm font-semibold ${theme === 'dark' ? 'text-slate-200' : 'text-[#34483b]'}`}>
-              <span className="mr-1">Portfolio:</span>
-              <PortfolioLink theme={theme}>www.Gikunjucreates.work.gd</PortfolioLink>
-            </p>
+            <p className="mt-2 text-center"><PortfolioLink theme={theme}>@Gikunjucreates</PortfolioLink></p>
           </div>
         </section>
       </main>
@@ -2265,25 +2619,19 @@ export default function App() {
                   ) : (
                     <div className="space-y-3">
                       {cyclePayments.filter(p => p.status === 'PENDING').map(p => (
-                        <div key={p.id} className={`flex flex-col sm:flex-row sm:items-center justify-between p-4 rounded-xl border gap-4 transition-all hover:shadow-md ${theme === 'dark' ? 'bg-slate-950 border-slate-800' : 'bg-[#FDFBF7] border-[#E8DFCE]'}`}>
+                        <form key={p.id} onSubmit={event => { event.preventDefault(); handleConfirmPayment(p, new FormData(event.currentTarget).get('messageCode')); }} className={`flex flex-col sm:flex-row sm:items-center justify-between p-4 rounded-xl border gap-4 transition-all hover:shadow-md ${theme === 'dark' ? 'bg-slate-950 border-slate-800' : 'bg-[#FDFBF7] border-[#E8DFCE]'}`}>
                           <div>
                             <p className={`font-bold text-lg ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{p.tenantName}</p>
                             <p className="text-xs text-gray-500 font-semibold">{p.type === 'COMBINED' ? 'Rent & Water Combined' : p.type} via {p.method}</p>
-                            {p.messageCode && (
-                              <p className={`text-[10px] font-mono font-bold mt-1.5 inline-block px-2 py-1 rounded-md border ${theme === 'dark' ? 'bg-white/10 text-gray-300 border-white/10' : 'bg-black/5 text-gray-700 border-black/10'}`}>Ref: {p.messageCode}</p>
-                            )}
                           </div>
-                          <div className="flex items-center justify-between sm:justify-end gap-4">
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between sm:justify-end gap-3">
                             <span className={`font-black text-xl ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{formatKes(p.amount)}</span>
-                            <button 
-                              onClick={() => handleConfirmPayment(p)} 
-                              disabled={isProcessing || isHistoricalCycleView}
-                              className="bg-gray-800 hover:bg-gray-900 text-white px-5 py-2.5 rounded-xl text-sm font-bold transition-all disabled:bg-gray-400 flex items-center gap-2"
-                            >
+                            <input required name="messageCode" defaultValue={p.messageCode || ''} aria-label={`Reference code for ${p.tenantName}`} type="text" placeholder="Transaction reference" className={`w-full sm:w-48 border rounded-lg px-3 py-2 text-xs font-mono uppercase outline-none focus:ring-2 focus:ring-gray-500 ${theme === 'dark' ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-[#DCD4C6] text-gray-900'}`} />
+                            <button type="submit" disabled={isProcessing || isHistoricalCycleView} className="bg-gray-800 hover:bg-gray-900 text-white px-5 py-2.5 rounded-xl text-sm font-bold transition-all disabled:bg-gray-400 flex items-center gap-2">
                               {isProcessing ? 'Processing...' : 'Confirm'}
                             </button>
                           </div>
-                        </div>
+                        </form>
                       ))}
                     </div>
                   )}
@@ -2442,9 +2790,14 @@ export default function App() {
             {activeTab === 'billing' && (
               <div className="space-y-8 animate-in fade-in duration-500">
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
-                  <div>
-                    <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Billing & Payments</h2>
-                    <p className="mt-1 text-sm font-medium text-gray-500">{activeCycle ? `Balances for ${activeCycle.month}` : 'No billing cycle is currently open.'}</p>
+                  <div className="flex items-start gap-3">
+                    <button type="button" onClick={() => setActiveTab('dashboard')} aria-label="Back to dashboard" className={`mt-0.5 inline-flex shrink-0 items-center gap-2 rounded-lg border px-3 py-2 text-sm font-semibold transition-colors ${theme === 'dark' ? 'border-[#505050] text-slate-200 hover:bg-[#292929]' : 'border-[#d8d2c8] text-[#34483b] hover:bg-white'}`}>
+                      <ArrowLeft size={16} aria-hidden="true" /> Back
+                    </button>
+                    <div>
+                      <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Billing & Payments</h2>
+                      <p className="mt-1 text-sm font-medium text-gray-500">{activeCycle ? `Balances for ${activeCycle.month}` : 'No billing cycle is currently open.'}</p>
+                    </div>
                   </div>
                 </div>
 
@@ -2503,7 +2856,7 @@ export default function App() {
                             )}
 
                             {pendingPayments.map(pendingPayment => (
-                              <div key={pendingPayment.id} className="mb-4 bg-amber-500/10 border border-amber-500/20 p-3.5 rounded-xl shadow-sm">
+                              <form key={pendingPayment.id} onSubmit={event => { event.preventDefault(); handleConfirmPayment(pendingPayment, new FormData(event.currentTarget).get('messageCode')); }} className="mb-4 bg-amber-500/10 border border-amber-500/20 p-3.5 rounded-xl shadow-sm">
                                 <h5 className={`text-xs font-black flex items-center gap-1.5 mb-1.5 uppercase tracking-wider ${theme === 'dark' ? 'text-amber-500' : 'text-amber-600'}`}><Clock size={14}/> Pending Approval</h5>
                                 <div className={`text-[11px] space-y-1 font-semibold flex justify-between ${theme === 'dark' ? 'text-slate-400' : 'text-gray-600'}`}>
                                   <div>
@@ -2516,15 +2869,15 @@ export default function App() {
                                   </div>
                                 </div>
                                 {canApproveRent && (
-                                  <button 
-                                    onClick={() => handleConfirmPayment(pendingPayment)} 
-                                    disabled={isProcessing || !activeCycle || pendingPayment.cycleId !== activeCycle.id}
-                                    className="w-full mt-3 bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs py-2 rounded-lg transition-all disabled:opacity-50 shadow-sm"
-                                  >
-                                    {isProcessing ? 'Processing...' : 'Confirm & Update Balances'}
-                                  </button>
+                                  <>
+                                    <label className={`block mt-3 mb-1 text-[10px] font-bold uppercase tracking-wider ${theme === 'dark' ? 'text-amber-300' : 'text-amber-800'}`} htmlFor={`pending-reference-${pendingPayment.id}`}>Transaction reference required to confirm</label>
+                                    <input id={`pending-reference-${pendingPayment.id}`} required name="messageCode" defaultValue={pendingPayment.messageCode || ''} type="text" placeholder="Enter reference code" className={`w-full border rounded-lg px-3 py-2 text-xs font-mono uppercase outline-none focus:ring-2 focus:ring-amber-500 ${theme === 'dark' ? 'bg-slate-950 border-slate-700 text-white' : 'bg-white border-amber-200 text-gray-900'}`} />
+                                    <button type="submit" disabled={isProcessing || !activeCycle || pendingPayment.cycleId !== activeCycle.id} className="w-full mt-3 bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs py-2 rounded-lg transition-all disabled:opacity-50 shadow-sm">
+                                      {isProcessing ? 'Processing...' : 'Confirm & Update Balances'}
+                                    </button>
+                                  </>
                                 )}
-                              </div>
+                              </form>
                             ))}
                           </div>
 
@@ -2649,7 +3002,7 @@ export default function App() {
               <div className="space-y-6 animate-in fade-in duration-500">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                   <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Repairs & Operations</h2>
-                  <div className="flex gap-2">
+                  <div className="flex flex-wrap gap-2">
                     <button onClick={() => { setModalError(''); setIsSepticModalOpen(true); }} className="bg-gray-800 hover:bg-gray-900 text-white px-5 py-2.5 rounded-xl text-sm font-bold flex items-center gap-2 shadow-sm transition-all hover:shadow-md"><Truck size={18}/> Log Septic Cleanout</button>
                     <button onClick={() => { setModalError(''); setIsRepairModalOpen(true); }} className="bg-rose-600 hover:bg-rose-700 text-white px-5 py-2.5 rounded-xl text-sm font-bold flex items-center gap-2 shadow-sm transition-all hover:shadow-md"><Plus size={18}/> Log Issue</button>
                   </div>
@@ -2727,16 +3080,50 @@ export default function App() {
                     </table>
                   </div>
                 </div>
+
+                <div className={`rounded-2xl border overflow-hidden shadow-sm mt-8 ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
+                  <div className={`p-5 border-b flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${theme === 'dark' ? 'bg-slate-950 border-slate-800' : 'bg-[#FDFBF7] border-[#E8DFCE]'}`}>
+                    <div>
+                      <h3 className={`font-bold flex items-center gap-2 text-lg ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}><Trash2 size={20}/> Garbage Collection</h3>
+                      <p className="mt-1 text-sm text-gray-500">Collection dates, service providers, costs, and notes.</p>
+                    </div>
+                    <button type="button" onClick={() => { setModalError(''); setIsGarbageModalOpen(true); }} className="self-start sm:self-auto rounded-lg bg-gray-800 px-4 py-2 text-sm font-semibold text-white hover:bg-gray-900">Log Collection</button>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full min-w-150 text-left text-sm">
+                      <thead className={`border-b ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-slate-400' : 'bg-[#FDFBF7] border-[#E8DFCE] text-gray-500'}`}>
+                        <tr>
+                          <th className="p-4 font-bold">Collection Date</th>
+                          <th className="p-4 font-bold">Service Provider</th>
+                          <th className="p-4 font-bold">Cost</th>
+                          <th className="p-4 font-bold">Notes</th>
+                          <th className="p-4 font-bold">Logged By</th>
+                        </tr>
+                      </thead>
+                      <tbody className={`divide-y ${theme === 'dark' ? 'divide-slate-800' : 'divide-[#E8DFCE]'}`}>
+                        {garbageLogs.length === 0 && (
+                          <tr><td colSpan="5" className="p-8 text-center font-medium text-gray-500">No garbage collections logged yet.</td></tr>
+                        )}
+                        {garbageLogs.map(log => (
+                          <tr key={log.id} className={`transition ${theme === 'dark' ? 'hover:bg-slate-950/40' : 'hover:bg-[#FDFBF7]'}`}>
+                            <td className="p-4 font-medium text-gray-500">{new Date(log.date).toLocaleDateString('en-KE', { timeZone: DEFAULT_TIMEZONE })}</td>
+                            <td className={`p-4 font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{log.provider}</td>
+                            <td className={`p-4 font-mono font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{formatKes(log.cost)}</td>
+                            <td className={`max-w-xs whitespace-normal p-4 ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>{log.notes || '—'}</td>
+                            <td className="p-4 text-gray-500">{log.loggedBy}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
               </div>
             )}
           </div>
 
           <footer className={`mt-10 py-6 border-t text-center text-sm font-medium flex flex-col gap-1 items-center justify-center transition-colors ${theme === 'dark' ? 'border-slate-800 text-slate-500' : 'border-[#E8DFCE] text-gray-500'}`}>
             <p>&copy; {new Date().getFullYear()} Ruiru Rentals. All rights reserved.</p>
-            <p className={`text-sm font-semibold ${theme === 'dark' ? 'text-slate-200' : 'text-[#34483b]'}`}>
-              <span className="mr-1">@Gikunju creates ·</span>
-              <PortfolioLink theme={theme}>www.Gikunjucreates.work.gd</PortfolioLink>
-            </p>
+            <p><PortfolioLink theme={theme}>@Gikunjucreates</PortfolioLink></p>
           </footer>
 
         </main>
@@ -3054,7 +3441,8 @@ export default function App() {
             <form onSubmit={handleLogPayment} className="space-y-5">
               <div>
                 <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Transaction Ref / Code</label>
-                <input required name="messageCode" type="text" placeholder="e.g. QKX2T1... or 'CASH'" className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 font-mono uppercase font-bold transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`} />
+                <input required={isLandlord} name="messageCode" type="text" placeholder="e.g. QKX2T1..." className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 font-mono uppercase font-bold transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`} />
+                {!isLandlord && <p className="mt-1.5 text-xs text-gray-500">If the reference is unavailable, leave this blank. The landlord must enter it before confirming the payment.</p>}
               </div>
               <div>
                 <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Payment Date</label>
@@ -3176,6 +3564,41 @@ export default function App() {
               </div>
               <button type="submit" disabled={isProcessing} className="w-full bg-gray-800 hover:bg-gray-900 text-white font-bold py-3.5 rounded-xl mt-6 disabled:opacity-50 transition-all shadow-md hover:shadow-lg">
                 {isProcessing ? 'Recording...' : 'Record Expense'}
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {isGarbageModalOpen && (
+        <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={() => closeAnyModal(setIsGarbageModalOpen)}>
+          <div role="dialog" aria-modal="true" aria-labelledby="garbage-dialog-title" className={`w-full max-w-md rounded-2xl border p-6 shadow-2xl ${theme === 'dark' ? 'border-slate-800 bg-slate-900 text-white' : 'border-[#E8DFCE] bg-[#FDFBF7] text-gray-900'}`} onClick={event => event.stopPropagation()}>
+            <div className="mb-5 flex items-center justify-between gap-3">
+              <div>
+                <h3 id="garbage-dialog-title" className="text-xl font-bold">Log Garbage Collection</h3>
+                <p className="mt-1 text-sm text-gray-500">Record a pickup and its cost.</p>
+              </div>
+              <button type="button" onClick={() => closeAnyModal(setIsGarbageModalOpen)} className={`rounded-lg p-2 ${theme === 'dark' ? 'text-gray-300 hover:bg-white/5' : 'text-gray-500 hover:bg-black/5'}`} aria-label="Close garbage collection form"><X size={18}/></button>
+            </div>
+            <form onSubmit={handleLogGarbage} className="space-y-4">
+              <div>
+                <label htmlFor="garbage-date" className="mb-1.5 block text-xs font-semibold text-gray-500">Collection date</label>
+                <input id="garbage-date" name="date" type="date" required defaultValue={new Date().toLocaleDateString('en-CA', { timeZone: DEFAULT_TIMEZONE })} className={`w-full rounded-lg border p-2.5 text-sm outline-none focus:ring-2 focus:ring-amber-600/40 ${theme === 'dark' ? 'border-[#303030] bg-[#0A0A0A] text-white' : 'border-[#E5E5E5] bg-white text-gray-900'}`} />
+              </div>
+              <div>
+                <label htmlFor="garbage-provider" className="mb-1.5 block text-xs font-semibold text-gray-500">Service provider</label>
+                <input id="garbage-provider" name="provider" required maxLength="80" placeholder="Provider or collector" className={`w-full rounded-lg border p-2.5 text-sm outline-none focus:ring-2 focus:ring-amber-600/40 ${theme === 'dark' ? 'border-[#303030] bg-[#0A0A0A] text-white' : 'border-[#E5E5E5] bg-white text-gray-900'}`} />
+              </div>
+              <div>
+                <label htmlFor="garbage-cost" className="mb-1.5 block text-xs font-semibold text-gray-500">Cost ({DEFAULT_CURRENCY})</label>
+                <input id="garbage-cost" name="cost" type="number" min="0" step="0.01" required defaultValue="0" className={`w-full rounded-lg border p-2.5 text-sm outline-none focus:ring-2 focus:ring-amber-600/40 ${theme === 'dark' ? 'border-[#303030] bg-[#0A0A0A] text-white' : 'border-[#E5E5E5] bg-white text-gray-900'}`} />
+              </div>
+              <div>
+                <label htmlFor="garbage-notes" className="mb-1.5 block text-xs font-semibold text-gray-500">Notes (optional)</label>
+                <textarea id="garbage-notes" name="notes" maxLength="300" rows="3" placeholder="Pickup details" className={`w-full resize-y rounded-lg border p-2.5 text-sm outline-none focus:ring-2 focus:ring-amber-600/40 ${theme === 'dark' ? 'border-[#303030] bg-[#0A0A0A] text-white' : 'border-[#E5E5E5] bg-white text-gray-900'}`} />
+              </div>
+              <button type="submit" disabled={isProcessing} className="w-full rounded-lg bg-gray-800 py-3 text-sm font-semibold text-white hover:bg-gray-900 disabled:opacity-50">
+                {isProcessing ? 'Saving…' : 'Save collection log'}
               </button>
             </form>
           </div>

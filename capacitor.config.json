@@ -1,5 +1,11 @@
 {
   "appId": "ke.co.houseapprentals",
   "appName": "Ruiru Rentals",
-  "webDir": "dist"
+  "webDir": "dist",
+  "plugins": {
+    "FirebaseAuthentication": {
+      "providers": ["google.com"],
+      "skipNativeAuth": true
+    }
+  }
 }

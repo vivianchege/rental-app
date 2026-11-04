@@ -1,0 +1,47 @@
+{
+  "project_info": {
+    "project_number": "385727030262",
+    "project_id": "hse-app-b1d2b",
+    "storage_bucket": "hse-app-b1d2b.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:385727030262:android:9382cc3e3c9c1552905dd7",
+        "android_client_info": {
+          "package_name": "ke.co.houseapprentals"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "385727030262-tbafd6g27g9juq989ret1mi5lp7j5v6v.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "ke.co.houseapprentals",
+            "certificate_hash": "c52feafd2cb38a9084e030dc4f1fa2e357cb4729"
+          }
+        },
+        {
+          "client_id": "385727030262-8q6rvk2998qncb8huei8m98ic1n1gtvt.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDw-j76N9tVwUZGrFjy0V_O8h_usA1Xgxs"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "385727030262-8q6rvk2998qncb8huei8m98ic1n1gtvt.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

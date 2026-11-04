@@ -1,57 +1,95 @@
-# House Management Portal
+# Ruiru Rentals
 
-A React/Vite property-operations workspace for landlords and house managers. The current application uses Firebase Authentication and Cloud Firestore and keeps the existing data collections used by the started project.
+Ruiru Rentals is a React and Capacitor property-management app for landlords and managers. The website and Android APK use Firebase Authentication and Cloud Firestore.
 
-## Architecture
+## What it includes
 
-- `src/App.jsx` contains the existing portal shell, screens, Firestore subscriptions, and workflows.
-- `src/lib/money.js` contains minor-unit money validation and payment allocation.
-- `src/lib/permissions.js` contains role and permission definitions used by the UI.
-- `firestore.rules` is the server-side authorization boundary. Frontend checks are only for usability.
-- Firestore data is currently stored under `artifacts/{projectId}/public/data/{collection}` to preserve the existing project schema.
+- Landlord and manager workspaces with role-based access.
+- Houses and units, tenant directory, rent and water billing, payment ledger, expenses, utilities, maintenance, reports, and activity history.
+- Past-month billing entry for the landlord and manager rent/water logging with landlord review.
+- Repairs & Operations includes house repairs, septic cleanouts, and a garbage collection log. Managers can record pickups; recorded collection costs are included in operating expense totals.
+- Payment reference checks: landlord-entered payments require a reference; managers can submit a pending payment without one, but the landlord must enter a reference before confirming it. References cannot be reused. Cash is not offered as a rent-payment method.
+- Responsive light and dark themes, with the Ruiru Rentals logo in the Android app drawer.
+- Native Google sign-in in Android and browser Google sign-in on the website.
+- Android ledger Back control and system Back navigation.
 
-The application supports the roles `LANDLORD` and `MANAGER`. A role must be supplied through a Firebase custom claim or a protected `users/{uid}` document. A manager should also have a `workspaceId` matching the landlord workspace and only the assigned property/unit records should be written into that workspace.
+## Sign-in and app security
 
-For migration compatibility, the current build recognizes the three existing account UIDs through the optional legacy UID values in `.env.example` and `firestore.rules`. Create the `users/{uid}` profiles below as soon as possible, then remove the legacy UID bridge from both files.
+- Firebase Authentication handles passwords. The app never stores them.
+- On Android devices with enrolled biometrics, the app locks each time it goes to the background and prompts for the device's available biometric when reopened. The operating system chooses the available biometric; a password sign-in is available if biometric unlock is cancelled or unavailable.
+- Without enrolled biometrics, an Android session expires after 15 minutes in the background and asks the user to sign in again.
+- Five incorrect password attempts trigger a local cooldown of 30 seconds, then 1 minute, 3 minutes, 5 minutes, 15 minutes, 30 minutes, 1 hour, and 5 hours. Later failed attempts remain at 5 hours. A successful password sign-in clears the counter. Firebase also applies its own server-side protections.
+- These local session and cooldown settings are stored with Capacitor Preferences on Android and browser storage on the web. They do not contain passwords.
 
-## Setup
+## Firebase configuration
 
-1. Install Node.js 20 or newer.
-2. Run `npm install`.
-3. Copy `.env.example` to `.env` and fill in the Firebase web-app values.
-4. Deploy `firestore.rules` with `firebase deploy --only firestore:rules` from this directory.
-5. Create the first landlord profile in a trusted administrative process. Do not let the browser promote a user to landlord.
+The public Firebase client settings for the registered web app are in `src/lib/firebaseClientConfig.js`; Android's registered app settings are in `android/app/google-services.json`. Firebase documents these client configuration values as public identifiers. They are not authorization credentials. Firestore rules and authenticated roles protect the data.
 
-Example profile shape:
+You can override the web settings for another environment by copying `.env.example` to `.env.local` and setting the six `VITE_FIREBASE_*` values. Never put service-account keys, private OAuth secrets, or other server credentials in a Vite variable or browser bundle.
 
-```json
-{
-  "role": "LANDLORD",
-  "workspaceId": "your-workspace-id",
-  "permissions": []
-}
-```
+The Firestore schema remains under `artifacts/{projectId}/public/data/{collection}`. `firestore.rules` is the server-side authorization boundary; client-side role checks only control the interface.
 
-For a manager, use `role: "MANAGER"` and assign only the permitted workspace/property scope. Existing legacy documents without `workspaceId`, `createdBy`, or `updatedBy` need a reviewed migration before production rules are enabled.
+### Roles
 
-## Environment variables
+Users need a Firebase custom claim or protected `users/{uid}` document with role `LANDLORD` or `MANAGER`. Manager profiles must be assigned to the correct landlord `workspaceId`. Do not let the browser promote an account to landlord. The current app retains compatibility with the existing legacy account UIDs while profiles are migrated.
 
-See `.env.example` for placeholders. Required values are the six `VITE_FIREBASE_*` variables. Optional defaults are:
-
-- `VITE_DEFAULT_CURRENCY=KES`
-- `VITE_DEFAULT_TIMEZONE=Africa/Nairobi`
-
-Firebase web API keys are identifiers, not authorization controls. Firestore rules and authenticated role data are the security boundary. Never put service-account credentials in Vite environment variables or the browser bundle.
-
-## Development
+Deploy rule changes to the project with:
 
 ```bash
+npx firebase-tools deploy --only firestore:rules --project hse-app-b1d2b
+```
+
+## Run the website locally
+
+Requirements: Node.js 20 or newer.
+
+```bash
+npm install
 npm run dev
 ```
 
-The app will show a configuration message when the Firebase variables are missing rather than attempting to initialize an incomplete client.
+## Build and install the Android APK
 
-## Verification
+The package name is `ke.co.houseapprentals`. Both builds support Android 7.0+ (API 24+) and use the Ruiru Rentals logo. The standard download is recommended for Android 10+ (API 29+) and uses Google Credential Manager. The older-device download is recommended for Android 7–9 (API 24–28), including the Galaxy S8 generation, and uses Google Play Services sign-in. Both use Tailwind CSS 3.4 and JavaScript output targeted to Chrome 72 for older Android WebViews. Keep Chrome updated on Android 7–9 because Chrome supplies WebView on those devices.
+
+### Download
+
+- [Android 10 and newer](https://github.com/vivianchege/rental-app/releases/latest/download/Ruiru-Rentals-1.4-Android-10-plus.apk)
+- [Android 7–9, including Galaxy S8](https://github.com/vivianchege/rental-app/releases/latest/download/Ruiru-Rentals-1.4-Android-7-to-9.apk)
+
+The older-device APK was smoke-tested on an Android 9 Samsung SM-J337A handset. A physical Galaxy S8 was not available for testing.
+
+Both APKs have the same app ID and signing identity. Installing one updates/replaces the other while retaining the device's app data. The APKs are signed debug builds for direct installation and private sharing; they are not Play Store release builds.
+
+### Build locally
+
+Use Android Studio's bundled JDK and install Android SDK/platform tools. From the project root, build the standard APK:
+
+```bash
+npm install
+npm run build
+npx cap sync android
+```
+
+In PowerShell, build and save both signed APKs:
+
+```powershell
+Push-Location android
+.\gradlew.bat assembleDebug
+Copy-Item .\app\build\outputs\apk\debug\app-debug.apk .\app\build\outputs\apk\debug\Ruiru-Rentals-1.4-Android-10-plus.apk
+Pop-Location
+
+npm run build -- --mode android-legacy
+npx cap sync android
+Push-Location android
+.\gradlew.bat assembleDebug -PlegacyGoogleAuth=true
+Copy-Item .\app\build\outputs\apk\debug\app-debug.apk .\app\build\outputs\apk\debug\Ruiru-Rentals-1.4-Android-7-to-9.apk
+Pop-Location
+```
+
+The current Android version is **1.4** (version code **5**; the older-device APK displays **1.4-legacy**). Both builds use the local Android debug signing key so they can update the app already installed from this development machine. To sign with another key, add that key's SHA-1 fingerprint to the Android app in Firebase Console and download the refreshed `google-services.json`.
+
+## Checks
 
 ```bash
 npm run lint
@@ -59,27 +97,16 @@ npm test
 npm run build
 ```
 
-The critical money helpers are isolated in `src/lib/money.js` and covered by the built-in Node test runner.
+The Node test suite covers money allocation, workspace access, and the password cooldown schedule.
 
-## Data integrity and security notes
+## Project layout
 
-- Passwords are handled by Firebase Authentication; the app does not store passwords.
-- Password reset feedback is generic so it does not reveal whether an email exists.
-- Role resolution is based on custom claims or protected user profiles, not an email allowlist in source code.
-- Move-in, payment confirmation, tenant archival, and maintenance completion use Firestore transactions where multiple records must remain consistent.
-- Payment references are reserved transactionally to prevent duplicate processing.
-- Tenant removal is archival; financial history is not deleted.
-- Confirmed payments are used for financial totals. Overpayments are retained as `excessAmount`/credit instead of being discarded.
-- Audit records are appended to `auditLogs`; normal UI actions do not edit or delete them.
-- Financial calculations use integer minor units inside the money helper. Existing Firestore records remain in configured currency units for compatibility.
-- File/document upload workflows, scheduled rent generation, CSV/PDF exports, server-side rate limiting, and automated backup/restore are not yet implemented in this client-only repository.
+- `src/App.jsx` — portal screens, authentication, Firestore subscriptions, and app workflows.
+- `src/lib/firebaseClientConfig.js` — public Firebase web-app configuration.
+- `src/lib/money.js` — money validation and payment allocation.
+- `src/lib/permissions.js` — roles and permissions.
+- `src/lib/authSecurity.js` — app idle timeout and password cooldown calculations.
+- `firestore.rules` — Firestore authorization and data validation.
+- `android/` — Capacitor Android project and APK build configuration.
 
-## Production deployment
-
-Build the web application with `npm run build`, then deploy the generated `dist` directory through the chosen static host. Configure Firebase Authentication authorized domains and deploy Firestore rules before exposing the app.
-
-For backup and recovery, configure Firebase scheduled exports to a protected Cloud Storage bucket. Do not expose Firestore export files or local database files through the static site. Review and migrate legacy records before turning on the strict workspace rules.
-
-## Known limitations
-
-This repository is a browser client, not a complete backend service. Sensitive workflows that require trusted server credentials, scheduled jobs, file scanning, rate limiting, or administrator-only user provisioning should be moved to Cloud Functions or another authenticated backend before production use with real financial records.
+Financial totals use confirmed payments. Overpayments are retained as credit, duplicate transaction references are blocked, and tenant removal archives records rather than deleting financial history. Audit records are appended to `auditLogs`.
