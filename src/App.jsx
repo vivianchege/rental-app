@@ -100,6 +100,7 @@ const DATA_COLLECTION_LABELS = {
   septicLogs: 'septic logs', garbageLogs: 'garbage collection logs', masterWaterBills: 'water bills', waterVaultResets: 'water vault',
   expenses: 'expenses', auditLogs: 'activity history', notifications: 'notifications',
   billingCycles: 'billing cycles', tenantCycles: 'tenant billing records',
+  tenantChangeRequests: 'tenant approval requests',
 };
 const sortByDateDescending = (records, field = 'date') => (
   [...records].sort((left, right) => new Date(right[field] || 0) - new Date(left[field] || 0))
@@ -270,6 +271,7 @@ export default function App() {
   const [expenses, setExpenses] = useState([]);
   const [activityLogs, setActivityLogs] = useState([]);
   const [notifications, setNotifications] = useState([]);
+  const [tenantChangeRequests, setTenantChangeRequests] = useState([]);
 
   const isLandlord = hasPermission(role, PERMISSIONS.MANAGE_SETTINGS);
   const canManageProperties = hasPermission(role, PERMISSIONS.MANAGE_PROPERTIES);
@@ -324,6 +326,7 @@ export default function App() {
     setExpenses([]);
     setActivityLogs([]);
     setNotifications([]);
+    setTenantChangeRequests([]);
     setBillingCycles([]);
     setTenantCycles([]);
     setSyncIssues([]);
@@ -632,6 +635,7 @@ export default function App() {
     subscribe('expenses', setExpenses, 'date');
     if (role === ROLES.LANDLORD) subscribe('auditLogs', setActivityLogs, 'timestamp');
     subscribe('notifications', setNotifications, 'createdAt');
+    subscribe('tenantChangeRequests', setTenantChangeRequests, 'requestedAt');
     subscribe('billingCycles', setBillingCycles, null, records => records.sort((left, right) => new Date(right.openedAt || 0) - new Date(left.openedAt || 0)));
     subscribe('tenantCycles', setTenantCycles);
 
@@ -651,6 +655,13 @@ export default function App() {
     .filter(cycle => cycle.cycleId === viewedCycle?.id)
     .sort((left, right) => compareNatural(left.tenantName, right.tenantName)), [tenantCycles, viewedCycle]);
   const activeTenants = useMemo(() => tenants.filter(t => t.status !== 'ARCHIVED' && !t.archivedAt), [tenants]);
+  const visibleTenantChangeRequests = useMemo(() => tenantChangeRequests
+    .filter(request => isLandlord ? request.status === 'PENDING' : request.createdBy === user?.uid)
+    .sort((left, right) => new Date(right.requestedAt || 0) - new Date(left.requestedAt || 0)),
+  [tenantChangeRequests, isLandlord, user]);
+  const pendingTenantCreationHouseIds = useMemo(() => new Set(tenantChangeRequests
+    .filter(request => request.action === 'CREATE_TENANT' && request.status === 'PENDING')
+    .map(request => request.houseId)), [tenantChangeRequests]);
   const activeTenantCycles = useMemo(() => new Map(
     tenantCycles.filter(cycle => cycle.cycleId === activeCycle?.id).map(cycle => [cycle.tenantId, cycle])
   ), [tenantCycles, activeCycle]);
@@ -1183,9 +1194,38 @@ export default function App() {
     try {
       const formData = new FormData(e.target);
       const houseId = formData.get('houseId');
-      
+
       if (!houseId) throw new Error("Please select an available vacant house unit.");
       if (occupiedHouseIds.has(houseId)) throw new Error("That house unit has just been occupied.");
+      if (pendingTenantCreationHouseIds.has(houseId)) throw new Error('A registration request for that unit is already waiting for landlord approval.');
+      const name = String(formData.get('name') || '').trim();
+      const phone = String(formData.get('phone') || '').trim();
+      const contactPref = String(formData.get('contactPref') || '').trim();
+      if (!name || name.length > 120) throw new Error('Enter a tenant name of up to 120 characters.');
+      if (!phone || phone.length > 40) throw new Error('Enter a phone number of up to 40 characters.');
+
+      if (role === ROLES.MANAGER) {
+        const tenantRef = doc(collectionRef('tenants'));
+        const requestData = {
+          ...recordDefaults(),
+          action: 'CREATE_TENANT',
+          status: 'PENDING',
+          tenantId: tenantRef.id,
+          tenantName: name,
+          phone,
+          contactPref,
+          houseId,
+          requestedByName: String(user.displayName || user.email || user.uid).slice(0, 120),
+          requestedAt: new Date().toISOString(),
+        };
+        const requestRef = await promiseTimeout(addDoc(collectionRef('tenantChangeRequests'), requestData), 5000);
+        await recordAudit('TENANT_CREATION_REQUESTED', 'tenant_change_request', requestRef.id, { tenantId: tenantRef.id, houseId });
+        closeAnyModal(setIsTenantModalOpen);
+        setToastMessage(`Tenant request for ${name} was sent to the landlord for approval.`);
+        return;
+      }
+
+      if (role !== ROLES.LANDLORD) throw new Error('Your account cannot register tenants.');
 
       const tenantRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'tenants'));
       await promiseTimeout(runTransaction(db, async (transaction) => {
@@ -1205,7 +1245,7 @@ export default function App() {
         const now = new Date().toISOString();
         const newTenant = {
           ...recordDefaults(),
-          name: formData.get('name').trim(), phone: formData.get('phone').trim(), contactPref: formData.get('contactPref'),
+          name, phone, contactPref,
           houseId, expectedRent, depositAmount: expectedRent, paidRent: 0, paidWater: 0,
           status: 'ACTIVE', dateEntered: now, createdAt: now,
         };
@@ -1234,6 +1274,106 @@ export default function App() {
       await recordAudit('TENANT_CREATED', 'tenant', tenantRef.id, { houseId });
       closeAnyModal(setIsTenantModalOpen);
     } catch (err) { setModalError(describeActionError(err, 'registering the tenant')); } finally { setIsProcessing(false); }
+  };
+
+  const handleReviewTenantChangeRequest = async (changeRequest, decision) => {
+    if (!user || !db || role !== ROLES.LANDLORD || isProcessing || !changeRequest || !['APPROVED', 'REJECTED'].includes(decision)) return;
+    setIsProcessing(true);
+    setModalError('');
+    try {
+      const requestRef = documentRef('tenantChangeRequests', changeRequest.id);
+      await promiseTimeout(runTransaction(db, async (transaction) => {
+        const requestSnapshot = await transaction.get(requestRef);
+        if (!requestSnapshot.exists()) throw new Error('This tenant request no longer exists.');
+        const request = requestSnapshot.data();
+        if (request.status !== 'PENDING') throw new Error('This tenant request has already been reviewed. Refresh the page.');
+        if (request.workspaceId !== workspaceId) throw new Error('This request belongs to a different workspace.');
+        const now = new Date().toISOString();
+
+        if (decision === 'APPROVED' && request.action === 'CREATE_TENANT') {
+          const tenantRef = documentRef('tenants', request.tenantId);
+          const houseRef = documentRef('houses', request.houseId);
+          const cycleRef = activeCycle ? documentRef('billingCycles', activeCycle.id) : null;
+          const cycleTenantRef = activeCycle ? documentRef('tenantCycles', tenantCycleDocumentId(request.tenantId, activeCycle.id)) : null;
+          const [tenantSnapshot, houseSnapshot, cycleSnapshot] = await Promise.all([
+            transaction.get(tenantRef),
+            transaction.get(houseRef),
+            cycleRef ? transaction.get(cycleRef) : Promise.resolve(null),
+          ]);
+          if (tenantSnapshot.exists()) throw new Error('A tenant record already uses this request.');
+          if (!houseSnapshot.exists() || houseSnapshot.data().status !== 'VACANT') throw new Error('The requested unit is no longer vacant. Decline this request and ask the manager to submit it again for another vacant unit.');
+          if (cycleSnapshot && (!cycleSnapshot.exists() || cycleSnapshot.data().status !== 'OPEN')) throw new Error('The active billing month changed. Refresh and review this request again.');
+
+          const expectedRent = parseMoney(houseSnapshot.data().rent, { allowZero: true });
+          const tenant = {
+            ...recordDefaults(),
+            name: request.tenantName,
+            phone: request.phone,
+            contactPref: request.contactPref,
+            houseId: request.houseId,
+            expectedRent,
+            depositAmount: expectedRent,
+            paidRent: 0,
+            paidWater: 0,
+            status: 'ACTIVE',
+            dateEntered: now,
+            createdAt: now,
+          };
+          transaction.set(tenantRef, tenant);
+          transaction.update(houseRef, { status: 'OCCUPIED', ...makeRecordMetadata(user, true), updatedAt: now });
+          if (cycleTenantRef && activeCycle) {
+            const cycleTenant = {
+              tenantId: request.tenantId,
+              cycleId: activeCycle.id,
+              tenantName: tenant.name,
+              houseId: request.houseId,
+              expectedRent,
+              expectedWater: 0,
+              paidRent: 0,
+              paidWater: 0,
+              status: 'OPEN',
+              createdAt: now,
+              ...recordDefaults(),
+            };
+            transaction.set(cycleTenantRef, cycleTenant);
+          }
+        } else if (decision === 'APPROVED' && request.action === 'DELETE_TENANT') {
+          const tenantRef = documentRef('tenants', request.tenantId);
+          const tenantSnapshot = await transaction.get(tenantRef);
+          if (!tenantSnapshot.exists()) throw new Error('The tenant record no longer exists.');
+          const tenant = tenantSnapshot.data();
+          if (tenant.status === 'ARCHIVED' || tenant.archivedAt) throw new Error('This tenant has already been removed.');
+          if (tenant.houseId !== request.houseId || tenant.name !== request.tenantName) throw new Error('The tenant changed after this request was submitted. Refresh and review the current tenant record.');
+          const houseRef = tenant.houseId ? documentRef('houses', tenant.houseId) : null;
+          const houseSnapshot = houseRef ? await transaction.get(houseRef) : null;
+          if (houseRef && !houseSnapshot.exists()) throw new Error('The tenant’s house unit no longer exists.');
+          transaction.update(tenantRef, {
+            status: 'ARCHIVED', archivedAt: now, archivedBy: user.uid,
+            ...makeRecordMetadata(user, true),
+          });
+          if (houseRef) transaction.update(houseRef, { status: 'VACANT', ...makeRecordMetadata(user, true), updatedAt: now });
+        } else if (decision === 'APPROVED') {
+          throw new Error('This request type is not supported.');
+        }
+
+        transaction.update(requestRef, {
+          status: decision,
+          reviewedAt: now,
+          reviewedBy: user.uid,
+          updatedBy: user.uid,
+        });
+      }), 10000);
+      const approved = decision === 'APPROVED';
+      const actionName = changeRequest.action === 'CREATE_TENANT' ? 'registration' : 'removal';
+      await recordAudit(`TENANT_${actionName.toUpperCase()}_${decision}`, 'tenant_change_request', changeRequest.id, { tenantId: changeRequest.tenantId });
+      setToastMessage(approved
+        ? (changeRequest.action === 'CREATE_TENANT' ? `${changeRequest.tenantName} was added to the tenant directory.` : `${changeRequest.tenantName} was removed from the active directory; financial history was retained.`)
+        : `The ${actionName} request for ${changeRequest.tenantName} was declined.`);
+    } catch (err) {
+      setToastMessage(describeActionError(err, 'reviewing the tenant request'));
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
   const handleEditTenant = async (e) => {
@@ -1725,8 +1865,12 @@ export default function App() {
   };
 
   const handleDeleteTenant = async (tenant) => {
-    if (!user || !db || role !== ROLES.LANDLORD || !tenant || isProcessing) return;
-    setConfirmationAction({ type: 'deleteTenant', tenant });
+    if (!user || !db || !tenant || isProcessing) return;
+    if (role === ROLES.LANDLORD) {
+      setConfirmationAction({ type: 'deleteTenant', tenant });
+    } else if (role === ROLES.MANAGER) {
+      setConfirmationAction({ type: 'requestTenantRemoval', tenant });
+    }
   };
 
   const handleOpenCycle = async (e) => {
@@ -1993,11 +2137,32 @@ export default function App() {
   };
 
   const handleConfirmationSubmit = async () => {
-    if (!user || !db || role !== ROLES.LANDLORD || !confirmationAction || isProcessing) return;
+    const managerRemovalRequest = role === ROLES.MANAGER && confirmationAction?.type === 'requestTenantRemoval';
+    if (!user || !db || (role !== ROLES.LANDLORD && !managerRemovalRequest) || !confirmationAction || isProcessing) return;
     setIsProcessing(true);
     setModalError('');
     try {
-      if (confirmationAction.type === 'resetData') {
+      if (confirmationAction.type === 'requestTenantRemoval') {
+        const tenant = confirmationAction.tenant;
+        if (!tenant || tenant.status === 'ARCHIVED' || tenant.archivedAt) throw new Error('This tenant is no longer active. Refresh the directory.');
+        if (tenantChangeRequests.some(request => request.action === 'DELETE_TENANT' && request.tenantId === tenant.id && request.status === 'PENDING')) throw new Error('A removal request for this tenant is already waiting for landlord approval.');
+        const request = {
+          ...recordDefaults(),
+          action: 'DELETE_TENANT',
+          status: 'PENDING',
+          tenantId: tenant.id,
+          tenantName: tenant.name,
+          phone: String(tenant.phone || ''),
+          contactPref: String(tenant.contactPref || ''),
+          houseId: String(tenant.houseId || ''),
+          requestedByName: String(user.displayName || user.email || user.uid).slice(0, 120),
+          requestedAt: new Date().toISOString(),
+        };
+        const created = await promiseTimeout(addDoc(collectionRef('tenantChangeRequests'), request), 5000);
+        await recordAudit('TENANT_REMOVAL_REQUESTED', 'tenant_change_request', created.id, { tenantId: tenant.id, houseId: tenant.houseId });
+        setSelectedTenantForDetails(null);
+        setToastMessage(`Removal request for ${tenant.name} was sent to the landlord. The tenant remains active until approval.`);
+      } else if (confirmationAction.type === 'resetData') {
         await handleDataReset();
       } else if (confirmationAction.type === 'closeCycle') {
         await handleCloseCycle();
@@ -2027,7 +2192,9 @@ export default function App() {
     } catch (error) {
       const action = confirmationAction.type === 'resetData'
         ? 'resetting payment and operations data'
-        : confirmationAction.type === 'deleteTenant' ? 'removing the tenant' : 'closing the billing cycle';
+        : confirmationAction.type === 'deleteTenant' ? 'removing the tenant'
+          : confirmationAction.type === 'requestTenantRemoval' ? 'requesting landlord approval to remove the tenant'
+            : 'closing the billing cycle';
       setModalError(describeActionError(error, action));
     } finally {
       setIsProcessing(false);
@@ -2739,10 +2906,54 @@ export default function App() {
                   <div>
                     <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Tenants Directory</h2>
                   </div>
-                  <button onClick={() => { setModalError(''); setNewTenantHouseId(''); setIsTenantModalOpen(true); }} className="bg-gray-800 hover:bg-gray-900 text-white px-5 py-2.5 rounded-xl text-sm font-bold flex items-center gap-2 shadow-sm transition-all hover:shadow-md hover:-translate-y-0.5">
-                    <Plus size={18}/> Register Tenant
-                  </button>
+                  {(role === ROLES.LANDLORD || role === ROLES.MANAGER) && (
+                    <button onClick={() => { setModalError(''); setNewTenantHouseId(''); setIsTenantModalOpen(true); }} className="bg-gray-800 hover:bg-gray-900 text-white px-5 py-2.5 rounded-xl text-sm font-bold flex items-center gap-2 shadow-sm transition-all hover:shadow-md hover:-translate-y-0.5">
+                      <Plus size={18}/> {role === ROLES.MANAGER ? 'Request New Tenant' : 'Register Tenant'}
+                    </button>
+                  )}
                 </div>
+
+                {(isLandlord || visibleTenantChangeRequests.length > 0) && (
+                  <section className={`rounded-2xl border p-5 shadow-sm ${theme === 'dark' ? 'border-slate-800 bg-slate-900' : 'border-[#E8DFCE] bg-[#FDFBF7]'}`} aria-labelledby="tenant-requests-title">
+                    <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <h3 id="tenant-requests-title" className={`text-lg font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{isLandlord ? 'Tenant Approval Requests' : 'My Tenant Requests'}</h3>
+                        <p className="mt-1 text-sm text-gray-500">{isLandlord ? 'Review manager requests. Approved additions and removals take effect immediately.' : 'New tenants and removal requests stay pending until the landlord reviews them.'}</p>
+                      </div>
+                    </div>
+                    {visibleTenantChangeRequests.length === 0 ? (
+                      <p className="rounded-xl border border-dashed border-[#DCD4C6] p-5 text-center text-sm text-gray-500 dark:border-slate-700">No tenant requests are waiting for review.</p>
+                    ) : (
+                      <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+                        {visibleTenantChangeRequests.map(request => {
+                          const requestHouse = houses.find(house => house.id === request.houseId);
+                          const isCreateRequest = request.action === 'CREATE_TENANT';
+                          return (
+                            <article key={request.id} className={`rounded-xl border p-4 ${theme === 'dark' ? 'border-slate-700 bg-[#151515]' : 'border-[#E8DFCE] bg-white'}`}>
+                              <div className="flex flex-wrap items-start justify-between gap-3">
+                                <div>
+                                  <p className={`font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{request.tenantName}</p>
+                                  <p className="mt-1 text-sm text-gray-500">{isCreateRequest ? 'New tenant registration' : 'Tenant removal'} · {requestHouse?.name || 'Unit unavailable'}</p>
+                                  {isCreateRequest && <p className="mt-1 text-xs text-gray-500">{request.phone || 'No phone'} · {formatKes(requestHouse?.rent || 0)} monthly rent</p>}
+                                  <p className="mt-1 text-xs text-gray-500">Requested by {request.requestedByName || 'Manager'} · {request.requestedAt ? new Date(request.requestedAt).toLocaleDateString('en-KE', { timeZone: DEFAULT_TIMEZONE }) : '—'}</p>
+                                </div>
+                                {!isLandlord && (
+                                  <span className={`rounded-full px-2.5 py-1 text-xs font-bold ${request.status === 'APPROVED' ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300' : request.status === 'REJECTED' ? 'bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300' : 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'}`}>{request.status === 'APPROVED' ? 'Approved' : request.status === 'REJECTED' ? 'Declined' : 'Pending landlord approval'}</span>
+                                )}
+                              </div>
+                              {isLandlord && (
+                                <div className="mt-4 flex flex-wrap justify-end gap-2 border-t border-[#E8DFCE] pt-3 dark:border-slate-700">
+                                  <button type="button" disabled={isProcessing} onClick={() => handleReviewTenantChangeRequest(request, 'REJECTED')} className={`rounded-lg border px-3 py-2 text-sm font-semibold disabled:opacity-50 ${theme === 'dark' ? 'border-slate-600 text-slate-200 hover:bg-white/5' : 'border-[#DCD4C6] text-gray-700 hover:bg-gray-50'}`}>Decline</button>
+                                  <button type="button" disabled={isProcessing} onClick={() => handleReviewTenantChangeRequest(request, 'APPROVED')} className="rounded-lg bg-gray-800 px-3 py-2 text-sm font-semibold text-white hover:bg-gray-900 disabled:opacity-50">{isCreateRequest ? 'Approve registration' : 'Approve removal'}</button>
+                                </div>
+                              )}
+                            </article>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </section>
+                )}
 
                 <div className={`rounded-2xl border overflow-hidden shadow-sm ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
                   <table className="w-full text-left text-sm">
@@ -3245,20 +3456,22 @@ export default function App() {
       {confirmationAction && (
         <div className="fixed inset-0 z-70 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={() => !isProcessing && setConfirmationAction(null)}>
           <div role="dialog" aria-modal="true" aria-labelledby="confirmation-title" className={`w-full max-w-md rounded-2xl border p-6 shadow-2xl ${theme === 'dark' ? 'border-slate-800 bg-slate-900 text-white' : 'border-[#E8DFCE] bg-white text-gray-900'}`} onClick={e => e.stopPropagation()}>
-            <h3 id="confirmation-title" className="text-lg font-bold text-rose-600">
-              {confirmationAction.type === 'resetData' ? 'Reset payment and operations data?' : confirmationAction.type === 'closeCycle' ? 'Close the current billing cycle?' : 'Remove tenant from the active directory?'}
+            <h3 id="confirmation-title" className={`text-lg font-bold ${confirmationAction.type === 'requestTenantRemoval' ? 'text-amber-600' : 'text-rose-600'}`}>
+              {confirmationAction.type === 'resetData' ? 'Reset payment and operations data?' : confirmationAction.type === 'closeCycle' ? 'Close the current billing cycle?' : confirmationAction.type === 'requestTenantRemoval' ? 'Send tenant removal request?' : 'Remove tenant from the active directory?'}
             </h3>
             <p className={`mt-3 text-sm leading-relaxed ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>
               {confirmationAction.type === 'resetData'
                 ? 'This will permanently erase ALL payment records, repair logs, septic logs, and water bill invoices. Tenants and houses will be preserved. This cannot be undone. Paid totals in monthly cycles will also reset, while cycle months and expected rent/water charges are preserved. Because large resets run in batches, a later failure may leave earlier batches completed; the error will identify where it stopped.'
                 : confirmationAction.type === 'closeCycle'
                   ? `Close ${activeCycle?.month || 'the current month'}? New payments will require a new billing cycle.`
-                  : `Archive ${confirmationAction.tenant.name} from the active directory? Their financial history will remain available for audit.`}
+                  : confirmationAction.type === 'requestTenantRemoval'
+                    ? `Ask the landlord to remove ${confirmationAction.tenant.name}? The tenant stays active and their financial history is preserved unless the landlord approves the request.`
+                    : `Archive ${confirmationAction.tenant.name} from the active directory? Their financial history will remain available for audit.`}
             </p>
             <div className="mt-6 flex justify-end gap-2">
               <button type="button" onClick={() => setConfirmationAction(null)} disabled={isProcessing} className={`rounded-xl px-4 py-2.5 text-sm font-bold transition disabled:opacity-50 ${theme === 'dark' ? 'text-slate-300 hover:bg-white/5' : 'text-gray-600 hover:bg-black/5'}`}>Cancel</button>
-              <button type="button" onClick={handleConfirmationSubmit} disabled={isProcessing} className="rounded-xl bg-rose-600 px-4 py-2.5 text-sm font-bold text-white transition hover:bg-rose-700 disabled:opacity-50">
-                {isProcessing ? 'Working…' : confirmationAction.type === 'resetData' ? 'Reset Data' : confirmationAction.type === 'closeCycle' ? 'Close Cycle' : 'Remove Tenant'}
+              <button type="button" onClick={handleConfirmationSubmit} disabled={isProcessing} className={`rounded-xl px-4 py-2.5 text-sm font-bold text-white transition disabled:opacity-50 ${confirmationAction.type === 'requestTenantRemoval' ? 'bg-gray-800 hover:bg-gray-900' : 'bg-rose-600 hover:bg-rose-700'}`}>
+                {isProcessing ? 'Working…' : confirmationAction.type === 'resetData' ? 'Reset Data' : confirmationAction.type === 'closeCycle' ? 'Close Cycle' : confirmationAction.type === 'requestTenantRemoval' ? 'Request Removal' : 'Remove Tenant'}
               </button>
             </div>
           </div>
@@ -3320,18 +3533,19 @@ export default function App() {
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-60 backdrop-blur-sm transition-opacity" onClick={() => closeAnyModal(setIsTenantModalOpen)}>
           <div className={`rounded-3xl w-full max-w-md p-7 shadow-2xl animate-in fade-in zoom-in-95 duration-200 ${theme === 'dark' ? 'bg-slate-900 border border-slate-800 text-white' : 'bg-[#FDFBF7] border border-[#E8DFCE] text-gray-900'}`} onClick={e => e.stopPropagation()}>
             <div className="flex justify-between items-center mb-6">
-              <h3 className="text-xl font-bold">Register New Tenant</h3>
+              <h3 className="text-xl font-bold">{role === ROLES.MANAGER ? 'Request New Tenant' : 'Register New Tenant'}</h3>
               <button onClick={() => closeAnyModal(setIsTenantModalOpen)} className={`p-2 rounded-full ${theme === 'dark' ? 'hover:bg-white/5 text-gray-400 hover:text-white' : 'hover:bg-black/5 text-gray-500 hover:text-gray-900'}`}><X/></button>
             </div>
+            {role === ROLES.MANAGER && <p className="mb-5 rounded-xl border border-amber-500/20 bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-300">The tenant will be added only after the landlord approves this request.</p>}
             <form onSubmit={handleAddTenant} className="space-y-4">
               <div className="grid grid-cols-2 gap-4">
                 <div className="col-span-2">
                   <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Full Name</label>
-                  <input required name="name" className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 font-medium text-sm transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`} />
+                  <input required maxLength={120} name="name" className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 font-medium text-sm transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`} />
                 </div>
                 <div>
                   <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Phone Number</label>
-                  <input required name="phone" className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 font-medium text-sm transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`} />
+                  <input required maxLength={40} name="phone" className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 font-medium text-sm transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`} />
                 </div>
                 <div>
                   <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Comm. Pref</label>
@@ -3345,7 +3559,7 @@ export default function App() {
                   <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Assign House Unit (Vacant only)</label>
                   <select required name="houseId" value={newTenantHouseId} onChange={event => setNewTenantHouseId(event.target.value)} className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 text-sm font-bold transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`}>
                     <option value="">-- Select Vacant Unit --</option>
-                    {houses.filter(h => h.status === 'VACANT' && !occupiedHouseIds.has(h.id)).map(h => (
+                    {houses.filter(h => h.status === 'VACANT' && !occupiedHouseIds.has(h.id) && !pendingTenantCreationHouseIds.has(h.id)).map(h => (
                       <option key={h.id} value={h.id}>{h.name} ({formatKes(h.rent)})</option>
                     ))}
                   </select>
@@ -3363,7 +3577,7 @@ export default function App() {
                 </div>
               </div>
               <button type="submit" disabled={isProcessing} className="w-full bg-gray-800 hover:bg-gray-900 text-white font-bold py-3.5 rounded-xl mt-6 disabled:opacity-50 transition-all shadow-md hover:shadow-lg">
-                {isProcessing ? 'Saving Details...' : 'Save Tenant'}
+                {isProcessing ? (role === ROLES.MANAGER ? 'Submitting Request…' : 'Saving Details…') : (role === ROLES.MANAGER ? 'Submit for Landlord Approval' : 'Save Tenant')}
               </button>
             </form>
           </div>
@@ -3700,7 +3914,7 @@ export default function App() {
               })()}
 
               <div className={`flex justify-between items-center pt-5 border-t ${theme === 'dark' ? 'border-slate-800' : 'border-[#DCD4C6]'}`}>
-                {isLandlord && <button onClick={() => handleDeleteTenant(selectedTenantForDetails)} disabled={isProcessing} className={`text-sm font-bold px-4 py-2.5 rounded-xl transition disabled:opacity-50 ${theme === 'dark' ? 'text-rose-500 hover:bg-rose-500/10' : 'text-rose-600 hover:bg-rose-500/10'}`}>Remove Tenant</button>}
+                {(role === ROLES.LANDLORD || role === ROLES.MANAGER) && <button onClick={() => handleDeleteTenant(selectedTenantForDetails)} disabled={isProcessing} className={`text-sm font-bold px-4 py-2.5 rounded-xl transition disabled:opacity-50 ${theme === 'dark' ? 'text-rose-500 hover:bg-rose-500/10' : 'text-rose-600 hover:bg-rose-500/10'}`}>{isLandlord ? 'Remove Tenant' : 'Request Removal'}</button>}
                 {canManageTenants ? (
                   <button onClick={() => { setEditTenantHouseId(selectedTenantForDetails.houseId || ''); setModalError(''); setIsEditTenantModalOpen(true); }} disabled={isProcessing} className="bg-gray-800 hover:bg-gray-900 text-white font-bold text-sm px-6 py-3 rounded-xl transition flex items-center gap-2 shadow-md hover:shadow-lg"><Edit size={16}/> Edit Details</button>
                 ) : (

@@ -5,6 +5,7 @@ Ruiru Rentals is a React and Capacitor property-management app for landlords and
 ## What it includes
 
 - Landlord and manager workspaces with role-based access.
+- Managers can submit new-tenant and tenant-removal requests. The landlord reviews each request; a tenant is only added or archived after approval. Removal keeps payment and billing history for audit.
 - Houses and units, tenant directory, rent and water billing, payment ledger, expenses, utilities, maintenance, reports, and activity history.
 - Past-month billing entry for the landlord and manager rent/water logging with landlord review.
 - Repairs & Operations includes house repairs, septic cleanouts, and a garbage collection log. Managers can record pickups; recorded collection costs are included in operating expense totals.
@@ -54,10 +55,10 @@ The package name is `ke.co.houseapprentals`. Both builds support Android 7.0+ (A
 
 ### Download
 
-- [Android 10 and newer](https://github.com/vivianchege/rental-app/releases/latest/download/Ruiru-Rentals-1.4-Android-10-plus.apk)
-- [Android 7–9, including Galaxy S8](https://github.com/vivianchege/rental-app/releases/latest/download/Ruiru-Rentals-1.4-Android-7-to-9.apk)
+- [Android 10 and newer](https://github.com/vivianchege/rental-app/releases/latest/download/Ruiru-Rentals-1.5-Android-10-plus.apk)
+- [Android 7–9, including Galaxy S8](https://github.com/vivianchege/rental-app/releases/latest/download/Ruiru-Rentals-1.5-Android-7-to-9.apk)
 
-The older-device APK was smoke-tested on an Android 9 Samsung SM-J337A handset. A physical Galaxy S8 was not available for testing.
+The Android 7–9 variant was previously smoke-tested on an Android 9 Samsung SM-J337A handset. Version 1.5 has not yet been retested on that handset or on a physical Galaxy S8.
 
 Both APKs have the same app ID and signing identity. Installing one updates/replaces the other while retaining the device's app data. The APKs are signed debug builds for direct installation and private sharing; they are not Play Store release builds.
 
@@ -76,18 +77,18 @@ In PowerShell, build and save both signed APKs:
 ```powershell
 Push-Location android
 .\gradlew.bat assembleDebug
-Copy-Item .\app\build\outputs\apk\debug\app-debug.apk .\app\build\outputs\apk\debug\Ruiru-Rentals-1.4-Android-10-plus.apk
+Copy-Item .\app\build\outputs\apk\debug\app-debug.apk .\app\build\outputs\apk\debug\Ruiru-Rentals-1.5-Android-10-plus.apk
 Pop-Location
 
 npm run build -- --mode android-legacy
 npx cap sync android
 Push-Location android
 .\gradlew.bat assembleDebug -PlegacyGoogleAuth=true
-Copy-Item .\app\build\outputs\apk\debug\app-debug.apk .\app\build\outputs\apk\debug\Ruiru-Rentals-1.4-Android-7-to-9.apk
+Copy-Item .\app\build\outputs\apk\debug\app-debug.apk .\app\build\outputs\apk\debug\Ruiru-Rentals-1.5-Android-7-to-9.apk
 Pop-Location
 ```
 
-The current Android version is **1.4** (version code **5**; the older-device APK displays **1.4-legacy**). Both builds use the local Android debug signing key so they can update the app already installed from this development machine. To sign with another key, add that key's SHA-1 fingerprint to the Android app in Firebase Console and download the refreshed `google-services.json`.
+The current Android version is **1.5** (version code **6**; the older-device APK displays **1.5-legacy**). Both builds use the local Android debug signing key so they can update the app already installed from this development machine. To sign with another key, add that key's SHA-1 fingerprint to the Android app in Firebase Console and download the refreshed `google-services.json`.
 
 ## Checks
 

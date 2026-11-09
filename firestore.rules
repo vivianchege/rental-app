@@ -70,14 +70,14 @@ service cloud.firestore {
     function managerCollectionAllowed(collectionName) {
       return collectionName in [
         'houses', 'tenants', 'payments', 'repairs', 'septicLogs', 'garbageLogs', 'masterWaterBills',
-        'billingCycles', 'tenantCycles', 'expenses', 'notifications', 'paymentReferences'
+        'billingCycles', 'tenantCycles', 'expenses', 'notifications', 'paymentReferences', 'tenantChangeRequests'
       ];
     }
 
     function managerCanCreate(collectionName) {
       return collectionName in [
         'payments', 'repairs', 'septicLogs', 'garbageLogs', 'masterWaterBills', 'expenses',
-        'notifications', 'paymentReferences', 'auditLogs'
+        'notifications', 'paymentReferences', 'auditLogs', 'tenantChangeRequests'
       ];
     }
 
@@ -223,6 +223,80 @@ service cloud.firestore {
         isValidTenantPricing(data) && tenantRentMatchesUnit(appId, data);
     }
 
+    function isValidTenantChangeRequestCreate(appId, data) {
+      let tenantPath = /databases/$(database)/documents/artifacts/$(appId)/public/data/tenants/$(data.tenantId);
+      let housePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/houses/$(data.houseId);
+      return data.keys().hasAll([
+          'action', 'status', 'tenantId', 'tenantName', 'phone', 'contactPref', 'houseId',
+          'requestedByName', 'requestedAt', 'workspaceId', 'createdBy', 'updatedBy'
+        ]) &&
+        data.keys().hasOnly([
+          'action', 'status', 'tenantId', 'tenantName', 'phone', 'contactPref', 'houseId',
+          'requestedByName', 'requestedAt', 'workspaceId', 'createdBy', 'updatedBy'
+        ]) &&
+        data.action in ['CREATE_TENANT', 'DELETE_TENANT'] &&
+        data.status == 'PENDING' &&
+        data.tenantId is string && data.tenantId.size() > 0 && data.tenantId.size() <= 128 &&
+        data.tenantName is string && data.tenantName.size() > 0 && data.tenantName.size() <= 120 &&
+        data.phone is string && data.phone.size() <= 40 &&
+        data.contactPref is string && data.contactPref.size() <= 40 &&
+        data.houseId is string && data.houseId.size() <= 150 &&
+        data.requestedByName is string && data.requestedByName.size() > 0 && data.requestedByName.size() <= 120 &&
+        data.requestedAt is string && data.requestedAt.size() > 0 && data.requestedAt.size() <= 40 &&
+        data.workspaceId is string && data.workspaceId.size() > 0 && data.workspaceId.size() <= 120 &&
+        data.createdBy == request.auth.uid && data.updatedBy == request.auth.uid &&
+        ((data.action == 'CREATE_TENANT' &&
+            data.phone.size() > 0 && data.contactPref.size() > 0 && data.houseId.size() > 0 &&
+            !exists(tenantPath) && exists(housePath) && get(housePath).data.status == 'VACANT' &&
+            sameWorkspace(get(housePath).data)) ||
+         (data.action == 'DELETE_TENANT' && exists(tenantPath) &&
+            (sameWorkspace(get(tenantPath).data) || (isLegacyManager() && legacyRecord(get(tenantPath).data))) &&
+            (!('status' in get(tenantPath).data) || get(tenantPath).data.status != 'ARCHIVED') &&
+            !('archivedAt' in get(tenantPath).data) &&
+            data.tenantName == get(tenantPath).data.name &&
+            data.houseId == (get(tenantPath).data.houseId is string ? get(tenantPath).data.houseId : '')));
+    }
+
+    function tenantChangeRequestApprovalEffectsMatch(appId, data) {
+      let tenantPath = /databases/$(database)/documents/artifacts/$(appId)/public/data/tenants/$(data.tenantId);
+      let housePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/houses/$(data.houseId);
+      return (data.action == 'CREATE_TENANT' &&
+          existsAfter(tenantPath) && existsAfter(housePath) &&
+          getAfter(tenantPath).data.status == 'ACTIVE' &&
+          getAfter(tenantPath).data.name == data.tenantName &&
+          getAfter(tenantPath).data.phone == data.phone &&
+          getAfter(tenantPath).data.contactPref == data.contactPref &&
+          getAfter(tenantPath).data.houseId == data.houseId &&
+          getAfter(tenantPath).data.createdBy == request.auth.uid &&
+          getAfter(tenantPath).data.workspaceId == data.workspaceId &&
+          getAfter(tenantPath).data.expectedRent == getAfter(housePath).data.rent &&
+          getAfter(housePath).data.status == 'OCCUPIED' &&
+          getAfter(housePath).data.updatedBy == request.auth.uid &&
+          sameWorkspace(getAfter(tenantPath).data) && sameWorkspace(getAfter(housePath).data)) ||
+        (data.action == 'DELETE_TENANT' &&
+          existsAfter(tenantPath) && getAfter(tenantPath).data.status == 'ARCHIVED' &&
+          getAfter(tenantPath).data.archivedBy == request.auth.uid &&
+          getAfter(tenantPath).data.updatedBy == request.auth.uid &&
+          (sameWorkspace(getAfter(tenantPath).data) || (isLegacyLandlord() && legacyRecord(getAfter(tenantPath).data))) &&
+          (data.houseId == '' ||
+            (existsAfter(housePath) && getAfter(housePath).data.status == 'VACANT' &&
+              getAfter(housePath).data.updatedBy == request.auth.uid &&
+              (sameWorkspace(getAfter(housePath).data) || (isLegacyLandlord() && legacyRecord(getAfter(housePath).data))))));
+    }
+
+    function tenantChangeRequestUpdateIsValid(appId) {
+      return isLandlord() && resource.data.status == 'PENDING' &&
+        request.resource.data.status in ['APPROVED', 'REJECTED'] &&
+        request.resource.data.reviewedAt is string && request.resource.data.reviewedAt.size() > 0 &&
+        request.resource.data.reviewedAt.size() <= 40 &&
+        request.resource.data.reviewedBy == request.auth.uid &&
+        request.resource.data.updatedBy == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'status', 'reviewedAt', 'reviewedBy', 'updatedBy'
+        ]) &&
+        (request.resource.data.status == 'REJECTED' || tenantChangeRequestApprovalEffectsMatch(appId, resource.data));
+    }
+
     function tenantPricingUpdateIsValid(appId) {
       let data = request.resource.data;
       let rentOrHouseChanged = data.diff(resource.data).affectedKeys().hasAny([
@@ -365,7 +439,8 @@ service cloud.firestore {
         (collectionName == 'tenantCycles' &&
           (validTenantCycleCreate(appId, data, recordId) || validHistoricalTenantCycleCreate(appId, data, recordId))) ||
         (collectionName == 'tenants' && isValidTenantLeaseCreate(appId, data)) ||
-        (!isCycleCollection(collectionName) && collectionName != 'payments' && collectionName != 'tenants');
+        (!isCycleCollection(collectionName) && collectionName != 'payments' &&
+          collectionName != 'tenants' && collectionName != 'tenantChangeRequests');
     }
 
     function cycleUpdateIsValid(collectionName, appId, recordId) {
@@ -430,6 +505,7 @@ service cloud.firestore {
         request.resource.data.createdBy == request.auth.uid &&
         !isCycleCollection(collectionName) &&
         (collectionName != 'garbageLogs' || isValidGarbageLog(request.resource.data)) &&
+        (collectionName != 'tenantChangeRequests' || isValidTenantChangeRequestCreate(appId, request.resource.data)) &&
         (collectionName != 'payments' || managerPaymentCreateIsPending(appId));
 
       allow update: if isLandlord() &&
@@ -437,12 +513,14 @@ service cloud.firestore {
         (sameWorkspace(request.resource.data) || (isLegacyLandlord() && legacyRecord(request.resource.data))) &&
         request.resource.data.updatedBy == request.auth.uid &&
         (collectionName != 'tenants' || tenantPricingUpdateIsValid(appId)) &&
+        (collectionName != 'tenantChangeRequests' || tenantChangeRequestUpdateIsValid(appId)) &&
         (cycleUpdateIsValid(collectionName, appId, recordId) ||
           (collectionName == 'tenantCycles' && tenantCycleResetIsValid(appId, recordId)));
 
       allow update: if isManager() &&
         managerCollectionAllowed(collectionName) &&
         collectionName != 'billingCycles' &&
+        collectionName != 'tenantChangeRequests' &&
         (sameWorkspace(resource.data) || (isLegacyManager() && legacyRecord(resource.data))) &&
         (sameWorkspace(request.resource.data) || (isLegacyManager() && legacyRecord(request.resource.data))) &&
         request.resource.data.updatedBy == request.auth.uid &&
