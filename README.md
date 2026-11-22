@@ -11,8 +11,22 @@ Ruiru Rentals is a React and Capacitor property-management app for landlords and
 - Repairs & Operations includes house repairs, septic cleanouts, and a garbage collection log. Managers can record pickups; recorded collection costs are included in operating expense totals.
 - Payment reference checks: landlord-entered payments require a reference; managers can submit a pending payment without one, but the landlord must enter a reference before confirming it. References cannot be reused. Cash is not offered as a rent-payment method.
 - Responsive light and dark themes, with the Ruiru Rentals logo in the Android app drawer.
+- Shared workspace notifications for rental, payment, maintenance, utility, and account changes, plus one daily follow-up reminder for a randomly selected tenant with a large balance.
+- A role-aware rental assistant. It reads workspace data on the server, keeps a conversation history, summarizes the latest 18 closed billing months, and lets the landlord ask about managers' recent activity and assistant conversations. It cannot change records. Managers can see only their own assistant history and permitted rental records.
 - Native Google sign-in in Android and browser Google sign-in on the website.
 - Android ledger Back control and system Back navigation.
+
+## Rental assistant setup
+
+The assistant calls Firebase Cloud Functions and Google Gemini through Google Cloud's Vertex AI service. No model API key is stored in the website or APK. The server verifies the signed-in role and workspace before reading records. Manager conversations are private to that manager and landlord-accessible within the same workspace; no other workspace is included. The assistant uses recent billing cycles and operational records, and it does not create or approve records.
+
+To enable answers in a Firebase project, enable Cloud Functions and the Vertex AI API, attach a billing account, and grant the Functions runtime service account the Vertex AI User role (`roles/aiplatform.user`). The default model is `gemini-3.8-flash` using the global endpoint; set `RENTAL_ASSISTANT_MODEL` or `GOOGLE_CLOUD_LOCATION` in `functions/.env` if you need to change them. Deploy with:
+
+```bash
+npx firebase-tools deploy --only functions --project hse-app-b1d2b
+```
+
+Cloud Functions deployment requires the Firebase project to use the Blaze plan. Gemini model usage may incur separate Google Cloud charges; set budget alerts in Google Cloud before enabling regular use. The app shows an actionable setup error if the backend or model service is not configured.
 
 ## Sign-in and app security
 
@@ -55,10 +69,10 @@ The package name is `ke.co.houseapprentals`. Both builds support Android 7.0+ (A
 
 ### Download
 
-- [Android 10 and newer](https://github.com/vivianchege/rental-app/releases/latest/download/Ruiru-Rentals-1.5-Android-10-plus.apk)
-- [Android 7–9, including Galaxy S8](https://github.com/vivianchege/rental-app/releases/latest/download/Ruiru-Rentals-1.5-Android-7-to-9.apk)
+- [Android 10 and newer](https://github.com/vivianchege/rental-app/releases/latest/download/Ruiru-Rentals-1.6.0-Android-10-plus.apk)
+- [Android 7–9, including Galaxy S8](https://github.com/vivianchege/rental-app/releases/latest/download/Ruiru-Rentals-1.6.0-Android-7-to-9.apk)
 
-The Android 7–9 variant was previously smoke-tested on an Android 9 Samsung SM-J337A handset. Version 1.5 has not yet been retested on that handset or on a physical Galaxy S8.
+The Android 7–9 variant was previously smoke-tested on an Android 9 Samsung SM-J337A handset. Record a fresh device smoke check for each release before describing it as verified on a physical phone.
 
 Both APKs have the same app ID and signing identity. Installing one updates/replaces the other while retaining the device's app data. The APKs are signed debug builds for direct installation and private sharing; they are not Play Store release builds.
 
@@ -77,18 +91,18 @@ In PowerShell, build and save both signed APKs:
 ```powershell
 Push-Location android
 .\gradlew.bat assembleDebug
-Copy-Item .\app\build\outputs\apk\debug\app-debug.apk .\app\build\outputs\apk\debug\Ruiru-Rentals-1.5-Android-10-plus.apk
+Copy-Item .\app\build\outputs\apk\debug\app-debug.apk .\app\build\outputs\apk\debug\Ruiru-Rentals-1.6.0-Android-10-plus.apk
 Pop-Location
 
 npm run build -- --mode android-legacy
 npx cap sync android
 Push-Location android
 .\gradlew.bat assembleDebug -PlegacyGoogleAuth=true
-Copy-Item .\app\build\outputs\apk\debug\app-debug.apk .\app\build\outputs\apk\debug\Ruiru-Rentals-1.5-Android-7-to-9.apk
+Copy-Item .\app\build\outputs\apk\debug\app-debug.apk .\app\build\outputs\apk\debug\Ruiru-Rentals-1.6.0-Android-7-to-9.apk
 Pop-Location
 ```
 
-The current Android version is **1.5** (version code **6**; the older-device APK displays **1.5-legacy**). Both builds use the local Android debug signing key so they can update the app already installed from this development machine. To sign with another key, add that key's SHA-1 fingerprint to the Android app in Firebase Console and download the refreshed `google-services.json`.
+The current Android version is **1.6.0** (version code **7**; the older-device APK displays **1.6.0-legacy**). Both builds use the local Android debug signing key so they can update the app already installed from this development machine. To sign with another key, add that key's SHA-1 fingerprint to the Android app in Firebase Console and download the refreshed `google-services.json`.
 
 ## Checks
 

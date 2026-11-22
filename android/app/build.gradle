@@ -10,8 +10,8 @@ android {
         applicationId = "ke.co.houseapprentals"
         minSdk = rootProject.ext.minSdkVersion
         targetSdk = rootProject.ext.targetSdkVersion
-        versionCode = 6
-        versionName = project.hasProperty('legacyGoogleAuth') ? "1.5-legacy" : "1.5"
+        versionCode = 7
+        versionName = project.hasProperty('legacyGoogleAuth') ? "1.6.0-legacy" : "1.6.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

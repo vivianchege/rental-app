@@ -49,7 +49,8 @@ service cloud.firestore {
     }
 
     function isManager() {
-      return signedIn() && (
+      return signedIn() &&
+        (!hasProfile() || !('disabled' in profile()) || profile().disabled != true) && (
         request.auth.token.role == 'MANAGER' ||
         isLegacyManager() ||
         (hasProfile() && profile().role == 'MANAGER')
@@ -67,10 +68,20 @@ service cloud.firestore {
       return isLegacyAccount() && (!(data.workspaceId is string) || data.workspaceId == 'main-workspace');
     }
 
+    function notificationWriteIsWorkspaceScoped(before, after) {
+      return notificationRecordWorkspaceScoped(before) && notificationRecordWorkspaceScoped(after);
+    }
+
+    function notificationRecordWorkspaceScoped(data) {
+      return sameWorkspace(data) ||
+        (isLegacyAccount() &&
+          (!('workspaceId' in data) || (data.workspaceId is string && data.workspaceId == 'main-workspace')));
+    }
+
     function managerCollectionAllowed(collectionName) {
       return collectionName in [
         'houses', 'tenants', 'payments', 'repairs', 'septicLogs', 'garbageLogs', 'masterWaterBills',
-        'billingCycles', 'tenantCycles', 'expenses', 'notifications', 'paymentReferences', 'tenantChangeRequests'
+        'billingCycles', 'tenantCycles', 'expenses', 'notifications', 'paymentReferences'
       ];
     }
 
@@ -173,7 +184,7 @@ service cloud.firestore {
         ]) &&
         data.keys().hasOnly([
           'tenantId', 'cycleId', 'tenantName', 'houseId', 'expectedRent', 'expectedWater',
-          'paidRent', 'paidWater', 'status', 'createdAt', 'workspaceId', 'createdBy', 'updatedBy'
+          'paidRent', 'paidWater', 'status', 'createdAt', 'workspaceId', 'createdBy', 'updatedBy', 'updatedAt'
         ]) &&
         data.tenantId is string && data.tenantId.size() > 0 && data.tenantId.size() <= 128 &&
         data.cycleId is string && data.cycleId.size() > 0 && data.cycleId.size() <= 128 &&
@@ -188,7 +199,8 @@ service cloud.firestore {
         data.createdAt is string && data.createdAt.size() > 0 && data.createdAt.size() <= 40 &&
         data.workspaceId is string && data.workspaceId.size() > 0 && data.workspaceId.size() <= 120 &&
         data.createdBy is string && data.createdBy.size() > 0 && data.createdBy.size() <= 128 &&
-        (!('updatedBy' in data) || (data.updatedBy is string && data.updatedBy.size() <= 128));
+        (!('updatedBy' in data) || (data.updatedBy is string && data.updatedBy.size() <= 128)) &&
+        (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() > 0 && data.updatedAt.size() <= 40));
     }
 
     function tenantCycleStatusMatchesBalances(data) {
@@ -232,9 +244,11 @@ service cloud.firestore {
         ]) &&
         data.keys().hasOnly([
           'action', 'status', 'tenantId', 'tenantName', 'phone', 'contactPref', 'houseId',
-          'requestedByName', 'requestedAt', 'workspaceId', 'createdBy', 'updatedBy'
+          'requestedByName', 'requestedAt', 'workspaceId', 'createdBy', 'updatedBy',
+          'requestedName', 'requestedPhone', 'requestedContactPref', 'activeCycleId',
+          'cycleId', 'currentExpectedRent', 'currentExpectedWater',
+          'requestedExpectedRent', 'requestedExpectedWater'
         ]) &&
-        data.action in ['CREATE_TENANT', 'DELETE_TENANT'] &&
         data.status == 'PENDING' &&
         data.tenantId is string && data.tenantId.size() > 0 && data.tenantId.size() <= 128 &&
         data.tenantName is string && data.tenantName.size() > 0 && data.tenantName.size() <= 120 &&
@@ -246,15 +260,152 @@ service cloud.firestore {
         data.workspaceId is string && data.workspaceId.size() > 0 && data.workspaceId.size() <= 120 &&
         data.createdBy == request.auth.uid && data.updatedBy == request.auth.uid &&
         ((data.action == 'CREATE_TENANT' &&
+            data.keys().hasOnly([
+              'action', 'status', 'tenantId', 'tenantName', 'phone', 'contactPref', 'houseId',
+              'requestedByName', 'requestedAt', 'workspaceId', 'createdBy', 'updatedBy'
+            ]) &&
             data.phone.size() > 0 && data.contactPref.size() > 0 && data.houseId.size() > 0 &&
             !exists(tenantPath) && exists(housePath) && get(housePath).data.status == 'VACANT' &&
             sameWorkspace(get(housePath).data)) ||
          (data.action == 'DELETE_TENANT' && exists(tenantPath) &&
+            data.keys().hasOnly([
+              'action', 'status', 'tenantId', 'tenantName', 'phone', 'contactPref', 'houseId',
+              'requestedByName', 'requestedAt', 'workspaceId', 'createdBy', 'updatedBy'
+            ]) &&
             (sameWorkspace(get(tenantPath).data) || (isLegacyManager() && legacyRecord(get(tenantPath).data))) &&
             (!('status' in get(tenantPath).data) || get(tenantPath).data.status != 'ARCHIVED') &&
             !('archivedAt' in get(tenantPath).data) &&
             data.tenantName == get(tenantPath).data.name &&
-            data.houseId == (get(tenantPath).data.houseId is string ? get(tenantPath).data.houseId : '')));
+            data.houseId == (get(tenantPath).data.houseId is string ? get(tenantPath).data.houseId : '')) ||
+         (data.action == 'UPDATE_TENANT' &&
+            isValidTenantUpdateRequestCreate(appId, data)) ||
+         (data.action == 'UPDATE_TENANT_BILL' &&
+            isValidTenantBillUpdateRequestCreate(appId, data)));
+    }
+
+    function isValidTenantUpdateRequestCreate(appId, data) {
+      let tenantPath = /databases/$(database)/documents/artifacts/$(appId)/public/data/tenants/$(data.tenantId);
+      let housePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/houses/$(data.houseId);
+      return data.keys().hasAll(['requestedName', 'requestedPhone', 'requestedContactPref', 'activeCycleId']) &&
+        data.keys().hasOnly([
+          'action', 'status', 'tenantId', 'tenantName', 'phone', 'contactPref', 'houseId',
+          'requestedByName', 'requestedAt', 'workspaceId', 'createdBy', 'updatedBy',
+          'requestedName', 'requestedPhone', 'requestedContactPref', 'activeCycleId'
+        ]) &&
+        data.requestedName is string && data.requestedName.size() > 0 && data.requestedName.size() <= 120 &&
+        data.requestedPhone is string && data.requestedPhone.size() <= 40 &&
+        data.requestedContactPref is string && data.requestedContactPref.size() <= 40 &&
+        data.activeCycleId is string && data.activeCycleId.size() <= 128 &&
+        exists(tenantPath) &&
+        (sameWorkspace(get(tenantPath).data) || (isLegacyManager() && legacyRecord(get(tenantPath).data))) &&
+        data.workspaceId == (get(tenantPath).data.workspaceId is string
+          ? get(tenantPath).data.workspaceId
+          : 'main-workspace') &&
+        get(tenantPath).data.name is string &&
+        data.tenantName == get(tenantPath).data.name &&
+        data.phone == (get(tenantPath).data.phone is string ? get(tenantPath).data.phone : '') &&
+        data.contactPref == (get(tenantPath).data.contactPref is string ? get(tenantPath).data.contactPref : '') &&
+        get(tenantPath).data.houseId is string && get(tenantPath).data.houseId.size() > 0 &&
+        data.houseId == get(tenantPath).data.houseId &&
+        (!('status' in get(tenantPath).data) || get(tenantPath).data.status == 'ACTIVE') &&
+        !('archivedAt' in get(tenantPath).data) &&
+        exists(housePath) && get(housePath).data.status == 'OCCUPIED' &&
+        (sameWorkspace(get(housePath).data) || (isLegacyManager() && legacyRecord(get(housePath).data))) &&
+        tenantUpdateRequestCycleIsValid(appId, data);
+    }
+
+    function tenantUpdateRequestCycleIsValid(appId, data) {
+      return data.activeCycleId == '' || tenantUpdateRequestCycleIsValidForId(appId, data);
+    }
+
+    function tenantUpdateRequestCycleIsValidForId(appId, data) {
+      let billingCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/billingCycles/$(data.activeCycleId);
+      let tenantCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/tenantCycles/$(data.tenantId + '_' + data.activeCycleId);
+      return data.activeCycleId.size() > 0 &&
+        exists(billingCyclePath) && get(billingCyclePath).data.status == 'OPEN' &&
+        (sameWorkspace(get(billingCyclePath).data) || (isLegacyManager() && legacyRecord(get(billingCyclePath).data))) &&
+        (!exists(tenantCyclePath) ||
+          (get(tenantCyclePath).data.tenantId == data.tenantId &&
+            get(tenantCyclePath).data.cycleId == data.activeCycleId &&
+            get(tenantCyclePath).data.tenantName == data.tenantName &&
+            (!('workspaceId' in get(tenantCyclePath).data) || get(tenantCyclePath).data.workspaceId == data.workspaceId) &&
+            (sameWorkspace(get(tenantCyclePath).data) || (isLegacyManager() && legacyRecord(get(tenantCyclePath).data)))));
+    }
+
+    function isValidTenantBillUpdateRequestCreate(appId, data) {
+      let tenantPath = /databases/$(database)/documents/artifacts/$(appId)/public/data/tenants/$(data.tenantId);
+      let housePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/houses/$(data.houseId);
+      let billingCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/billingCycles/$(data.cycleId);
+      let tenantCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/tenantCycles/$(data.tenantId + '_' + data.cycleId);
+      return data.keys().hasAll([
+          'cycleId', 'currentExpectedRent', 'currentExpectedWater',
+          'requestedExpectedRent', 'requestedExpectedWater'
+        ]) &&
+        data.keys().hasOnly([
+          'action', 'status', 'tenantId', 'tenantName', 'phone', 'contactPref', 'houseId',
+          'requestedByName', 'requestedAt', 'workspaceId', 'createdBy', 'updatedBy',
+          'cycleId', 'currentExpectedRent', 'currentExpectedWater',
+          'requestedExpectedRent', 'requestedExpectedWater'
+        ]) &&
+        data.cycleId is string && data.cycleId.size() > 0 && data.cycleId.size() <= 128 &&
+        data.houseId is string && data.houseId.size() > 0 && data.houseId.size() <= 150 &&
+        data.currentExpectedRent is number && data.currentExpectedRent >= 0 && data.currentExpectedRent <= 1000000000000 &&
+        data.currentExpectedWater is number && data.currentExpectedWater >= 0 && data.currentExpectedWater <= 1000000000000 &&
+        data.requestedExpectedRent is number && data.requestedExpectedRent >= 0 && data.requestedExpectedRent <= 1000000000000 &&
+        data.requestedExpectedWater is number && data.requestedExpectedWater >= 0 && data.requestedExpectedWater <= 1000000000000 &&
+        exists(tenantPath) &&
+        (sameWorkspace(get(tenantPath).data) || (isLegacyManager() && legacyRecord(get(tenantPath).data))) &&
+        data.workspaceId == (get(tenantPath).data.workspaceId is string
+          ? get(tenantPath).data.workspaceId
+          : 'main-workspace') &&
+        get(tenantPath).data.name is string &&
+        data.phone == (get(tenantPath).data.phone is string ? get(tenantPath).data.phone : '') &&
+        data.contactPref == (get(tenantPath).data.contactPref is string ? get(tenantPath).data.contactPref : '') &&
+        exists(housePath) &&
+        (sameWorkspace(get(housePath).data) || (isLegacyManager() && legacyRecord(get(housePath).data))) &&
+        exists(billingCyclePath) && get(billingCyclePath).data.id == data.cycleId &&
+        get(billingCyclePath).data.status == 'CLOSED' &&
+        (sameWorkspace(get(billingCyclePath).data) || (isLegacyManager() && legacyRecord(get(billingCyclePath).data))) &&
+        exists(tenantCyclePath) && get(tenantCyclePath).data.tenantId == data.tenantId &&
+        get(tenantCyclePath).data.cycleId == data.cycleId &&
+        get(tenantCyclePath).data.tenantName == data.tenantName &&
+        get(tenantCyclePath).data.houseId == data.houseId &&
+        get(tenantCyclePath).data.expectedRent == data.currentExpectedRent &&
+        get(tenantCyclePath).data.expectedWater == data.currentExpectedWater &&
+        get(tenantCyclePath).data.expectedRent is number && get(tenantCyclePath).data.expectedWater is number &&
+        get(tenantCyclePath).data.paidRent is number && get(tenantCyclePath).data.paidWater is number &&
+        get(tenantCyclePath).data.paidRent >= 0 && get(tenantCyclePath).data.paidRent <= data.currentExpectedRent &&
+        get(tenantCyclePath).data.paidWater >= 0 && get(tenantCyclePath).data.paidWater <= data.currentExpectedWater &&
+        data.requestedExpectedRent >= get(tenantCyclePath).data.paidRent &&
+        data.requestedExpectedWater >= get(tenantCyclePath).data.paidWater &&
+        get(tenantCyclePath).data.status in ['CLEARED', 'ARREARS'] &&
+        (!('workspaceId' in get(tenantCyclePath).data) || get(tenantCyclePath).data.workspaceId == data.workspaceId) &&
+        (sameWorkspace(get(tenantCyclePath).data) || (isLegacyManager() && legacyRecord(get(tenantCyclePath).data)));
+    }
+
+    function documentIsUnchanged(path) {
+      return (!exists(path) && !existsAfter(path)) ||
+        (exists(path) && existsAfter(path) &&
+          getAfter(path).data.diff(get(path).data).affectedKeys().hasOnly([]));
+    }
+
+    function tenantUpdateCycleIsUnchanged(appId, data) {
+      return !('activeCycleId' in data) || data.activeCycleId == '' ||
+        documentIsUnchanged(/databases/$(database)/documents/artifacts/$(appId)/public/data/tenantCycles/$(data.tenantId + '_' + data.activeCycleId));
+    }
+
+    function tenantChangeRequestRejectionEffectsMatch(appId, data) {
+      let tenantPath = /databases/$(database)/documents/artifacts/$(appId)/public/data/tenants/$(data.tenantId);
+      let housePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/houses/$(data.houseId);
+      return documentIsUnchanged(tenantPath) &&
+        (data.houseId == '' || documentIsUnchanged(housePath)) &&
+        (data.action != 'UPDATE_TENANT' || tenantUpdateCycleIsUnchanged(appId, data)) &&
+        (data.action != 'UPDATE_TENANT_BILL' || tenantBillCycleIsUnchanged(appId, data));
+    }
+
+    function tenantBillCycleIsUnchanged(appId, data) {
+      return documentIsUnchanged(/databases/$(database)/documents/artifacts/$(appId)/public/data/billingCycles/$(data.cycleId)) &&
+        documentIsUnchanged(/databases/$(database)/documents/artifacts/$(appId)/public/data/tenantCycles/$(data.tenantId + '_' + data.cycleId));
     }
 
     function tenantChangeRequestApprovalEffectsMatch(appId, data) {
@@ -281,7 +432,144 @@ service cloud.firestore {
           (data.houseId == '' ||
             (existsAfter(housePath) && getAfter(housePath).data.status == 'VACANT' &&
               getAfter(housePath).data.updatedBy == request.auth.uid &&
-              (sameWorkspace(getAfter(housePath).data) || (isLegacyLandlord() && legacyRecord(getAfter(housePath).data))))));
+              (sameWorkspace(getAfter(housePath).data) || (isLegacyLandlord() && legacyRecord(getAfter(housePath).data)))))) ||
+        (data.action == 'UPDATE_TENANT' && tenantUpdateApprovalEffectsMatch(appId, data)) ||
+        (data.action == 'UPDATE_TENANT_BILL' && tenantBillUpdateApprovalEffectsMatch(appId, data));
+    }
+
+    function tenantBillUpdateApprovalEffectsMatch(appId, data) {
+      let tenantPath = /databases/$(database)/documents/artifacts/$(appId)/public/data/tenants/$(data.tenantId);
+      let housePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/houses/$(data.houseId);
+      let billingCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/billingCycles/$(data.cycleId);
+      let tenantCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/tenantCycles/$(data.tenantId + '_' + data.cycleId);
+      return isLandlord() &&
+        data.cycleId is string && data.cycleId.size() > 0 && data.cycleId.size() <= 128 &&
+        data.currentExpectedRent is number && data.currentExpectedRent >= 0 && data.currentExpectedRent <= 1000000000000 &&
+        data.currentExpectedWater is number && data.currentExpectedWater >= 0 && data.currentExpectedWater <= 1000000000000 &&
+        data.requestedExpectedRent is number && data.requestedExpectedRent >= 0 && data.requestedExpectedRent <= 1000000000000 &&
+        data.requestedExpectedWater is number && data.requestedExpectedWater >= 0 && data.requestedExpectedWater <= 1000000000000 &&
+        exists(tenantPath) &&
+        (sameWorkspace(get(tenantPath).data) || (isLegacyLandlord() && legacyRecord(get(tenantPath).data))) &&
+        data.workspaceId == (get(tenantPath).data.workspaceId is string
+          ? get(tenantPath).data.workspaceId
+          : 'main-workspace') &&
+        data.phone == (get(tenantPath).data.phone is string ? get(tenantPath).data.phone : '') &&
+        data.contactPref == (get(tenantPath).data.contactPref is string ? get(tenantPath).data.contactPref : '') &&
+        exists(housePath) &&
+        (sameWorkspace(get(housePath).data) || (isLegacyLandlord() && legacyRecord(get(housePath).data))) &&
+        exists(billingCyclePath) && get(billingCyclePath).data.id == data.cycleId &&
+        get(billingCyclePath).data.status == 'CLOSED' && existsAfter(billingCyclePath) &&
+        getAfter(billingCyclePath).data.status == 'CLOSED' &&
+        (sameWorkspace(get(billingCyclePath).data) || (isLegacyLandlord() && legacyRecord(get(billingCyclePath).data))) &&
+        (sameWorkspace(getAfter(billingCyclePath).data) || (isLegacyLandlord() && legacyRecord(getAfter(billingCyclePath).data))) &&
+        getAfter(billingCyclePath).data.diff(get(billingCyclePath).data).affectedKeys().hasOnly([]) &&
+        exists(tenantCyclePath) && existsAfter(tenantCyclePath) &&
+        tenantBillUpdateBeforeMatchesRequest(get(tenantCyclePath).data, data) &&
+        tenantBillUpdateAfterMatchesRequest(getAfter(tenantCyclePath).data, get(tenantCyclePath).data, data) &&
+        (sameWorkspace(get(tenantCyclePath).data) || (isLegacyLandlord() && legacyRecord(get(tenantCyclePath).data))) &&
+        (sameWorkspace(getAfter(tenantCyclePath).data) || (isLegacyLandlord() && legacyRecord(getAfter(tenantCyclePath).data)));
+    }
+
+    function tenantBillUpdateBeforeMatchesRequest(bill, data) {
+      return bill.tenantId == data.tenantId && bill.cycleId == data.cycleId &&
+        bill.tenantName == data.tenantName && bill.houseId == data.houseId &&
+        bill.expectedRent == data.currentExpectedRent && bill.expectedWater == data.currentExpectedWater &&
+        bill.expectedRent is number && bill.expectedWater is number &&
+        bill.paidRent is number && bill.paidWater is number &&
+        bill.paidRent >= 0 && bill.paidRent <= bill.expectedRent &&
+        bill.paidWater >= 0 && bill.paidWater <= bill.expectedWater &&
+        data.requestedExpectedRent >= bill.paidRent &&
+        data.requestedExpectedWater >= bill.paidWater &&
+        bill.status in ['CLEARED', 'ARREARS'] &&
+        (!('workspaceId' in bill) || bill.workspaceId == data.workspaceId);
+    }
+
+    function tenantBillUpdateAfterMatchesRequest(afterBill, beforeBill, data) {
+      return afterBill.tenantId == data.tenantId && afterBill.cycleId == data.cycleId &&
+        afterBill.tenantName == beforeBill.tenantName && afterBill.houseId == data.houseId &&
+        afterBill.expectedRent == data.requestedExpectedRent &&
+        afterBill.expectedWater == data.requestedExpectedWater &&
+        afterBill.paidRent == beforeBill.paidRent && afterBill.paidWater == beforeBill.paidWater &&
+        closedTenantCycleStatusMatchesBalances(afterBill) &&
+        afterBill.updatedBy == request.auth.uid &&
+        afterBill.updatedAt is string && afterBill.updatedAt.size() > 0 && afterBill.updatedAt.size() <= 40 &&
+        afterBill.workspaceId == data.workspaceId &&
+        afterBill.diff(beforeBill).affectedKeys().hasAll(['expectedRent', 'expectedWater']) &&
+        afterBill.diff(beforeBill).affectedKeys().hasOnly([
+          'expectedRent', 'expectedWater', 'status', 'updatedBy', 'updatedAt', 'workspaceId'
+        ]);
+    }
+
+    function tenantUpdateCycleApprovalEffectsMatch(appId, data) {
+      // Rules cannot query for every OPEN billing cycle. The request supplies the
+      // cycle ID so this rule can validate the specific active cycle and row.
+      return data.activeCycleId == '' || tenantUpdateCycleApprovalEffectsForId(appId, data);
+    }
+
+    function tenantUpdateCycleApprovalEffectsForId(appId, data) {
+      let billingCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/billingCycles/$(data.activeCycleId);
+      let tenantCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/tenantCycles/$(data.tenantId + '_' + data.activeCycleId);
+      return data.activeCycleId.size() > 0 &&
+        exists(billingCyclePath) && get(billingCyclePath).data.status == 'OPEN' &&
+          (sameWorkspace(get(billingCyclePath).data) || (isLegacyLandlord() && legacyRecord(get(billingCyclePath).data))) &&
+          existsAfter(billingCyclePath) && getAfter(billingCyclePath).data.status == 'OPEN' &&
+          (sameWorkspace(getAfter(billingCyclePath).data) || (isLegacyLandlord() && legacyRecord(getAfter(billingCyclePath).data))) &&
+          ((!exists(tenantCyclePath) && !existsAfter(tenantCyclePath)) ||
+            (exists(tenantCyclePath) && existsAfter(tenantCyclePath) &&
+              get(tenantCyclePath).data.tenantId == data.tenantId &&
+              get(tenantCyclePath).data.cycleId == data.activeCycleId &&
+              get(tenantCyclePath).data.tenantName == data.tenantName &&
+              (!('workspaceId' in get(tenantCyclePath).data) || get(tenantCyclePath).data.workspaceId == data.workspaceId) &&
+              (sameWorkspace(get(tenantCyclePath).data) || (isLegacyLandlord() && legacyRecord(get(tenantCyclePath).data))) &&
+              getAfter(tenantCyclePath).data.tenantId == data.tenantId &&
+              getAfter(tenantCyclePath).data.cycleId == data.activeCycleId &&
+              getAfter(tenantCyclePath).data.tenantName == data.requestedName &&
+              getAfter(tenantCyclePath).data.updatedBy == request.auth.uid &&
+              getAfter(tenantCyclePath).data.workspaceId == data.workspaceId &&
+              getAfter(tenantCyclePath).data.updatedAt is string &&
+              getAfter(tenantCyclePath).data.updatedAt.size() > 0 && getAfter(tenantCyclePath).data.updatedAt.size() <= 40 &&
+              (sameWorkspace(getAfter(tenantCyclePath).data) || (isLegacyLandlord() && legacyRecord(getAfter(tenantCyclePath).data))) &&
+              getAfter(tenantCyclePath).data.diff(get(tenantCyclePath).data).affectedKeys().hasOnly([
+                'tenantName', 'updatedBy', 'updatedAt', 'workspaceId'
+              ])));
+    }
+
+    function tenantUpdateApprovalEffectsMatch(appId, data) {
+      let tenantPath = /databases/$(database)/documents/artifacts/$(appId)/public/data/tenants/$(data.tenantId);
+      let housePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/houses/$(data.houseId);
+      return data.action == 'UPDATE_TENANT' &&
+        data.requestedName is string && data.requestedName.size() > 0 && data.requestedName.size() <= 120 &&
+        data.requestedPhone is string && data.requestedPhone.size() <= 40 &&
+        data.requestedContactPref is string && data.requestedContactPref.size() <= 40 &&
+        data.activeCycleId is string && data.activeCycleId.size() <= 128 &&
+        exists(tenantPath) && existsAfter(tenantPath) &&
+        (sameWorkspace(get(tenantPath).data) || (isLegacyLandlord() && legacyRecord(get(tenantPath).data))) &&
+        (sameWorkspace(getAfter(tenantPath).data) || (isLegacyLandlord() && legacyRecord(getAfter(tenantPath).data))) &&
+        data.workspaceId == (get(tenantPath).data.workspaceId is string
+          ? get(tenantPath).data.workspaceId
+          : 'main-workspace') &&
+        data.tenantName == get(tenantPath).data.name &&
+        data.phone == (get(tenantPath).data.phone is string ? get(tenantPath).data.phone : '') &&
+        data.contactPref == (get(tenantPath).data.contactPref is string ? get(tenantPath).data.contactPref : '') &&
+        data.houseId == get(tenantPath).data.houseId &&
+        (!('status' in get(tenantPath).data) || get(tenantPath).data.status == 'ACTIVE') &&
+        !('archivedAt' in get(tenantPath).data) &&
+        exists(housePath) && existsAfter(housePath) &&
+        get(housePath).data.status == 'OCCUPIED' && getAfter(housePath).data.status == 'OCCUPIED' &&
+        (sameWorkspace(get(housePath).data) || (isLegacyLandlord() && legacyRecord(get(housePath).data))) &&
+        (sameWorkspace(getAfter(housePath).data) || (isLegacyLandlord() && legacyRecord(getAfter(housePath).data))) &&
+        getAfter(housePath).data.diff(get(housePath).data).affectedKeys().hasOnly([]) &&
+        getAfter(tenantPath).data.name == data.requestedName &&
+        getAfter(tenantPath).data.phone == data.requestedPhone &&
+        getAfter(tenantPath).data.contactPref == data.requestedContactPref &&
+        getAfter(tenantPath).data.houseId == data.houseId &&
+        getAfter(tenantPath).data.updatedBy == request.auth.uid &&
+        getAfter(tenantPath).data.workspaceId == data.workspaceId &&
+        getAfter(tenantPath).data.updatedAt is string &&
+        getAfter(tenantPath).data.updatedAt.size() > 0 && getAfter(tenantPath).data.updatedAt.size() <= 40 &&
+        getAfter(tenantPath).data.diff(get(tenantPath).data).affectedKeys().hasOnly([
+          'name', 'phone', 'contactPref', 'updatedBy', 'updatedAt', 'workspaceId'
+        ]) && tenantUpdateCycleApprovalEffectsMatch(appId, data);
     }
 
     function tenantChangeRequestUpdateIsValid(appId) {
@@ -294,7 +582,9 @@ service cloud.firestore {
         request.resource.data.diff(resource.data).affectedKeys().hasOnly([
           'status', 'reviewedAt', 'reviewedBy', 'updatedBy'
         ]) &&
-        (request.resource.data.status == 'REJECTED' || tenantChangeRequestApprovalEffectsMatch(appId, resource.data));
+        (request.resource.data.status == 'REJECTED'
+          ? tenantChangeRequestRejectionEffectsMatch(appId, resource.data)
+          : tenantChangeRequestApprovalEffectsMatch(appId, resource.data));
     }
 
     function tenantPricingUpdateIsValid(appId) {
@@ -340,7 +630,8 @@ service cloud.firestore {
     function tenantCycleParentIsClosed(appId, data) {
       let billingCyclePath = /databases/$(database)/documents/artifacts/$(appId)/public/data/billingCycles/$(data.cycleId);
       return exists(billingCyclePath) && get(billingCyclePath).data.status == 'CLOSED' &&
-        sameWorkspace(get(billingCyclePath).data);
+        (sameWorkspace(get(billingCyclePath).data) ||
+          (isLegacyLandlord() && legacyRecord(get(billingCyclePath).data)));
     }
 
     function closedTenantCycleStatusMatchesBalances(data) {
@@ -356,7 +647,8 @@ service cloud.firestore {
       return isLandlord() && isValidTenantCycle(data, recordId) &&
         tenantCycleParentIsClosed(appId, data) &&
         data.diff(resource.data).affectedKeys().hasOnly([
-          'expectedRent', 'expectedWater', 'paidRent', 'paidWater', 'status', 'updatedBy'
+          'expectedRent', 'expectedWater', 'paidRent', 'paidWater', 'status',
+          'updatedBy', 'updatedAt', 'workspaceId'
         ]) &&
         closedTenantCycleStatusMatchesBalances(data);
     }
@@ -455,7 +747,7 @@ service cloud.firestore {
           tenantCycleParentIsOpen(appId, request.resource.data) &&
           request.resource.data.diff(resource.data).affectedKeys().hasOnly([
             'tenantName', 'houseId', 'expectedRent', 'expectedWater', 'paidRent',
-            'paidWater', 'status', 'updatedBy'
+            'paidWater', 'status', 'updatedBy', 'updatedAt', 'workspaceId'
           ])) ||
         (collectionName == 'tenantCycles' && landlordClosedTenantCycleUpdateIsValid(appId, recordId)) ||
         (collectionName == 'payments' &&
@@ -488,20 +780,30 @@ service cloud.firestore {
     }
 
     match /artifacts/{appId}/public/data/{collectionName}/{recordId} {
-      // Compatibility reads preserve the existing UID-based accounts while they migrate.
-      allow read: if isLegacyLandlord() ||
-        (isLegacyManager() && managerCollectionAllowed(collectionName)) ||
-        (isLandlord() && sameWorkspace(resource.data)) ||
-        (isManager() && managerCollectionAllowed(collectionName) && sameWorkspace(resource.data));
+      // Legacy accounts still use unfiltered collection queries. Keep their temporary
+      // compatibility access until the old records and queries are migrated to workspace filters.
+      // Proposed tenant detail edits and bill changes remain landlord-only.
+      allow read: if (collectionName == 'tenantChangeRequests' &&
+          (isLegacyLandlord() || (isLandlord() && sameWorkspace(resource.data)) ||
+            (isManager() && resource.data.createdBy == request.auth.uid &&
+              resource.data.action in ['CREATE_TENANT', 'DELETE_TENANT'] &&
+              (sameWorkspace(resource.data) || (isLegacyManager() && legacyRecord(resource.data)))))) ||
+        (collectionName != 'tenantChangeRequests' &&
+          (isLegacyLandlord() ||
+            (isManager() && managerCollectionAllowed(collectionName) &&
+              (isLegacyManager() || sameWorkspace(resource.data))) ||
+            (isLandlord() && sameWorkspace(resource.data))));
 
       allow create: if isLandlord() &&
         sameWorkspace(request.resource.data) &&
+        (collectionName != 'notifications' || sameWorkspace(request.resource.data)) &&
         request.resource.data.createdBy == request.auth.uid &&
         isValidCollectionCreate(collectionName, appId, request.resource.data, recordId);
 
       allow create: if isManager() &&
         managerCanCreate(collectionName) &&
         sameWorkspace(request.resource.data) &&
+        (collectionName != 'notifications' || sameWorkspace(request.resource.data)) &&
         request.resource.data.createdBy == request.auth.uid &&
         !isCycleCollection(collectionName) &&
         (collectionName != 'garbageLogs' || isValidGarbageLog(request.resource.data)) &&
@@ -511,6 +813,7 @@ service cloud.firestore {
       allow update: if isLandlord() &&
         (sameWorkspace(resource.data) || (isLegacyLandlord() && legacyRecord(resource.data))) &&
         (sameWorkspace(request.resource.data) || (isLegacyLandlord() && legacyRecord(request.resource.data))) &&
+        (collectionName != 'notifications' || notificationWriteIsWorkspaceScoped(resource.data, request.resource.data)) &&
         request.resource.data.updatedBy == request.auth.uid &&
         (collectionName != 'tenants' || tenantPricingUpdateIsValid(appId)) &&
         (collectionName != 'tenantChangeRequests' || tenantChangeRequestUpdateIsValid(appId)) &&
@@ -519,10 +822,12 @@ service cloud.firestore {
 
       allow update: if isManager() &&
         managerCollectionAllowed(collectionName) &&
+        collectionName != 'tenants' &&
         collectionName != 'billingCycles' &&
         collectionName != 'tenantChangeRequests' &&
         (sameWorkspace(resource.data) || (isLegacyManager() && legacyRecord(resource.data))) &&
         (sameWorkspace(request.resource.data) || (isLegacyManager() && legacyRecord(request.resource.data))) &&
+        (collectionName != 'notifications' || notificationWriteIsWorkspaceScoped(resource.data, request.resource.data)) &&
         request.resource.data.updatedBy == request.auth.uid &&
         cycleUpdateIsValid(collectionName, appId, recordId) &&
         managerCanUpdateRecord(collectionName, appId, recordId);

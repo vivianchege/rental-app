@@ -4,6 +4,9 @@ import { FirebaseAuthentication } from '@capacitor-firebase/authentication';
 import { App as CapacitorApp } from '@capacitor/app';
 import { BiometricAuth } from '@aparajita/capacitor-biometric-auth';
 import { Preferences } from '@capacitor/preferences';
+import { Browser } from '@capacitor/browser';
+import { Device } from '@capacitor/device';
+import { getFunctions, httpsCallable } from 'firebase/functions';
 import { 
   Users, Home, Wallet, Wrench, LayoutDashboard, LogOut, Trash2,
   CheckCircle2, Plus, AlertCircle, Phone, X, ShieldCheck,
@@ -11,12 +14,14 @@ import {
   Droplet, Truck, Sun, Moon, BellRing, Menu,
   Eye, EyeOff, Download, Search, ReceiptText, FileBarChart, Fingerprint,
   Settings, Bell, Building2, Activity,
-  SlidersHorizontal, Database, ArrowUpRight, ArrowLeft, RotateCcw
+  SlidersHorizontal, Database, ArrowUpRight, ArrowLeft, RotateCcw, Sparkles, Send, MessageCircle
 } from 'lucide-react';
 import { allocatePayment, parseMoney } from './lib/money.js';
 import { canAccessWorkspaceRecord, hasPermission, normalizeRole, PERMISSIONS, ROLES } from './lib/permissions.js';
 import { APP_IDLE_TIMEOUT_MS, formatLockoutDuration, getCurrentTimestamp, getNextPasswordFailure, getRemainingLockoutSeconds } from './lib/authSecurity.js';
 import { firebaseClientConfig } from './lib/firebaseClientConfig.js';
+import { probeInternetAccess } from './lib/connectivity.js';
+import { checkForAppUpdate } from './lib/releaseUpdates.js';
 
 // --- FIREBASE IMPORTS ---
 import { initializeApp, getApps, getApp } from 'firebase/app';
@@ -90,10 +95,29 @@ const auth = app ? (Capacitor.isNativePlatform()
 const db = app ? initializeFirestore(app, {
   localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
 }) : null;
+const functionsClient = app ? getFunctions(app, 'us-central1') : null;
 const appId = firebaseConfig.projectId || 'house-management-portal';
 const DEFAULT_CURRENCY = import.meta.env.VITE_DEFAULT_CURRENCY || 'KES';
 const DEFAULT_TIMEZONE = import.meta.env.VITE_DEFAULT_TIMEZONE || 'Africa/Nairobi';
+const formatKes = (amount) => new Intl.NumberFormat('en-KE', {
+  style: 'currency',
+  currency: DEFAULT_CURRENCY,
+  maximumFractionDigits: 2,
+}).format(Number(amount || 0));
 const DEFAULT_WORKSPACE_ID = import.meta.env.VITE_DEFAULT_WORKSPACE_ID || 'main-workspace';
+const APP_RELEASE_VERSION = import.meta.env.VITE_APP_VERSION || '1.6.0';
+const androidApiLevelFromUserAgent = () => {
+  const match = /Android\s+(\d+)(?:\.(\d+))?/i.exec(navigator.userAgent || '');
+  if (!match) return null;
+  const major = Number(match[1]);
+  const minor = Number(match[2] || 0);
+  if (major >= 13) return major + 20;
+  if (major >= 10) return major + 19;
+  if (major === 9) return 28;
+  if (major === 8) return minor >= 1 ? 27 : 26;
+  if (major === 7) return minor >= 1 ? 25 : 24;
+  return null;
+};
 const compareNatural = (left, right) => String(left || '').localeCompare(String(right || ''), undefined, { numeric: true, sensitivity: 'base' });
 const DATA_COLLECTION_LABELS = {
   houses: 'houses', tenants: 'tenants', payments: 'payments', repairs: 'maintenance',
@@ -109,6 +133,21 @@ const describeSnapshotError = (error, collectionName) => {
   if (error?.code === 'permission-denied') return `Access to ${DATA_COLLECTION_LABELS[collectionName] || collectionName} was denied by Firebase rules.`;
   if (error?.code === 'unavailable') return `${DATA_COLLECTION_LABELS[collectionName] || collectionName} are temporarily unavailable. Check your connection.`;
   return `${DATA_COLLECTION_LABELS[collectionName] || collectionName} could not be synchronized.`;
+};
+const rentalAssistantErrorMessage = (error, landlord = false) => {
+  const code = String(error?.code || '').replace(/^functions\//, '').toLowerCase();
+  if (code === 'not-found') {
+    return landlord
+      ? 'The rental assistant backend has not been deployed to this Firebase project yet.'
+      : 'The rental assistant is not available yet. Please contact the landlord.';
+  }
+  if (code === 'failed-precondition') {
+    return landlord
+      ? error?.message || 'The rental assistant still needs its secure Google Cloud setup.'
+      : 'The rental assistant is not ready yet. Please contact the landlord.';
+  }
+  if (code === 'permission-denied') return 'Your account does not have access to the rental assistant.';
+  return error?.message || 'The rental assistant is temporarily unavailable. Please try again later.';
 };
 
 // Temporary compatibility bridge for the existing live accounts. Create users/{uid}
@@ -200,6 +239,8 @@ const escapeHtml = (value) => String(value ?? '')
 export default function App() {
   const [theme, setTheme] = useState(() => localStorage.getItem('ruiru_theme') || 'light');
   const [user, setUser] = useState(null);
+  const [internetAvailable, setInternetAvailable] = useState(false);
+  const [internetCheckPending, setInternetCheckPending] = useState(true);
   const [isAppLocked, setIsAppLocked] = useState(false);
   const [biometricLabel, setBiometricLabel] = useState('biometric');
   const [biometricError, setBiometricError] = useState('');
@@ -244,6 +285,7 @@ export default function App() {
   const [backfillCycleYear, setBackfillCycleYear] = useState(() => getPreviousMonthParts().year);
   const [selectedDashboardCycleId, setSelectedDashboardCycleId] = useState('ACTIVE');
   const [selectedPaymentCycleId, setSelectedPaymentCycleId] = useState('');
+  const [focusedBillingTenantId, setFocusedBillingTenantId] = useState('');
   const [tenantSearch, setTenantSearch] = useState('');
   const [tenantStatusFilter, setTenantStatusFilter] = useState('ALL');
   const [paymentMonthFilter, setPaymentMonthFilter] = useState(createCurrentMonthKey);
@@ -271,7 +313,22 @@ export default function App() {
   const [expenses, setExpenses] = useState([]);
   const [activityLogs, setActivityLogs] = useState([]);
   const [notifications, setNotifications] = useState([]);
+  const [isNotificationsOpen, setIsNotificationsOpen] = useState(false);
+  const [notificationReadAt, setNotificationReadAt] = useState(0);
   const [tenantChangeRequests, setTenantChangeRequests] = useState([]);
+  const [managerAccounts, setManagerAccounts] = useState([]);
+  const [managerAccountsLoading, setManagerAccountsLoading] = useState(false);
+  const [managerAccountsError, setManagerAccountsError] = useState('');
+  const [availableAppUpdate, setAvailableAppUpdate] = useState(null);
+  const [showAppUpdateNotice, setShowAppUpdateNotice] = useState(false);
+  const [appUpdateCheckPending, setAppUpdateCheckPending] = useState(false);
+  const [appUpdateCheckMessage, setAppUpdateCheckMessage] = useState('');
+  const [assistantMessages, setAssistantMessages] = useState([]);
+  const [assistantInput, setAssistantInput] = useState('');
+  const [assistantPending, setAssistantPending] = useState(false);
+  const [assistantError, setAssistantError] = useState('');
+  const [assistantHistoryPending, setAssistantHistoryPending] = useState(false);
+  const assistantEndRef = useRef(null);
 
   const isLandlord = hasPermission(role, PERMISSIONS.MANAGE_SETTINGS);
   const canManageProperties = hasPermission(role, PERMISSIONS.MANAGE_PROPERTIES);
@@ -332,6 +389,53 @@ export default function App() {
     setSyncIssues([]);
   }, []);
 
+  useEffect(() => {
+    let disposed = false;
+    let checking = false;
+    let networkEventVersion = 0;
+
+    const checkConnection = async () => {
+      if (checking || disposed) return;
+      if (navigator.onLine === false) {
+        setInternetAvailable(false);
+        setInternetCheckPending(false);
+        clearWorkspaceData();
+        return;
+      }
+      checking = true;
+      const eventVersion = networkEventVersion;
+      const reachable = await probeInternetAccess({ apiKey: firebaseConfig.apiKey });
+      checking = false;
+      if (disposed || eventVersion !== networkEventVersion) return;
+      setInternetAvailable(reachable);
+      setInternetCheckPending(false);
+      if (!reachable) clearWorkspaceData();
+    };
+
+    const handleOffline = () => {
+      networkEventVersion += 1;
+      setInternetAvailable(false);
+      setInternetCheckPending(false);
+      clearWorkspaceData();
+    };
+    const handleOnline = () => {
+      networkEventVersion += 1;
+      setInternetCheckPending(true);
+      void checkConnection();
+    };
+
+    void checkConnection();
+    window.addEventListener('offline', handleOffline);
+    window.addEventListener('online', handleOnline);
+    const intervalId = window.setInterval(() => { void checkConnection(); }, 20000);
+    return () => {
+      disposed = true;
+      window.clearInterval(intervalId);
+      window.removeEventListener('offline', handleOffline);
+      window.removeEventListener('online', handleOnline);
+    };
+  }, [clearWorkspaceData]);
+
   const loadLoginSecurityState = useCallback(async () => {
     try {
       const { value } = await Preferences.get({ key: 'ruiru_login_security' });
@@ -364,6 +468,127 @@ export default function App() {
     setLoginSecurity({ failedAttempts: 0, lockedUntil: 0 });
     setLockoutClock(getCurrentTimestamp());
   }, []);
+
+  const refreshManagerAccounts = useCallback(async () => {
+    if (!user || role !== ROLES.LANDLORD || !functionsClient) return;
+    setManagerAccountsLoading(true);
+    setManagerAccountsError('');
+    try {
+      const { data } = await httpsCallable(functionsClient, 'listWorkspaceManagers')({});
+      setManagerAccounts(Array.isArray(data?.managers) ? data.managers : []);
+    } catch (error) {
+      setManagerAccountsError(error?.message?.replace(/^Firebase:\s*/i, '') || 'Could not load manager accounts.');
+    } finally {
+      setManagerAccountsLoading(false);
+    }
+  }, [role, user]);
+
+  useEffect(() => {
+    if (activeTab !== 'settings' || !isLandlord || !internetAvailable) return undefined;
+    const timer = window.setTimeout(() => { void refreshManagerAccounts(); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [activeTab, isLandlord, internetAvailable, refreshManagerAccounts]);
+
+  const handleManagerAccessChange = async (manager) => {
+    if (!functionsClient || role !== ROLES.LANDLORD || isProcessing) return;
+    setIsProcessing(true);
+    setManagerAccountsError('');
+    try {
+      await httpsCallable(functionsClient, 'setManagerAccess')({
+        uid: manager.uid,
+        disabled: !manager.disabled,
+      });
+      await writeWorkspaceNotification({
+        title: manager.disabled ? 'Manager access restored' : 'Manager access turned off',
+        message: `${manager.displayName || manager.email || 'A manager'}’s sign-in access was ${manager.disabled ? 'restored' : 'turned off'} by the landlord.`,
+        action: manager.disabled ? 'MANAGER_ACCESS_RESTORED' : 'MANAGER_ACCESS_DISABLED',
+        entity: 'manager', entityId: manager.uid,
+      });
+      setToastMessage(manager.disabled ? `${manager.displayName || manager.email || 'Manager'} access restored.` : `${manager.displayName || manager.email || 'Manager'} access turned off.`);
+      await refreshManagerAccounts();
+    } catch (error) {
+      setManagerAccountsError(error?.message?.replace(/^Firebase:\s*/i, '') || 'Could not update manager access.');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const checkAppUpdate = useCallback(async ({ force = false } = {}) => {
+    const isAndroidDevice = Capacitor.isNativePlatform() || /Android/i.test(navigator.userAgent || '');
+    if (!isAndroidDevice) return null;
+
+    setAppUpdateCheckPending(true);
+    setAppUpdateCheckMessage('');
+    try {
+      const deviceInfo = Capacitor.isNativePlatform() ? await Device.getInfo().catch(() => null) : null;
+      const androidApiLevel = Number(deviceInfo?.androidSDKVersion) || androidApiLevelFromUserAgent();
+      if (!androidApiLevel) throw new Error('Could not identify the Android version on this device.');
+
+      const cacheKey = 'ruiru_release_update_check';
+      if (!force) {
+        try {
+          const cached = JSON.parse(localStorage.getItem(cacheKey) || 'null');
+          if (cached?.checkedAt && Date.now() - cached.checkedAt < 6 * 60 * 60 * 1000) {
+            const info = cached.info || null;
+            setAvailableAppUpdate(info?.updateAvailable ? info : null);
+            if (info?.updateAvailable) {
+              const dismissedAt = Number(localStorage.getItem(`ruiru_update_dismissed_${info.latestVersion}`) || 0);
+              if (Date.now() - dismissedAt >= 24 * 60 * 60 * 1000) setShowAppUpdateNotice(true);
+            }
+            return info;
+          }
+        } catch {
+          // Ignore an invalid or unavailable cache and check GitHub directly.
+        }
+      }
+
+      const info = await checkForAppUpdate({ currentVersion: APP_RELEASE_VERSION, androidApiLevel });
+      setAvailableAppUpdate(info.updateAvailable ? info : null);
+      try { localStorage.setItem(cacheKey, JSON.stringify({ checkedAt: Date.now(), info })); } catch { /* Update checks still work without storage. */ }
+      if (info.updateAvailable) {
+        const dismissedAt = Number(localStorage.getItem(`ruiru_update_dismissed_${info.latestVersion}`) || 0);
+        if (force || Date.now() - dismissedAt >= 24 * 60 * 60 * 1000) setShowAppUpdateNotice(true);
+      } else if (force) {
+        setToastMessage('You are using the latest app version.');
+      }
+      return info;
+    } catch (error) {
+      if (force) {
+        const message = error?.message || 'Could not check for app updates.';
+        setAppUpdateCheckMessage(message);
+        setToastMessage(message);
+      }
+      return null;
+    } finally {
+      setAppUpdateCheckPending(false);
+    }
+  }, []);
+
+  const openAppUpdateDownload = async () => {
+    if (!availableAppUpdate?.apkDownloadUrl) return;
+    try {
+      if (Capacitor.isNativePlatform()) {
+        await Browser.open({ url: availableAppUpdate.apkDownloadUrl, toolbarColor: theme === 'dark' ? '#303030' : '#ffffff' });
+      } else {
+        window.open(availableAppUpdate.apkDownloadUrl, '_blank', 'noopener,noreferrer');
+      }
+    } catch {
+      setAppUpdateCheckMessage('Could not open the APK download. Open the release page and choose the APK for this Android version.');
+    }
+  };
+
+  const dismissAppUpdateNotice = () => {
+    if (availableAppUpdate?.latestVersion) {
+      try { localStorage.setItem(`ruiru_update_dismissed_${availableAppUpdate.latestVersion}`, String(Date.now())); } catch { /* Optional dismissal preference. */ }
+    }
+    setShowAppUpdateNotice(false);
+  };
+
+  useEffect(() => {
+    if (!internetAvailable) return undefined;
+    const timer = window.setTimeout(() => { void checkAppUpdate(); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [internetAvailable, checkAppUpdate]);
 
   const refreshDeviceBiometrics = useCallback(async () => {
     if (!Capacitor.isNativePlatform()) return null;
@@ -549,6 +774,16 @@ export default function App() {
           const resolvedRole = normalizeRole(token.claims.role || profile.role || LEGACY_ROLE_BY_UID[currentUser.uid]);
 
           if (!resolvedRole) throw new Error('Account permissions could not be verified.');
+          if (resolvedRole === ROLES.MANAGER && profile.disabled === true) {
+            setLoginError('Manager access has been turned off. Contact the landlord.');
+            await signOut(auth);
+            setUser(null);
+            setRole(null);
+            setUserProfile(null);
+            clearWorkspaceData();
+            setLoading(false);
+            return;
+          }
 
           setUser(currentUser);
           setUserProfile({
@@ -600,18 +835,18 @@ export default function App() {
   }, [refreshDeviceBiometrics, requestBiometricUnlock, clearWorkspaceData]);
 
   useEffect(() => {
-    if (!user || !db) return undefined;
+    if (!user || !db || !internetAvailable) return undefined;
 
     const getColRef = (colName) => {
       const ref = collection(db, 'artifacts', appId, 'public', 'data', colName);
-      const isLegacyAccount = Boolean(LEGACY_ROLE_BY_UID[user?.uid]);
+      const isLegacyAccount = LEGACY_ROLE_BY_UID[user?.uid] !== undefined;
       const needsWorkspaceQuery = [ROLES.LANDLORD, ROLES.MANAGER].includes(role) && !isLegacyAccount;
       return needsWorkspaceQuery ? query(ref, where('workspaceId', '==', workspaceId)) : ref;
     };
 
     const subscriptions = [];
-    const subscribe = (collectionName, setter, sortField, transform = records => records) => {
-      const unsubscribe = onSnapshot(getColRef(collectionName), (snap) => {
+    const subscribe = (collectionName, setter, sortField, transform = records => records, makeRef = getColRef) => {
+      const unsubscribe = onSnapshot(makeRef(collectionName), (snap) => {
         const records = snap.docs.map(snapshot => ({ id: snapshot.id, ...snapshot.data() }));
         setter(transform(sortField ? sortByDateDescending(records, sortField) : records));
         setSyncIssues(current => current.filter(issue => issue.collectionName !== collectionName));
@@ -634,13 +869,24 @@ export default function App() {
     if (role === ROLES.LANDLORD) subscribe('waterVaultResets', setWaterVaultResets, 'date');
     subscribe('expenses', setExpenses, 'date');
     if (role === ROLES.LANDLORD) subscribe('auditLogs', setActivityLogs, 'timestamp');
-    subscribe('notifications', setNotifications, 'createdAt');
-    subscribe('tenantChangeRequests', setTenantChangeRequests, 'requestedAt');
+    subscribe('notifications', setNotifications, 'createdAt', undefined, collectionName => query(
+      collectionRef(collectionName), where('workspaceId', '==', workspaceId)
+    ));
+    if (role === ROLES.LANDLORD) {
+      subscribe('tenantChangeRequests', setTenantChangeRequests, 'requestedAt');
+    } else if (role === ROLES.MANAGER) {
+      subscribe('tenantChangeRequests', setTenantChangeRequests, 'requestedAt', undefined, collectionName => query(
+        getColRef(collectionName),
+        ...(LEGACY_ROLE_BY_UID[user?.uid] !== undefined ? [where('workspaceId', '==', 'main-workspace')] : []),
+        where('createdBy', '==', user.uid),
+        where('action', 'in', ['CREATE_TENANT', 'DELETE_TENANT'])
+      ));
+    }
     subscribe('billingCycles', setBillingCycles, null, records => records.sort((left, right) => new Date(right.openedAt || 0) - new Date(left.openedAt || 0)));
     subscribe('tenantCycles', setTenantCycles);
 
     return () => subscriptions.forEach(unsubscribe => unsubscribe());
-  }, [user, role, workspaceId]);
+  }, [user, role, workspaceId, internetAvailable]);
 
   const activeCycle = useMemo(() => billingCycles.find(cycle => cycle.status === 'OPEN') || null, [billingCycles]);
   const selectedPaymentCycle = billingCycles.find(cycle => cycle.id === selectedPaymentCycleId) || activeCycle;
@@ -650,13 +896,20 @@ export default function App() {
   const viewedCycle = selectedDashboardCycleId === 'ACTIVE'
     ? activeCycle
     : billingCycles.find(cycle => cycle.id === selectedDashboardCycleId) || activeCycle;
+  const selectBillingCycleView = (cycleId) => {
+    setSelectedDashboardCycleId(cycleId);
+    const cycle = cycleId === 'ACTIVE' ? activeCycle : billingCycles.find(item => item.id === cycleId);
+    if (cycle) setPaymentMonthFilter(`${cycle.year}-${String(Number(cycle.monthIndex) + 1).padStart(2, '0')}`);
+  };
   const isHistoricalCycleView = Boolean(viewedCycle && viewedCycle.id !== activeCycle?.id);
   const viewedCycleTenantCycles = useMemo(() => tenantCycles
     .filter(cycle => cycle.cycleId === viewedCycle?.id)
     .sort((left, right) => compareNatural(left.tenantName, right.tenantName)), [tenantCycles, viewedCycle]);
   const activeTenants = useMemo(() => tenants.filter(t => t.status !== 'ARCHIVED' && !t.archivedAt), [tenants]);
   const visibleTenantChangeRequests = useMemo(() => tenantChangeRequests
-    .filter(request => isLandlord ? request.status === 'PENDING' : request.createdBy === user?.uid)
+    .filter(request => isLandlord
+      ? request.status === 'PENDING'
+      : request.createdBy === user?.uid && ['CREATE_TENANT', 'DELETE_TENANT'].includes(request.action))
     .sort((left, right) => new Date(right.requestedAt || 0) - new Date(left.requestedAt || 0)),
   [tenantChangeRequests, isLandlord, user]);
   const pendingTenantCreationHouseIds = useMemo(() => new Set(tenantChangeRequests
@@ -706,7 +959,7 @@ export default function App() {
     return new Set(activeTenants.map(t => t.houseId).filter(Boolean));
   }, [activeTenants]);
 
-  const recordDefaults = () => ({ workspaceId, createdBy: user?.uid || '', updatedBy: user?.uid || '' });
+  const recordDefaults = useCallback(() => ({ workspaceId, createdBy: user?.uid || '', updatedBy: user?.uid || '' }), [workspaceId, user?.uid]);
 
   const recordAudit = async (action, entity, entityId, metadata = {}) => {
     if (!db || !user) return;
@@ -726,6 +979,166 @@ export default function App() {
       // to fail, especially during logout or legacy-record migration.
     }
   };
+
+  const writeWorkspaceNotification = async ({ title, message, action, entity = 'workspace', entityId = '', tenantId = '', cycleId = '' }) => {
+    if (!db || !user) return;
+    try {
+      await addDoc(collectionRef('notifications'), {
+        ...recordDefaults(),
+        title: String(title || 'Workspace update').slice(0, 90),
+        message: String(message || '').slice(0, 240),
+        action: String(action || 'UPDATE').slice(0, 60),
+        entity,
+        entityId: String(entityId || '').slice(0, 150),
+        tenantId: String(tenantId || '').slice(0, 128),
+        cycleId: String(cycleId || '').slice(0, 128),
+        actorName: String(user.displayName || user.email || (role === ROLES.LANDLORD ? 'Landlord' : 'House manager')).slice(0, 120),
+        actorRole: role || '',
+        createdAt: new Date().toISOString(),
+      });
+    } catch {
+      // Notification delivery is best-effort and cannot make a saved change fail.
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      if (!user?.uid) {
+        setNotificationReadAt(0);
+        setIsNotificationsOpen(false);
+        return;
+      }
+      try {
+        setNotificationReadAt(Number(localStorage.getItem(`ruiru_notifications_seen_${user.uid}`) || 0));
+      } catch {
+        setNotificationReadAt(0);
+      }
+      setIsNotificationsOpen(false);
+    }, 0);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [user?.uid]);
+
+  const unreadNotificationCount = notifications.filter(notification => {
+    const createdAt = new Date(notification.createdAt || 0).getTime();
+    return Number.isFinite(createdAt) && createdAt > notificationReadAt;
+  }).length;
+
+  const orderedNotifications = useMemo(() => [...notifications].sort((left, right) =>
+    new Date(right.createdAt || 0).getTime() - new Date(left.createdAt || 0).getTime()), [notifications]);
+
+  useEffect(() => {
+    if (activeTab !== 'assistant' || !user || !internetAvailable) return undefined;
+    let cancelled = false;
+    Promise.resolve().then(() => {
+      if (cancelled) return null;
+      setAssistantHistoryPending(true);
+      setAssistantError('');
+      return httpsCallable(functionsClient, 'getRentalAssistantHistory')({ limit: 50 });
+    })
+      .then(result => result?.data || null)
+      .then(data => {
+        if (!cancelled && data) setAssistantMessages(Array.isArray(data?.messages) ? data.messages : []);
+      })
+      .catch(error => {
+        if (!cancelled) setAssistantError(rentalAssistantErrorMessage(error, isLandlord));
+      })
+      .finally(() => { if (!cancelled) setAssistantHistoryPending(false); });
+    return () => { cancelled = true; };
+  }, [activeTab, user, internetAvailable, isLandlord]);
+
+  useEffect(() => {
+    assistantEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, [assistantMessages, assistantPending]);
+
+  const openNotifications = () => {
+    const seenAt = Date.now();
+    setNotificationReadAt(seenAt);
+    setIsNotificationsOpen(true);
+    if (user?.uid) {
+      try { localStorage.setItem(`ruiru_notifications_seen_${user.uid}`, String(seenAt)); } catch { /* Optional per-device read marker. */ }
+    }
+  };
+
+  const openNotificationDestination = (notification) => {
+    const action = String(notification.action || '').toUpperCase();
+    const entity = String(notification.entity || '').toLowerCase();
+    const nextTab = entity === 'payment' || entity === 'tenant' || action.includes('BILL') || action.includes('PAYMENT')
+      ? 'billing'
+      : entity === 'unit' ? 'houses'
+        : entity === 'expense' ? 'expenses'
+          : ['maintenance', 'garbage_collection', 'septic'].includes(entity) ? 'repairs'
+            : ['utility_bill', 'water_vault'].includes(entity) ? 'utilities'
+              : 'activity';
+    if (notification.tenantId && nextTab === 'billing') {
+      setFocusedBillingTenantId(notification.tenantId);
+      setSelectedDashboardCycleId(notification.cycleId || 'ACTIVE');
+    }
+    setActiveTab(nextTab);
+    setIsNotificationsOpen(false);
+  };
+
+  const submitAssistantQuestion = async (event) => {
+    event?.preventDefault?.();
+    const question = assistantInput.trim();
+    if (!question || assistantPending || question.length > 1000 || !user || !internetAvailable) return;
+    setAssistantInput('');
+    setAssistantError('');
+    setAssistantPending(true);
+    setAssistantMessages(current => [...current, { id: `local-${Date.now()}`, role: 'user', content: question, createdAt: new Date().toISOString() }]);
+    try {
+      const { data } = await httpsCallable(functionsClient, 'askRentalAssistant')({ message: question });
+      if (Array.isArray(data?.messages)) setAssistantMessages(data.messages);
+      else {
+        const answer = String(data?.answer || data?.message || '').trim();
+        if (!answer) throw new Error('The assistant returned an empty answer. Please try again.');
+        setAssistantMessages(current => [...current, { id: `answer-${Date.now()}`, role: 'assistant', content: answer, createdAt: new Date().toISOString() }]);
+      }
+    } catch (error) {
+      setAssistantError(rentalAssistantErrorMessage(error, isLandlord));
+    } finally {
+      setAssistantPending(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!user?.uid || !db || !internetAvailable || !activeCycle || activeTenants.length === 0) return;
+    const overdueTenants = activeTenants.flatMap(tenant => {
+      const cycle = activeTenantCycles.get(tenant.id);
+      if (!cycle) return [];
+      const house = houses.find(item => item.id === tenant.houseId);
+      const expectedRent = Number(cycle.expectedRent ?? house?.rent ?? tenant.expectedRent ?? 0);
+      const balance = Math.max(0, expectedRent - Number(cycle.paidRent || 0)) +
+        Math.max(0, Number(cycle.expectedWater || 0) - Number(cycle.paidWater || 0));
+      const largeBalanceThreshold = Math.max(5000, expectedRent * 1.5);
+      return balance >= largeBalanceThreshold ? [{ tenant, house, balance }] : [];
+    });
+    if (overdueTenants.length === 0) return;
+
+    const dayKey = new Date().toLocaleDateString('en-CA', { timeZone: DEFAULT_TIMEZONE });
+    const workspaceKey = String(workspaceId || 'workspace').replace(/[^A-Za-z0-9_-]/g, '_');
+    const reminderRef = documentRef('notifications', `balance-reminder-${workspaceKey}-${dayKey}`);
+    const { tenant, house, balance } = overdueTenants[Math.floor(Math.random() * overdueTenants.length)];
+    void runTransaction(db, async transaction => {
+      const existing = await transaction.get(reminderRef);
+      if (existing.exists()) return;
+      transaction.set(reminderRef, {
+        ...recordDefaults(),
+        title: 'Balance follow-up reminder',
+        message: `${tenant.name} · ${house?.name || 'unit unavailable'} has ${formatKes(balance)} outstanding for ${activeCycle.month}. Review this tenant’s billing record and follow up.`,
+        action: 'BALANCE_REMINDER',
+        entity: 'tenant',
+        entityId: tenant.id,
+        tenantId: tenant.id,
+        cycleId: activeCycle.id,
+        actorName: 'Daily balance reminder',
+        actorRole: 'SYSTEM',
+        createdAt: new Date().toISOString(),
+        reminderDate: dayKey,
+      });
+    }).catch(() => {});
+  }, [user?.uid, workspaceId, recordDefaults, internetAvailable, activeCycle, activeTenants, activeTenantCycles, houses]);
 
   // Handle standard email password sign in
   const handleLoginSubmit = async (e) => {
@@ -805,6 +1218,12 @@ export default function App() {
       const profileSnapshot = db ? await getDoc(doc(db, 'users', result.user.uid)) : null;
       const profile = profileSnapshot?.exists() ? profileSnapshot.data() : {};
       const resolvedRole = normalizeRole(token.claims.role || profile.role || LEGACY_ROLE_BY_UID[result.user.uid]);
+      if (resolvedRole === ROLES.MANAGER && profile.disabled === true) {
+        rejectedGoogleUserUid.current = result.user.uid;
+        await signOut(auth);
+        setLoginError('Manager access has been turned off. Contact the landlord.');
+        return;
+      }
       if (!resolvedRole) {
         rejectedGoogleUserUid.current = result.user.uid;
         setUser(null);
@@ -886,12 +1305,6 @@ export default function App() {
     setter(false);
     setModalError('');
   };
-
-  const formatKes = (amount) => new Intl.NumberFormat('en-KE', {
-    style: 'currency',
-    currency: DEFAULT_CURRENCY,
-    maximumFractionDigits: 2,
-  }).format(Number(amount || 0));
 
   // --- PROFESSIONAL PDF / PRINTING ENGINE ---
   const printReceipt = (payment, tenant) => {
@@ -1146,8 +1559,12 @@ export default function App() {
       const rawHouseName = formData.get('name').trim();
       const rent = parseMoney(formData.get('rent'), { allowZero: true });
       const type = formData.get('type');
+      const beneficiaryName = String(formData.get('beneficiaryName') || '').trim();
+      const beneficiaryPhone = String(formData.get('beneficiaryPhone') || '').trim();
 
       if (!rawHouseName) throw new Error("Unit name cannot be blank.");
+      if (beneficiaryName.length > 120) throw new Error('Rent recipient name must be 120 characters or less.');
+      if (beneficiaryPhone.length > 40) throw new Error('Rent recipient contact must be 40 characters or less.');
       if (houses.some(h => h.id !== selectedHouseForEdit?.id && h.name.trim().toLowerCase() === rawHouseName.toLowerCase())) {
         throw new Error(`A unit named "${rawHouseName}" already exists in your inventory.`);
       }
@@ -1158,17 +1575,21 @@ export default function App() {
           name: rawHouseName,
           type,
           rent,
+          beneficiaryName,
+          beneficiaryPhone,
           ...makeRecordMetadata(user, true),
           updatedAt: new Date().toISOString(),
         }), 5000);
         await recordAudit('UNIT_UPDATED', 'unit', selectedHouseForEdit.id, { name: rawHouseName, rent });
+        await writeWorkspaceNotification({ title: 'Unit details updated', message: `${rawHouseName} rent target: ${formatKes(rent)}.${beneficiaryName ? ` Rent recipient: ${beneficiaryName}.` : ''}`, action: 'UNIT_UPDATED', entity: 'unit', entityId: selectedHouseForEdit.id });
       } else {
         const created = await promiseTimeout(addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'houses'), {
           ...recordDefaults(),
-          name: rawHouseName, type, rent,
+          name: rawHouseName, type, rent, beneficiaryName, beneficiaryPhone,
           status: 'VACANT', repairStatus: 'GOOD', createdAt: new Date().toISOString()
         }), 5000);
         await recordAudit('UNIT_CREATED', 'unit', created.id, { name: rawHouseName });
+        await writeWorkspaceNotification({ title: 'Unit added', message: `${rawHouseName} was added to the property list.${beneficiaryName ? ` Rent recipient: ${beneficiaryName}.` : ''}`, action: 'UNIT_CREATED', entity: 'unit', entityId: created.id });
       }
       closeAnyModal(setIsHouseModalOpen);
       setSelectedHouseForEdit(null);
@@ -1183,6 +1604,7 @@ export default function App() {
       const updatePromise = updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'houses', house.id), { status: newStatus, updatedBy: user.uid, updatedAt: new Date().toISOString() });
       await promiseTimeout(updatePromise, 5000);
       await recordAudit('UNIT_STATUS_CHANGED', 'unit', house.id, { status: newStatus });
+      await writeWorkspaceNotification({ title: newStatus === 'UNDER_REPAIR' ? 'Unit marked for repair' : 'Unit repair status cleared', message: `${house.name} is now ${newStatus === 'UNDER_REPAIR' ? 'marked under repair' : 'available for normal use'}.`, action: 'UNIT_STATUS_CHANGED', entity: 'unit', entityId: house.id });
     } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
@@ -1220,6 +1642,7 @@ export default function App() {
         };
         const requestRef = await promiseTimeout(addDoc(collectionRef('tenantChangeRequests'), requestData), 5000);
         await recordAudit('TENANT_CREATION_REQUESTED', 'tenant_change_request', requestRef.id, { tenantId: tenantRef.id, houseId });
+        await writeWorkspaceNotification({ title: 'New tenant registration request', message: `${name} was submitted for ${houses.find(house => house.id === houseId)?.name || 'a vacant unit'}.`, action: 'TENANT_CREATION_REQUESTED', entity: 'tenant', entityId: tenantRef.id, tenantId: tenantRef.id });
         closeAnyModal(setIsTenantModalOpen);
         setToastMessage(`Tenant request for ${name} was sent to the landlord for approval.`);
         return;
@@ -1272,6 +1695,7 @@ export default function App() {
         }
       }), 5000);
       await recordAudit('TENANT_CREATED', 'tenant', tenantRef.id, { houseId });
+      await writeWorkspaceNotification({ title: 'Tenant registered', message: `${name} was added to ${houses.find(house => house.id === houseId)?.name || 'a house unit'}.`, action: 'TENANT_CREATED', entity: 'tenant', entityId: tenantRef.id, tenantId: tenantRef.id });
       closeAnyModal(setIsTenantModalOpen);
     } catch (err) { setModalError(describeActionError(err, 'registering the tenant')); } finally { setIsProcessing(false); }
   };
@@ -1352,6 +1776,60 @@ export default function App() {
             ...makeRecordMetadata(user, true),
           });
           if (houseRef) transaction.update(houseRef, { status: 'VACANT', ...makeRecordMetadata(user, true), updatedAt: now });
+        } else if (decision === 'APPROVED' && request.action === 'UPDATE_TENANT') {
+          const tenantRef = documentRef('tenants', request.tenantId);
+          const tenantSnapshot = await transaction.get(tenantRef);
+          if (!tenantSnapshot.exists()) throw new Error('The tenant record no longer exists.');
+          const tenant = tenantSnapshot.data();
+          if (tenant.status === 'ARCHIVED' || tenant.archivedAt) throw new Error('This tenant is no longer active.');
+          if (tenant.name !== request.tenantName || String(tenant.phone || '') !== request.phone || String(tenant.contactPref || '') !== request.contactPref || String(tenant.houseId || '') !== request.houseId) {
+            throw new Error('The tenant record changed after this request was submitted. Refresh and review the current details.');
+          }
+          const requestedName = String(request.requestedName || '').trim();
+          const requestedPhone = String(request.requestedPhone || '').trim();
+          const requestedContactPref = String(request.requestedContactPref || '').trim();
+          if (!requestedName || requestedName.length > 120 || !requestedPhone || requestedPhone.length > 40 || requestedContactPref.length > 40) {
+            throw new Error('The requested tenant details are invalid. Decline this request and ask the manager to resubmit it.');
+          }
+          const cycleTenantRef = activeCycle ? documentRef('tenantCycles', tenantCycleDocumentId(request.tenantId, activeCycle.id)) : null;
+          const cycleTenantSnapshot = cycleTenantRef ? await transaction.get(cycleTenantRef) : null;
+          const now = new Date().toISOString();
+          transaction.update(tenantRef, {
+            name: requestedName,
+            phone: requestedPhone,
+            contactPref: requestedContactPref,
+            ...makeRecordMetadata(user, true),
+            updatedAt: now,
+          });
+          if (cycleTenantSnapshot?.exists()) {
+            transaction.update(cycleTenantRef, { tenantName: requestedName, ...makeRecordMetadata(user, true), updatedAt: now });
+          }
+        } else if (decision === 'APPROVED' && request.action === 'UPDATE_TENANT_BILL') {
+          const cycleRef = documentRef('billingCycles', request.cycleId);
+          const cycleTenantRef = documentRef('tenantCycles', tenantCycleDocumentId(request.tenantId, request.cycleId));
+          const [cycleSnapshot, cycleTenantSnapshot] = await Promise.all([
+            transaction.get(cycleRef),
+            transaction.get(cycleTenantRef),
+          ]);
+          if (!cycleSnapshot.exists() || cycleSnapshot.data().status !== 'CLOSED') throw new Error('This billing month is no longer closed. Refresh and review the request again.');
+          if (!cycleTenantSnapshot.exists()) throw new Error('This tenant bill no longer exists.');
+          const current = cycleTenantSnapshot.data();
+          if (current.tenantId !== request.tenantId || current.cycleId !== request.cycleId || Number(current.expectedRent) !== Number(request.currentExpectedRent) || Number(current.expectedWater) !== Number(request.currentExpectedWater)) {
+            throw new Error('The bill changed after the manager submitted this request. Review the latest bill before deciding.');
+          }
+          const expectedRent = parseMoney(request.requestedExpectedRent, { allowZero: true });
+          const expectedWater = parseMoney(request.requestedExpectedWater, { allowZero: true });
+          if (expectedRent < Number(current.paidRent || 0) || expectedWater < Number(current.paidWater || 0)) {
+            throw new Error('The requested bill is lower than an amount already paid. Decline the request and ask for a corrected one.');
+          }
+          const updated = { ...current, expectedRent, expectedWater };
+          transaction.update(cycleTenantRef, {
+            expectedRent,
+            expectedWater,
+            status: finalizeTenantCycle(updated).status,
+            ...makeRecordMetadata(user, true),
+            updatedAt: now,
+          });
         } else if (decision === 'APPROVED') {
           throw new Error('This request type is not supported.');
         }
@@ -1364,10 +1842,21 @@ export default function App() {
         });
       }), 10000);
       const approved = decision === 'APPROVED';
-      const actionName = changeRequest.action === 'CREATE_TENANT' ? 'registration' : 'removal';
+      const actionName = changeRequest.action === 'CREATE_TENANT' ? 'registration' : changeRequest.action === 'UPDATE_TENANT' ? 'details change' : changeRequest.action === 'UPDATE_TENANT_BILL' ? 'past bill correction' : 'removal';
       await recordAudit(`TENANT_${actionName.toUpperCase()}_${decision}`, 'tenant_change_request', changeRequest.id, { tenantId: changeRequest.tenantId });
+      if (changeRequest.action !== 'UPDATE_TENANT' || approved) await writeWorkspaceNotification({
+        title: changeRequest.action === 'CREATE_TENANT' ? (approved ? 'Tenant registered' : 'Tenant request declined') : changeRequest.action === 'UPDATE_TENANT' ? 'Tenant record updated' : changeRequest.action === 'UPDATE_TENANT_BILL' ? (approved ? 'Past bill corrected' : 'Past bill correction declined') : (approved ? 'Tenant removed' : 'Tenant removal declined'),
+        message: changeRequest.action === 'UPDATE_TENANT'
+          ? 'Tenant contact details were updated.'
+          : changeRequest.action === 'UPDATE_TENANT_BILL'
+            ? `${changeRequest.tenantName}’s bill for ${billingCycles.find(cycle => cycle.id === changeRequest.cycleId)?.month || 'a past month'} was ${approved ? 'updated' : 'left unchanged'} by the landlord.`
+            : `${changeRequest.tenantName}${approved ? (changeRequest.action === 'CREATE_TENANT' ? ' was added to' : ' was removed from') : '’s request was declined by'} the tenant directory.`,
+        action: `TENANT_${actionName.toUpperCase()}_${decision}`,
+        entity: 'tenant', entityId: changeRequest.tenantId, tenantId: changeRequest.tenantId,
+        cycleId: changeRequest.cycleId || '',
+      });
       setToastMessage(approved
-        ? (changeRequest.action === 'CREATE_TENANT' ? `${changeRequest.tenantName} was added to the tenant directory.` : `${changeRequest.tenantName} was removed from the active directory; financial history was retained.`)
+        ? (changeRequest.action === 'CREATE_TENANT' ? `${changeRequest.tenantName} was added to the tenant directory.` : changeRequest.action === 'UPDATE_TENANT' ? `${changeRequest.tenantName}'s details were updated.` : `${changeRequest.tenantName} was removed from the active directory; financial history was retained.`)
         : `The ${actionName} request for ${changeRequest.tenantName} was declined.`);
     } catch (err) {
       setToastMessage(describeActionError(err, 'reviewing the tenant request'));
@@ -1378,11 +1867,44 @@ export default function App() {
 
   const handleEditTenant = async (e) => {
     e.preventDefault();
-    if (!user || !db || role !== ROLES.LANDLORD || !selectedTenantForDetails || isProcessing) return;
+    if (!user || !db || ![ROLES.LANDLORD, ROLES.MANAGER].includes(role) || !selectedTenantForDetails || isProcessing) return;
     setIsProcessing(true);
     setModalError('');
     try {
       const formData = new FormData(e.target);
+      const name = String(formData.get('name') || '').trim();
+      const phone = String(formData.get('phone') || '').trim();
+      const contactPref = String(formData.get('contactPref') || '').trim();
+      if (!name || name.length > 120) throw new Error('Enter a tenant name of up to 120 characters.');
+      if (!phone || phone.length > 40) throw new Error('Enter a phone number of up to 40 characters.');
+
+      if (role === ROLES.MANAGER) {
+        const tenant = selectedTenantForDetails;
+        if (tenant.status === 'ARCHIVED' || tenant.archivedAt) throw new Error('This tenant is no longer active.');
+        const request = {
+          ...recordDefaults(),
+          action: 'UPDATE_TENANT',
+          status: 'PENDING',
+          tenantId: tenant.id,
+          tenantName: String(tenant.name || ''),
+          phone: String(tenant.phone || ''),
+          contactPref: String(tenant.contactPref || ''),
+          houseId: String(tenant.houseId || ''),
+          requestedName: name,
+          requestedPhone: phone,
+          requestedContactPref: contactPref,
+          activeCycleId: activeCycle?.id || '',
+          requestedByName: String(user.displayName || user.email || user.uid).slice(0, 120),
+          requestedAt: new Date().toISOString(),
+        };
+        const created = await promiseTimeout(addDoc(collectionRef('tenantChangeRequests'), request), 5000);
+        await recordAudit('TENANT_DETAILS_CHANGE_SUBMITTED', 'tenant_change_request', created.id, { tenantId: tenant.id });
+        closeAnyModal(setIsEditTenantModalOpen);
+        setSelectedTenantForDetails(null);
+        setToastMessage('Your changes were submitted.');
+        return;
+      }
+
       const newHouseId = formData.get('houseId');
       const oldHouseId = selectedTenantForDetails.houseId;
       const targetHouseId = newHouseId || oldHouseId;
@@ -1421,7 +1943,7 @@ export default function App() {
           transaction.update(oldHouseRef, { status: 'VACANT', updatedBy: user.uid, updatedAt: now });
         }
         transaction.update(tenantRef, {
-          name: formData.get('name').trim(), phone: formData.get('phone').trim(), contactPref: formData.get('contactPref'),
+          name, phone, contactPref,
           expectedRent, depositAmount: expectedRent, houseId: targetHouseId,
           updatedBy: user.uid, updatedAt: now,
         });
@@ -1441,7 +1963,7 @@ export default function App() {
           };
           const nextCycleTenant = {
             ...currentCycleTenant,
-            tenantName: formData.get('name').trim(),
+            tenantName: name,
             houseId: targetHouseId,
             expectedRent,
           };
@@ -1458,6 +1980,7 @@ export default function App() {
         }
       }), 5000);
       await recordAudit('TENANT_UPDATED', 'tenant', selectedTenantForDetails.id, { houseId: newHouseId || oldHouseId });
+      await writeWorkspaceNotification({ title: 'Tenant details updated', message: `${name}’s contact details were updated.`, action: 'TENANT_UPDATED', entity: 'tenant', entityId: selectedTenantForDetails.id, tenantId: selectedTenantForDetails.id });
       closeAnyModal(setIsEditTenantModalOpen);
       setSelectedTenantForDetails(null);
     } catch (err) { setModalError(describeActionError(err, 'updating tenant details')); } finally { setIsProcessing(false); }
@@ -1555,6 +2078,7 @@ export default function App() {
         }
       }), 5000);
       await recordAudit('PAYMENT_RECORDED', 'payment', paymentRef.id, { tenantId: selectedTenant.id, amount, status: isConfirmed ? 'CONFIRMED' : 'PENDING' });
+      await writeWorkspaceNotification({ title: isConfirmed ? 'Payment recorded' : 'Payment submitted for review', message: `${formatKes(amount)} ${type === 'COMBINED' ? 'rent and water' : type.toLowerCase()} payment for ${selectedTenant.name}${isConfirmed ? ' was confirmed' : ' is awaiting landlord review'}.`, action: isConfirmed ? 'PAYMENT_CONFIRMED' : 'PAYMENT_PENDING', entity: 'payment', entityId: paymentRef.id, tenantId: selectedTenant.id, cycleId: paymentCycle.id });
 
       closeAnyModal(setIsPaymentModalOpen);
       setSelectedTenant(null);
@@ -1628,6 +2152,7 @@ export default function App() {
         });
       }), 10000);
       await recordAudit('PAYMENT_CONFIRMED', 'payment', payment.id, { tenantId: payment.tenantId, amount: payment.amount });
+      await writeWorkspaceNotification({ title: 'Payment confirmed', message: `${formatKes(payment.amount)} payment for ${payment.tenantName} was confirmed.`, action: 'PAYMENT_CONFIRMED', entity: 'payment', entityId: payment.id, tenantId: payment.tenantId, cycleId: payment.cycleId });
     } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
 
@@ -1648,6 +2173,7 @@ export default function App() {
         recordedBy: user.uid, createdAt: new Date().toISOString(), cycleId: activeCycle?.id || null
       }), 5000);
       await recordAudit('EXPENSE_CREATED', 'expense', created.id, { amount, category: formData.get('category') });
+      await writeWorkspaceNotification({ title: role === ROLES.LANDLORD ? 'Expense recorded' : 'Expense submitted for review', message: `${formatKes(amount)} expense: ${String(formData.get('description') || '').trim()}.`, action: 'EXPENSE_CREATED', entity: 'expense', entityId: created.id, cycleId: activeCycle?.id || '' });
       closeAnyModal(setIsExpenseModalOpen);
     } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
@@ -1676,6 +2202,7 @@ export default function App() {
         transaction.update(houseRef, { repairStatus: 'NEEDS_REPAIR', updatedBy: user.uid, updatedAt: now });
       }), 5000);
       await recordAudit('MAINTENANCE_CREATED', 'maintenance', repairRef.id, { houseId });
+      await writeWorkspaceNotification({ title: 'Maintenance issue reported', message: `${String(formData.get('description') || '').trim()} · ${houses.find(house => house.id === houseId)?.name || 'unit'}.`, action: 'MAINTENANCE_CREATED', entity: 'maintenance', entityId: repairRef.id, cycleId: activeCycle?.id || '' });
       closeAnyModal(setIsRepairModalOpen);
     } catch(err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
@@ -1696,6 +2223,7 @@ export default function App() {
         transaction.update(houseRef, { repairStatus: 'GOOD', updatedBy: user.uid });
       }), 5000);
       await recordAudit('MAINTENANCE_COMPLETED', 'maintenance', selectedRepair.id, { cost });
+      await writeWorkspaceNotification({ title: 'Maintenance issue resolved', message: `${selectedRepair.description} was marked resolved. Cost logged: ${formatKes(cost)}.`, action: 'MAINTENANCE_COMPLETED', entity: 'maintenance', entityId: selectedRepair.id, cycleId: selectedRepair.cycleId || '' });
       closeAnyModal(setIsResolveRepairModalOpen);
       setSelectedRepair(null);
     } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
@@ -1712,6 +2240,7 @@ export default function App() {
         ...recordDefaults(), provider, cost: parseMoney(costStr, { allowZero: true }), date: new Date().toISOString(), loggedBy: role, cycleId: activeCycle?.id || null
       }), 5000);
       await recordAudit('EXPENSE_CREATED', 'septic', created.id, { provider, cost: Number(costStr) });
+      await writeWorkspaceNotification({ title: 'Septic service logged', message: `${provider} · ${formatKes(parseMoney(costStr, { allowZero: true }))}.`, action: 'SEPTIC_SERVICE_LOGGED', entity: 'septic', entityId: created.id, cycleId: activeCycle?.id || '' });
       closeAnyModal(setIsSepticModalOpen);
     } catch(err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
@@ -1736,6 +2265,7 @@ export default function App() {
         loggedBy: role, cycleId: activeCycle?.id || null, createdAt,
       }), 5000);
       await recordAudit('GARBAGE_COLLECTION_LOGGED', 'garbage_collection', created.id, { provider, cost, date });
+      await writeWorkspaceNotification({ title: 'Garbage collection logged', message: `${provider} collection on ${date} · ${formatKes(cost)}.`, action: 'GARBAGE_COLLECTION_LOGGED', entity: 'garbage_collection', entityId: created.id, cycleId: activeCycle?.id || '' });
       closeAnyModal(setIsGarbageModalOpen);
     } catch (err) {
       setModalError(err.message || 'Could not record the garbage collection.');
@@ -1756,6 +2286,7 @@ export default function App() {
         ...recordDefaults(), month: formData.get('month').trim(), amount, date: new Date().toISOString(), loggedBy: role, cycleId
       }), 5000);
       await recordAudit('UTILITY_BILL_CREATED', 'utility_bill', created.id, { amount });
+      await writeWorkspaceNotification({ title: 'Water provider bill logged', message: `${formData.get('month').trim()} water bill · ${formatKes(amount)}.`, action: 'UTILITY_BILL_CREATED', entity: 'utility_bill', entityId: created.id, cycleId: cycleId || '' });
       closeAnyModal(setIsWaterBillModalOpen);
     } catch (err) { setModalError(err.message); } finally { setIsProcessing(false); }
   };
@@ -1779,6 +2310,7 @@ export default function App() {
         collectedWaterAtReset: stats.totalWaterCollectedAllTime,
         providerBillsAtReset: stats.totalMasterWaterBills,
       });
+      await writeWorkspaceNotification({ title: 'Water vault reset', message: 'A new water tracking period has started. Previous invoices and payments remain in history.', action: 'WATER_VAULT_RESET', entity: 'water_vault', entityId: created.id });
     } catch (err) {
       setModalError(err.message || 'Could not reset the water vault.');
     } finally {
@@ -1816,6 +2348,7 @@ export default function App() {
         });
       }), 10000);
       await recordAudit('TENANT_WATER_SHARE_SET', 'tenant', selectedTenant.id, { waterShare, cycleId: activeCycle.id });
+      await writeWorkspaceNotification({ title: 'Tenant water bill updated', message: `${selectedTenant.name}’s water charge was set to ${formatKes(waterShare)} for ${activeCycle.month}.`, action: 'TENANT_WATER_SHARE_SET', entity: 'tenant', entityId: selectedTenant.id, tenantId: selectedTenant.id, cycleId: activeCycle.id });
       closeAnyModal(setIsBillingModalOpen);
       setSelectedTenant(null);
     } catch (err) { setModalError(describeActionError(err, 'updating this month’s tenant water bill')); } finally { setIsProcessing(false); }
@@ -1823,7 +2356,7 @@ export default function App() {
 
   const handleUpdateClosedCycleCharges = async (e) => {
     e.preventDefault();
-    if (!user || !db || !isLandlord || !selectedTenantCycleForEdit || isProcessing) return;
+    if (!user || !db || ![ROLES.LANDLORD, ROLES.MANAGER].includes(role) || !selectedTenantCycleForEdit || isProcessing) return;
     setIsProcessing(true);
     setModalError('');
     try {
@@ -1831,6 +2364,39 @@ export default function App() {
       const expectedRent = parseMoney(formData.get('expectedRent'), { allowZero: true });
       const expectedWater = parseMoney(formData.get('expectedWater'), { allowZero: true });
       const cycleTenant = selectedTenantCycleForEdit;
+
+      if (role === ROLES.MANAGER) {
+        const tenant = tenants.find(record => record.id === cycleTenant.tenantId);
+        if (!tenant) throw new Error('The tenant record could not be found. Refresh the month and try again.');
+        if (expectedRent < Number(cycleTenant.paidRent || 0) || expectedWater < Number(cycleTenant.paidWater || 0)) {
+          throw new Error('A bill cannot be reduced below the amount already paid for that charge.');
+        }
+        const request = {
+          ...recordDefaults(),
+          action: 'UPDATE_TENANT_BILL',
+          status: 'PENDING',
+          tenantId: cycleTenant.tenantId,
+          tenantName: String(cycleTenant.tenantName || tenant.name || ''),
+          phone: String(tenant.phone || ''),
+          contactPref: String(tenant.contactPref || ''),
+          houseId: String(cycleTenant.houseId || tenant.houseId || ''),
+          cycleId: cycleTenant.cycleId,
+          currentExpectedRent: Number(cycleTenant.expectedRent || 0),
+          currentExpectedWater: Number(cycleTenant.expectedWater || 0),
+          requestedExpectedRent: expectedRent,
+          requestedExpectedWater: expectedWater,
+          requestedByName: String(user.displayName || user.email || user.uid).slice(0, 120),
+          requestedAt: new Date().toISOString(),
+        };
+        const requestRef = await promiseTimeout(addDoc(collectionRef('tenantChangeRequests'), request), 5000);
+        await recordAudit('HISTORICAL_BILL_CHANGE_REQUESTED', 'tenant_change_request', requestRef.id, { tenantId: tenant.id, cycleId: cycleTenant.cycleId });
+        await writeWorkspaceNotification({ title: 'Past bill correction submitted', message: `${cycleTenant.tenantName}’s bill for ${billingCycles.find(cycle => cycle.id === cycleTenant.cycleId)?.month || 'a past month'} was sent to the landlord for review.`, action: 'HISTORICAL_BILL_CHANGE_REQUESTED', entity: 'tenant', entityId: tenant.id, tenantId: tenant.id, cycleId: cycleTenant.cycleId });
+        setIsCycleChargeModalOpen(false);
+        setSelectedTenantCycleForEdit(null);
+        setToastMessage('Your bill changes were submitted.');
+        return;
+      }
+
       const cycleRef = documentRef('billingCycles', cycleTenant.cycleId);
       const cycleTenantRef = documentRef('tenantCycles', cycleTenant.id);
       await promiseTimeout(runTransaction(db, async (transaction) => {
@@ -1952,6 +2518,7 @@ export default function App() {
       });
       await promiseTimeout(batch.commit(), 15000);
       await recordAudit('BILLING_CYCLE_OPENED', 'billing_cycle', cycleRef.id, { month: cycleData.month });
+      await writeWorkspaceNotification({ title: 'Billing month opened', message: `${cycleData.month} billing is ready for rent and water entries.`, action: 'BILLING_CYCLE_OPENED', entity: 'billing_cycle', entityId: cycleRef.id, cycleId: cycleRef.id });
       setSelectedDashboardCycleId('ACTIVE');
       setIsCycleModalOpen(false);
       setToastMessage(`${cycleData.month} billing cycle opened.`);
@@ -2027,6 +2594,7 @@ export default function App() {
       });
       await promiseTimeout(batch.commit(), 15000);
       await recordAudit('HISTORICAL_BILLING_CYCLE_CREATED', 'billing_cycle', cycleId, { month: cycleData.month });
+      await writeWorkspaceNotification({ title: 'Past billing month added', message: `${cycleData.month} is available in billing history.`, action: 'HISTORICAL_BILLING_CYCLE_CREATED', entity: 'billing_cycle', entityId: cycleId, cycleId });
       setSelectedDashboardCycleId(cycleId);
       setIsBackfillCycleModalOpen(false);
       setToastMessage(`${cycleData.month} added to history. Review the rent and water amounts before recording past payments.`);
@@ -2058,6 +2626,7 @@ export default function App() {
     });
     await promiseTimeout(batch.commit(), 15000);
     await recordAudit('BILLING_CYCLE_CLOSED', 'billing_cycle', activeCycle.id, { month: activeCycle.month });
+    await writeWorkspaceNotification({ title: 'Billing month closed', message: `${activeCycle.month} was closed. Its records are now in monthly history.`, action: 'BILLING_CYCLE_CLOSED', entity: 'billing_cycle', entityId: activeCycle.id, cycleId: activeCycle.id });
     setSelectedDashboardCycleId('ACTIVE');
     setToastMessage(`${activeCycle.month} billing cycle closed.`);
   };
@@ -2130,6 +2699,7 @@ export default function App() {
     await commitResetStage('tenant balance totals', tenantBalanceOperations);
     await commitResetStage('payment, reference, repair, septic, garbage, and water-invoice records', deleteOperations);
     await recordAudit('OPERATIONAL_DATA_RESET', 'workspace', workspaceId, { deletedPayments: paymentDocs.length });
+    await writeWorkspaceNotification({ title: 'Operations data reset', message: 'The landlord reset the selected payment and operations records. Billing cycles and expected charges were preserved.', action: 'OPERATIONAL_DATA_RESET', entity: 'workspace', entityId: workspaceId });
     const skippedNotice = skippedOutOfWorkspaceRecords > 0
       ? ` ${skippedOutOfWorkspaceRecords} record(s) outside this workspace were left unchanged.`
       : '';
@@ -2160,12 +2730,21 @@ export default function App() {
         };
         const created = await promiseTimeout(addDoc(collectionRef('tenantChangeRequests'), request), 5000);
         await recordAudit('TENANT_REMOVAL_REQUESTED', 'tenant_change_request', created.id, { tenantId: tenant.id, houseId: tenant.houseId });
+        await writeWorkspaceNotification({ title: 'Tenant removal request', message: `A removal request was submitted for ${tenant.name}.`, action: 'TENANT_REMOVAL_REQUESTED', entity: 'tenant', entityId: tenant.id, tenantId: tenant.id });
         setSelectedTenantForDetails(null);
         setToastMessage(`Removal request for ${tenant.name} was sent to the landlord. The tenant remains active until approval.`);
       } else if (confirmationAction.type === 'resetData') {
         await handleDataReset();
       } else if (confirmationAction.type === 'closeCycle') {
         await handleCloseCycle();
+      } else if (confirmationAction.type === 'deleteManagerAccount') {
+        if (!functionsClient || role !== ROLES.LANDLORD) throw new Error('Only the landlord can delete manager accounts.');
+        const manager = confirmationAction.manager;
+        if (!manager?.uid) throw new Error('Select a valid manager account.');
+        await httpsCallable(functionsClient, 'deleteManagerAccount')({ uid: manager.uid });
+        setManagerAccounts(current => current.filter(account => account.uid !== manager.uid));
+        await writeWorkspaceNotification({ title: 'Manager account deleted', message: `${manager.displayName || manager.email || 'A manager'}’s sign-in account was removed by the landlord. Existing rental records were kept.`, action: 'MANAGER_ACCOUNT_DELETED', entity: 'manager', entityId: manager.uid });
+        setToastMessage(`${manager.displayName || manager.email || 'Manager'} account was deleted. Rental history was retained.`);
       } else if (confirmationAction.type === 'deleteTenant') {
         const tenant = confirmationAction.tenant;
         await promiseTimeout(runTransaction(db, async (transaction) => {
@@ -2185,6 +2764,7 @@ export default function App() {
           if (houseRef) transaction.update(houseRef, { status: 'VACANT', ...makeRecordMetadata(user, true) });
         }), 10000);
         await recordAudit('TENANT_ARCHIVED', 'tenant', tenant.id, { houseId: tenant.houseId });
+        await writeWorkspaceNotification({ title: 'Tenant removed', message: `${tenant.name} was removed from the active tenant directory. Billing history was retained.`, action: 'TENANT_ARCHIVED', entity: 'tenant', entityId: tenant.id, tenantId: tenant.id });
         setSelectedTenantForDetails(null);
         setToastMessage(`${tenant.name} was removed from the active tenant directory.`);
       }
@@ -2194,7 +2774,8 @@ export default function App() {
         ? 'resetting payment and operations data'
         : confirmationAction.type === 'deleteTenant' ? 'removing the tenant'
           : confirmationAction.type === 'requestTenantRemoval' ? 'requesting landlord approval to remove the tenant'
-            : 'closing the billing cycle';
+            : confirmationAction.type === 'deleteManagerAccount' ? 'deleting the manager account'
+              : 'closing the billing cycle';
       setModalError(describeActionError(error, action));
     } finally {
       setIsProcessing(false);
@@ -2343,9 +2924,10 @@ export default function App() {
   const normalizedSearch = globalSearch.trim().toLowerCase();
   const filteredPayments = useMemo(() => payments.filter(payment => {
     const matchesMonth = paymentMonthFilter === 'ALL' || getMonthKey(payment.date) === paymentMonthFilter;
+    const matchesSelectedCycle = activeTab !== 'billing' || !viewedCycle || payment.cycleId === viewedCycle.id;
     const searchRecord = `${payment.tenantName} ${payment.messageCode || ''} ${payment.type} ${payment.method}`.toLowerCase();
-    return matchesMonth && (!normalizedSearch || searchRecord.includes(normalizedSearch));
-  }), [payments, paymentMonthFilter, normalizedSearch]);
+    return matchesMonth && matchesSelectedCycle && (!normalizedSearch || searchRecord.includes(normalizedSearch));
+  }), [payments, paymentMonthFilter, normalizedSearch, activeTab, viewedCycle]);
 
   const tenantPaymentHistory = useMemo(() => {
     if (!selectedTenant) return [];
@@ -2364,13 +2946,40 @@ export default function App() {
   const sortedTenants = useMemo(() => [...filteredTenants].sort((a, b) => (
     compareNatural(houseNameById.get(a.houseId), houseNameById.get(b.houseId)) || compareNatural(a.name, b.name)
   )), [filteredTenants, houseNameById]);
-  const sortedBillingTenants = useMemo(() => [...filteredBillingTenants].sort((a, b) => (
+  const sortedBillingTenants = useMemo(() => [...filteredBillingTenants]
+    .filter(tenant => !focusedBillingTenantId || tenant.id === focusedBillingTenantId)
+    .sort((a, b) => (
     compareNatural(houseNameById.get(a.houseId), houseNameById.get(b.houseId)) || compareNatural(a.name, b.name)
-  )), [filteredBillingTenants, houseNameById]);
+  )), [filteredBillingTenants, houseNameById, focusedBillingTenantId]);
   const sortedPayments = useMemo(() => [...filteredPayments].sort((a, b) => (
     compareNatural(houseNameById.get(tenantById.get(a.tenantId)?.houseId), houseNameById.get(tenantById.get(b.tenantId)?.houseId)) ||
     (new Date(b.date) - new Date(a.date))
   )), [filteredPayments, houseNameById, tenantById]);
+  const rentPayoutSummary = useMemo(() => {
+    if (!viewedCycle) return [];
+    const cycleHouseByTenant = new Map(tenantCycles
+      .filter(cycleTenant => cycleTenant.cycleId === viewedCycle.id)
+      .map(cycleTenant => [cycleTenant.tenantId, cycleTenant.houseId]));
+    const totalsByHouse = new Map();
+    cyclePayments.forEach(payment => {
+      if (payment.status !== 'CONFIRMED') return;
+      const rentAmount = Number(payment.appliedRent || 0);
+      if (!Number.isFinite(rentAmount) || rentAmount <= 0) return;
+      const houseId = cycleHouseByTenant.get(payment.tenantId) || tenantById.get(payment.tenantId)?.houseId;
+      if (!houseId) return;
+      const house = houses.find(item => item.id === houseId);
+      const current = totalsByHouse.get(houseId) || {
+        houseId,
+        houseName: house?.name || 'Unit unavailable',
+        beneficiaryName: house?.beneficiaryName || '',
+        beneficiaryPhone: house?.beneficiaryPhone || '',
+        rentCollected: 0,
+      };
+      current.rentCollected += rentAmount;
+      totalsByHouse.set(houseId, current);
+    });
+    return [...totalsByHouse.values()].sort((left, right) => compareNatural(left.houseName, right.houseName));
+  }, [viewedCycle, tenantCycles, cyclePayments, tenantById, houses]);
 
   const can = (permission) => hasPermission(role, permission, userProfile?.permissions);
   const paymentMethods = useMemo(() => {
@@ -2383,6 +2992,7 @@ export default function App() {
 
   const navItems = [
     { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, permission: PERMISSIONS.VIEW_DASHBOARD },
+    { id: 'assistant', label: 'Rental assistant', icon: Sparkles, permission: PERMISSIONS.VIEW_DASHBOARD },
     { id: 'houses', label: 'Houses & Units', icon: Building2, permission: PERMISSIONS.VIEW_PROPERTIES },
     { id: 'tenants', label: 'Tenants', icon: Users, permission: PERMISSIONS.VIEW_TENANTS },
     { id: 'billing', label: 'Rent & Payments', icon: Wallet, permission: PERMISSIONS.VIEW_RENT, badge: stats.pendingPaymentsCount },
@@ -2394,6 +3004,46 @@ export default function App() {
     { id: 'settings', label: 'Settings', icon: Settings, permission: PERMISSIONS.MANAGE_SETTINGS },
   ];
 
+  const appUpdateDialog = showAppUpdateNotice && availableAppUpdate && (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4" role="presentation" onClick={dismissAppUpdateNotice}>
+      <section role="dialog" aria-modal="true" aria-labelledby="app-update-title" className={`w-full max-w-md rounded-2xl border p-6 shadow-2xl ${theme === 'dark' ? 'border-[#383838] bg-[#1f1f1f] text-white' : 'border-[#e7e1d7] bg-[#fffdf9] text-gray-900'}`} onClick={event => event.stopPropagation()}>
+        <div className="flex items-start justify-between gap-4"><div><p className="text-xs font-semibold uppercase tracking-wider text-amber-600">App update</p><h2 id="app-update-title" className="mt-1 text-xl font-semibold">Version {availableAppUpdate.latestVersion} is ready</h2></div><button type="button" onClick={dismissAppUpdateNotice} className={`rounded-lg p-2 ${theme === 'dark' ? 'text-slate-400 hover:bg-white/5' : 'text-gray-500 hover:bg-black/5'}`} aria-label="Close update notice"><X size={18}/></button></div>
+        <p className={`mt-3 text-sm leading-6 ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>This update is for Android {availableAppUpdate.androidApiLevel >= 29 ? '10 and newer' : '7–9'}. Download the APK, open it from Downloads, then confirm Android’s install prompt.</p>
+        {appUpdateCheckMessage && <p role="alert" className="mt-3 text-sm text-rose-600 dark:text-rose-300">{appUpdateCheckMessage}</p>}
+        <button type="button" onClick={() => void openAppUpdateDownload()} className={`mt-5 flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-semibold text-white ${theme === 'dark' ? 'bg-[#383838] hover:bg-[#505050]' : 'bg-slate-900 hover:bg-slate-800'}`}><Download size={17}/> Download and install update</button>
+        <div className={`mt-4 rounded-xl p-4 text-sm ${theme === 'dark' ? 'bg-[#292929] text-slate-300' : 'bg-[#f3f0e9] text-gray-700'}`}>
+          <p className="font-semibold">What’s improved</p>
+          <ul className="mt-2 list-disc space-y-1 pl-5 text-xs leading-5">
+            <li>Clearer tenant and billing workflows</li>
+            <li>More reliable history and manager approvals</li>
+            <li>Small fixes for supported Android phones</li>
+          </ul>
+        </div>
+        <p className={`mt-3 text-center text-xs leading-5 ${theme === 'dark' ? 'text-slate-400' : 'text-gray-500'}`}>After the download finishes, open the APK and follow Android’s install prompt.</p>
+        <button type="button" onClick={dismissAppUpdateNotice} className={`mt-4 w-full rounded-xl px-4 py-2.5 text-sm font-semibold ${theme === 'dark' ? 'text-slate-300 hover:bg-white/5' : 'text-gray-600 hover:bg-black/5'}`}>Later</button>
+      </section>
+    </div>
+  );
+
+  if (!internetAvailable) {
+    return (
+      <main className={`flex min-h-[100svh] items-center justify-center px-5 py-10 ${theme === 'dark' ? 'bg-[#171717] text-slate-100' : 'bg-[#f6f4ef] text-slate-900'}`}>
+        <section className={`w-full max-w-md rounded-2xl border p-8 text-center shadow-xl ${theme === 'dark' ? 'border-[#383838] bg-[#1f1f1f]' : 'border-[#e7e1d7] bg-[#fffdf9]'}`}>
+          <div className={`mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-full ${theme === 'dark' ? 'bg-[#303030] text-slate-100' : 'bg-[#eee9df] text-slate-800'}`}><AlertCircle size={30} aria-hidden="true" /></div>
+          <h1 className="text-2xl font-semibold">Internet connection required</h1>
+          <p className={`mt-3 text-sm leading-6 ${theme === 'dark' ? 'text-slate-300' : 'text-slate-600'}`}>{internetCheckPending ? 'Checking the connection to Firebase…' : 'Connect to the internet to sign in and use Ruiru Rentals. Your records will stay hidden until the connection is restored.'}</p>
+          <button type="button" disabled={internetCheckPending} onClick={async () => {
+            setInternetCheckPending(true);
+            const reachable = await probeInternetAccess({ apiKey: firebaseConfig.apiKey });
+            setInternetAvailable(reachable);
+            setInternetCheckPending(false);
+          }} className={`mt-6 w-full rounded-xl px-4 py-3 text-sm font-semibold text-white transition disabled:opacity-50 ${theme === 'dark' ? 'bg-[#383838] hover:bg-[#505050]' : 'bg-slate-900 hover:bg-slate-800'}`}>
+            {internetCheckPending ? 'Checking…' : 'Try again'}
+          </button>
+        </section>
+      </main>
+    );
+  }
 
   if (loading) {
     return (
@@ -2507,6 +3157,8 @@ export default function App() {
             <p className="mt-2 text-center"><PortfolioLink theme={theme}>@Gikunjucreates</PortfolioLink></p>
           </div>
         </section>
+        {availableAppUpdate && !showAppUpdateNotice && <button type="button" onClick={() => setShowAppUpdateNotice(true)} className={`fixed bottom-4 right-4 z-40 flex items-center gap-2 rounded-xl px-4 py-3 text-sm font-semibold text-white shadow-lg ${theme === 'dark' ? 'bg-[#383838]' : 'bg-slate-900'}`}><Download size={16}/> Update to {availableAppUpdate.latestVersion}</button>}
+        {appUpdateDialog}
       </main>
     );
   }
@@ -2580,10 +3232,11 @@ export default function App() {
                 <span className="sr-only">Search tenants, units, payments, or maintenance</span>
                 <input value={globalSearch} onChange={e => setGlobalSearch(e.target.value)} placeholder="Search records" className={`w-full pl-9 pr-3 py-2.5 rounded-lg border text-sm outline-none focus:ring-2 focus:ring-amber-600/40 ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#303030] text-white placeholder:text-[#737373]' : 'bg-white border-[#E5E5E5] text-gray-900 placeholder:text-gray-400'}`} />
               </label>
-              <button onClick={() => setActiveTab('activity')} className={`relative p-2.5 rounded-lg border transition ${theme === 'dark' ? 'border-[#303030] text-slate-300 hover:bg-[#171717]' : 'border-[#E5E5E5] text-gray-600 hover:bg-white'}`} aria-label="Open activity history">
+              <button onClick={openNotifications} className={`relative p-2.5 rounded-lg border transition ${theme === 'dark' ? 'border-[#303030] text-slate-300 hover:bg-[#171717]' : 'border-[#E5E5E5] text-gray-600 hover:bg-white'}`} aria-label="Open notifications" aria-haspopup="dialog">
                 <Bell size={17} aria-hidden="true" />
-                {notifications.filter(notification => !notification.read).length > 0 && <span className="absolute -top-1 -right-1 min-w-4 h-4 px-1 rounded-full bg-amber-600 text-white text-[9px] flex items-center justify-center">{notifications.filter(notification => !notification.read).length}</span>}
+                {unreadNotificationCount > 0 && <span className="absolute -top-1 -right-1 min-w-4 h-4 px-1 rounded-full bg-amber-600 text-white text-[9px] flex items-center justify-center">{unreadNotificationCount > 99 ? '99+' : unreadNotificationCount}</span>}
               </button>
+              {(Capacitor.isNativePlatform() || /Android/i.test(navigator.userAgent || '')) && <button type="button" onClick={() => void checkAppUpdate({ force: true })} disabled={appUpdateCheckPending} className={`flex items-center gap-2 rounded-lg border px-3 py-2.5 text-xs font-semibold transition disabled:opacity-50 ${theme === 'dark' ? 'border-[#303030] text-slate-200 hover:bg-[#171717]' : 'border-[#E5E5E5] text-gray-700 hover:bg-white'}`}><Download size={15}/><span>{appUpdateCheckPending ? 'Checking…' : availableAppUpdate ? `Update ${availableAppUpdate.latestVersion}` : 'Check updates'}</span></button>}
             </div>
           </header>
 
@@ -2601,6 +3254,34 @@ export default function App() {
           )}
 
           <div key={activeTab} className="flex-1 tab-panel-enter">
+            {activeTab === 'assistant' && (
+              <section className={`mx-auto flex min-h-[min(72vh,760px)] max-w-4xl flex-col overflow-hidden rounded-2xl border ${theme === 'dark' ? 'border-[#383838] bg-[#1c1c1c]' : 'border-[#e7e1d7] bg-[#fffdf9]'}`} aria-labelledby="rental-assistant-heading">
+                <div className={`border-b p-5 sm:p-6 ${theme === 'dark' ? 'border-[#383838]' : 'border-[#e7e1d7]'}`}>
+                  <div className="flex items-start gap-3">
+                    <div className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-xl ${theme === 'dark' ? 'bg-[#303030] text-slate-100' : 'bg-[#eee9df] text-slate-800'}`}><Sparkles size={20}/></div>
+                    <div><h3 id="rental-assistant-heading" className={`text-lg font-semibold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Rental assistant</h3><p className="mt-1 max-w-2xl text-sm leading-5 text-gray-500">Ask about bills, tenants, repairs, or past months. It uses only workspace records your role can access, remembers recent conversation history, and cannot change or approve records.</p></div>
+                  </div>
+                  {role === ROLES.MANAGER && <p className={`mt-4 rounded-lg px-3 py-2 text-xs leading-5 ${theme === 'dark' ? 'bg-[#292929] text-slate-300' : 'bg-[#f3f0e9] text-gray-600'}`}>The landlord can review assistant conversations and manager activity for this workspace.</p>}
+                  {isLandlord && <p className={`mt-4 rounded-lg px-3 py-2 text-xs leading-5 ${theme === 'dark' ? 'bg-[#292929] text-slate-300' : 'bg-[#f3f0e9] text-gray-600'}`}>You can also ask what managers have changed or asked the assistant. The answer uses this workspace’s activity and assistant history.</p>}
+                </div>
+                <div className="flex-1 space-y-4 overflow-y-auto p-4 sm:p-6" aria-live="polite" aria-busy={assistantHistoryPending || assistantPending}>
+                  {assistantHistoryPending && <p className="py-8 text-center text-sm text-gray-500">Loading your conversation…</p>}
+                  {!assistantHistoryPending && assistantMessages.length === 0 && <div className="mx-auto max-w-xl py-10 text-center"><MessageCircle size={26} className={`mx-auto ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}/><p className={`mt-3 font-semibold ${theme === 'dark' ? 'text-slate-100' : 'text-gray-800'}`}>What would you like to understand?</p><p className="mt-1 text-sm text-gray-500">The assistant can summarize records and help you find useful patterns. It cannot change rental records.</p><div className="mt-5 flex flex-wrap justify-center gap-2">{(isLandlord ? ['Summarize rent collected over the past 3 months', 'What has the manager done recently?', 'Which tenants have the largest balances?'] : ['Who still has a balance this month?', 'Summarize the last closed month', 'Which maintenance issues are still open?']).map(suggestion => <button key={suggestion} type="button" onClick={() => setAssistantInput(suggestion)} className={`rounded-full border px-3 py-2 text-xs font-medium ${theme === 'dark' ? 'border-[#505050] text-slate-300 hover:bg-[#292929]' : 'border-[#d8d2c8] text-gray-700 hover:bg-[#f3f0e9]'}`}>{suggestion}</button>)}</div></div>}
+                  {assistantMessages.map((message, index) => {
+                    const isUserMessage = ['user', 'USER'].includes(message.role);
+                    return <div key={message.id || `${message.role}-${index}`} className={`flex ${isUserMessage ? 'justify-end' : 'justify-start'}`}><div className={`max-w-[92%] whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm leading-6 sm:max-w-[80%] ${isUserMessage ? 'bg-gray-800 text-white' : theme === 'dark' ? 'bg-[#292929] text-slate-100' : 'bg-[#f3f0e9] text-gray-800'}`}>{message.content || message.text || message.answer || ''}<p className={`mt-1 text-[10px] ${isUserMessage ? 'text-white/60' : 'text-gray-500'}`}>{isUserMessage ? 'You' : 'Rental assistant'}</p></div></div>;
+                  })}
+                  {assistantPending && <div className={`w-fit rounded-xl px-4 py-3 text-sm ${theme === 'dark' ? 'bg-[#292929] text-slate-300' : 'bg-[#f3f0e9] text-gray-600'}`}>Reviewing the workspace records…</div>}
+                  <div ref={assistantEndRef}/>
+                </div>
+                {assistantError && <p role="alert" className="mx-4 mb-2 rounded-lg border border-rose-300/50 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300 sm:mx-6">{assistantError}</p>}
+                <form onSubmit={submitAssistantQuestion} className={`flex items-end gap-2 border-t p-3 sm:p-4 ${theme === 'dark' ? 'border-[#383838]' : 'border-[#e7e1d7]'}`}>
+                  <label className="sr-only" htmlFor="rental-assistant-question">Ask the rental assistant</label>
+                  <textarea id="rental-assistant-question" rows="2" maxLength="1000" value={assistantInput} onChange={event => setAssistantInput(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitAssistantQuestion(event); } }} placeholder="Ask about your rental records…" className={`min-h-12 flex-1 resize-y rounded-xl border px-3 py-3 text-sm outline-none focus:ring-2 focus:ring-amber-600/30 ${theme === 'dark' ? 'border-[#505050] bg-[#111111] text-white placeholder:text-slate-500' : 'border-[#d8d2c8] bg-white text-gray-900 placeholder:text-gray-400'}`} />
+                  <button type="submit" disabled={assistantPending || !assistantInput.trim() || !internetAvailable} className="flex h-12 shrink-0 items-center gap-2 rounded-xl bg-gray-800 px-4 text-sm font-semibold text-white transition hover:bg-gray-900 disabled:cursor-not-allowed disabled:opacity-50"><Send size={16}/><span className="hidden sm:inline">Ask</span></button>
+                </form>
+              </section>
+            )}
             {activeTab === 'dashboard' && isLandlord && (
               <div className="space-y-6 animate-in fade-in duration-500">
                 <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
@@ -2869,6 +3550,7 @@ export default function App() {
                           <div className={`ml-2 text-sm space-y-1.5 font-medium ${theme === 'dark' ? 'text-slate-400' : 'text-gray-500'}`}>
                             <p>Type: {house.type}</p>
                             <p>Rent Target: <strong className={`font-black text-base ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{formatKes(house.rent)}</strong></p>
+                            {isLandlord && house.beneficiaryName && <p className="pt-1 text-xs">Rent recipient: <strong className={theme === 'dark' ? 'text-slate-200' : 'text-gray-800'}>{house.beneficiaryName}</strong></p>}
                             
                             {house.repairStatus === 'NEEDS_REPAIR' && isOccupied && (
                               <div className="bg-rose-500/10 border border-rose-500/20 px-3 py-2 rounded-lg mt-3">
@@ -2918,7 +3600,7 @@ export default function App() {
                     <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
                       <div>
                         <h3 id="tenant-requests-title" className={`text-lg font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{isLandlord ? 'Tenant Approval Requests' : 'My Tenant Requests'}</h3>
-                        <p className="mt-1 text-sm text-gray-500">{isLandlord ? 'Review manager requests. Approved additions and removals take effect immediately.' : 'New tenants and removal requests stay pending until the landlord reviews them.'}</p>
+                        <p className="mt-1 text-sm text-gray-500">{isLandlord ? 'Review manager tenant and past-bill requests before records change.' : 'New tenants and removal requests are listed here.'}</p>
                       </div>
                     </div>
                     {visibleTenantChangeRequests.length === 0 ? (
@@ -2928,13 +3610,18 @@ export default function App() {
                         {visibleTenantChangeRequests.map(request => {
                           const requestHouse = houses.find(house => house.id === request.houseId);
                           const isCreateRequest = request.action === 'CREATE_TENANT';
+                          const isUpdateRequest = request.action === 'UPDATE_TENANT';
+                          const isBillRequest = request.action === 'UPDATE_TENANT_BILL';
+                          const requestCycle = isBillRequest ? billingCycles.find(cycle => cycle.id === request.cycleId) : null;
                           return (
                             <article key={request.id} className={`rounded-xl border p-4 ${theme === 'dark' ? 'border-slate-700 bg-[#151515]' : 'border-[#E8DFCE] bg-white'}`}>
                               <div className="flex flex-wrap items-start justify-between gap-3">
                                 <div>
                                   <p className={`font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{request.tenantName}</p>
-                                  <p className="mt-1 text-sm text-gray-500">{isCreateRequest ? 'New tenant registration' : 'Tenant removal'} · {requestHouse?.name || 'Unit unavailable'}</p>
+                                  <p className="mt-1 text-sm text-gray-500">{isCreateRequest ? 'New tenant registration' : isUpdateRequest ? 'Tenant detail update' : isBillRequest ? `Past bill correction · ${requestCycle?.month || 'month unavailable'}` : 'Tenant removal'}{!isBillRequest && ` · ${requestHouse?.name || 'Unit unavailable'}`}</p>
                                   {isCreateRequest && <p className="mt-1 text-xs text-gray-500">{request.phone || 'No phone'} · {formatKes(requestHouse?.rent || 0)} monthly rent</p>}
+                                  {isUpdateRequest && <div className="mt-2 space-y-1 text-xs text-gray-500"><p>Current: {request.tenantName} · {request.phone || 'No phone'} · {request.contactPref || 'No preference'}</p><p>Requested: <strong className={theme === 'dark' ? 'text-slate-200' : 'text-gray-800'}>{request.requestedName}</strong> · {request.requestedPhone} · {request.requestedContactPref || 'No preference'}</p></div>}
+                                  {isBillRequest && <div className="mt-2 space-y-1 text-xs text-gray-500"><p>Current: rent {formatKes(request.currentExpectedRent)} · water {formatKes(request.currentExpectedWater)}</p><p>Requested: <strong className={theme === 'dark' ? 'text-slate-200' : 'text-gray-800'}>rent {formatKes(request.requestedExpectedRent)} · water {formatKes(request.requestedExpectedWater)}</strong></p></div>}
                                   <p className="mt-1 text-xs text-gray-500">Requested by {request.requestedByName || 'Manager'} · {request.requestedAt ? new Date(request.requestedAt).toLocaleDateString('en-KE', { timeZone: DEFAULT_TIMEZONE }) : '—'}</p>
                                 </div>
                                 {!isLandlord && (
@@ -2944,7 +3631,7 @@ export default function App() {
                               {isLandlord && (
                                 <div className="mt-4 flex flex-wrap justify-end gap-2 border-t border-[#E8DFCE] pt-3 dark:border-slate-700">
                                   <button type="button" disabled={isProcessing} onClick={() => handleReviewTenantChangeRequest(request, 'REJECTED')} className={`rounded-lg border px-3 py-2 text-sm font-semibold disabled:opacity-50 ${theme === 'dark' ? 'border-slate-600 text-slate-200 hover:bg-white/5' : 'border-[#DCD4C6] text-gray-700 hover:bg-gray-50'}`}>Decline</button>
-                                  <button type="button" disabled={isProcessing} onClick={() => handleReviewTenantChangeRequest(request, 'APPROVED')} className="rounded-lg bg-gray-800 px-3 py-2 text-sm font-semibold text-white hover:bg-gray-900 disabled:opacity-50">{isCreateRequest ? 'Approve registration' : 'Approve removal'}</button>
+                                  <button type="button" disabled={isProcessing} onClick={() => handleReviewTenantChangeRequest(request, 'APPROVED')} className="rounded-lg bg-gray-800 px-3 py-2 text-sm font-semibold text-white hover:bg-gray-900 disabled:opacity-50">{isCreateRequest ? 'Approve registration' : isUpdateRequest ? 'Approve details' : isBillRequest ? 'Approve bill correction' : 'Approve removal'}</button>
                                 </div>
                               )}
                             </article>
@@ -2960,7 +3647,7 @@ export default function App() {
                     <thead className={`border-b ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-slate-400' : 'bg-[#FDFBF7] border-[#E8DFCE] text-gray-500'}`}>
                       <tr>
                         <th className="p-4 font-bold">Tenant Name</th>
-                        <th className="p-4 font-bold hidden sm:table-cell">House Unit</th>
+                        <th className="p-4 font-bold">House / Unit</th>
                         <th className="p-4 font-bold hidden sm:table-cell">Bal Status</th>
                         <th className="p-4 font-bold text-right">Actions</th>
                       </tr>
@@ -2981,8 +3668,16 @@ export default function App() {
                         const owesMoney = rentDue > 0 || waterDue > 0;
                         return (
                           <tr key={tenant.id} className={`transition cursor-pointer ${theme === 'dark' ? 'hover:bg-slate-950/40' : 'hover:bg-[#FDFBF7]'}`} onClick={() => setSelectedTenantForDetails(tenant)}>
-                            <td className={`p-4 font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{tenant.name}</td>
-                            <td className={`p-4 font-semibold hidden sm:table-cell ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>{house ? house.name : 'Unknown'}</td>
+                            <td className="p-4"><button type="button" onClick={event => {
+                              event.stopPropagation();
+                              setFocusedBillingTenantId(tenant.id);
+                              setTenantSearch('');
+                              setTenantStatusFilter('ALL');
+                              setSelectedDashboardCycleId('ACTIVE');
+                              setActiveTab('billing');
+                              window.setTimeout(() => document.getElementById(`billing-tenant-${tenant.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 120);
+                            }} className={`text-left font-bold underline decoration-transparent underline-offset-4 transition hover:decoration-current ${theme === 'dark' ? 'text-white hover:text-slate-200' : 'text-gray-900 hover:text-gray-700'}`}>{tenant.name}</button></td>
+                            <td className={`p-4 font-semibold ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>{house?.name || 'Unknown'}</td>
                             <td className="p-4 hidden sm:table-cell">
                               {owesMoney ? <span className={`font-bold text-[10px] uppercase tracking-wider px-2.5 py-1 rounded-md border ${theme === 'dark' ? 'bg-rose-500/10 text-rose-400 border-rose-500/20' : 'bg-rose-500/10 text-rose-600 border-rose-500/20'}`}>Has Arrears</span> : <span className={`font-bold text-[10px] uppercase tracking-wider px-2.5 py-1 rounded-md border ${theme === 'dark' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-emerald-500/10 text-emerald-600 border-emerald-500/20'}`}>Cleared</span>}
                             </td>
@@ -3007,14 +3702,49 @@ export default function App() {
                     </button>
                     <div>
                       <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Billing & Payments</h2>
-                      <p className="mt-1 text-sm font-medium text-gray-500">{activeCycle ? `Balances for ${activeCycle.month}` : 'No billing cycle is currently open.'}</p>
+                      <p className="mt-1 text-sm font-medium text-gray-500">{viewedCycle ? `Viewing ${viewedCycle.month}` : 'No billing cycle has been created yet.'}</p>
                     </div>
                   </div>
                 </div>
 
-                <div>
+                <section className={`rounded-2xl border p-4 ${theme === 'dark' ? 'border-[#383838] bg-[#1f1f1f]' : 'border-[#e7e1d7] bg-[#fffdf9]'}`} aria-labelledby="billing-month-heading">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div><h3 id="billing-month-heading" className={`font-semibold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Billing month</h3><p className="mt-1 text-sm text-gray-500">Choose a month to review tenant bills and payment progress.</p></div>
+                    <div className="flex items-center gap-2">
+                      <label className="sr-only" htmlFor="billing-month-select">Choose billing month</label>
+                      <select id="billing-month-select" value={selectedDashboardCycleId === 'ACTIVE' && !activeCycle ? 'NONE' : selectedDashboardCycleId} onChange={event => selectBillingCycleView(event.target.value)} className={`max-w-64 rounded-lg border px-3 py-2.5 text-sm font-semibold ${theme === 'dark' ? 'border-[#505050] bg-[#111111] text-white' : 'border-[#d8d2c8] bg-white text-gray-900'}`}>
+                        {activeCycle ? <option value="ACTIVE">{activeCycle.month} · Current month</option> : <option value="NONE">No current billing month</option>}
+                        {billingCycles.filter(cycle => cycle.status === 'CLOSED').map(cycle => <option key={cycle.id} value={cycle.id}>{cycle.month} · Past month</option>)}
+                      </select>
+                      {isHistoricalCycleView && <button type="button" onClick={() => selectBillingCycleView('ACTIVE')} disabled={!activeCycle} className={`rounded-lg border px-3 py-2.5 text-sm font-semibold disabled:opacity-40 ${theme === 'dark' ? 'border-[#505050] text-slate-200 hover:bg-[#292929]' : 'border-[#d8d2c8] text-gray-700 hover:bg-white'}`}>Current month</button>}
+                    </div>
+                  </div>
+                  {isHistoricalCycleView && <p className={`mt-3 rounded-lg px-3 py-2 text-sm ${isLandlord ? 'bg-amber-500/10 text-amber-800 dark:text-amber-200' : 'bg-slate-500/10 text-slate-700 dark:text-slate-300'}`}>{isLandlord ? 'Past month selected. You can edit its bill amounts and record missing payments below.' : role === ROLES.MANAGER ? 'Past month selected. Review the records or request a bill correction from the landlord.' : 'Past month selected. This is a read-only view of recorded bills and payments.'}</p>}
+                </section>
+
+                {isHistoricalCycleView && viewedCycle && <section className={`overflow-hidden rounded-2xl border ${theme === 'dark' ? 'border-[#383838] bg-[#1c1c1c]' : 'border-[#e7e1d7] bg-[#fffdf9]'}`}>
+                  <div className="border-b border-inherit p-5"><h3 className={`font-semibold ${theme === 'dark' ? 'text-white' : 'text-[#26332d]'}`}>{viewedCycle.month} tenant bills and payment progress</h3><p className="mt-1 text-sm text-gray-500">Amounts are shown for the selected month. {isLandlord ? 'Only this month’s bill and payment actions will update these records.' : role === ROLES.MANAGER ? 'Managers can ask the landlord to approve a past-month bill correction.' : 'Past-month bills are read-only.'}</p></div>
+                  <div className="overflow-x-auto"><table className="w-full min-w-[680px] text-left text-sm">
+                    <thead className={theme === 'dark' ? 'bg-[#242424] text-gray-400' : 'bg-[#f1eee7] text-gray-500'}><tr><th className="p-3">Tenant</th><th className="p-3">Unit</th><th className="p-3">Rent billed / paid</th><th className="p-3">Water billed / paid</th><th className="p-3">Status</th>{(isLandlord || role === ROLES.MANAGER) && <th className="p-3">Actions</th>}</tr></thead>
+                    <tbody className="divide-y divide-inherit">{viewedCycleTenantCycles.length === 0 && <tr><td colSpan={isLandlord || role === ROLES.MANAGER ? 6 : 5} className="p-7 text-center text-gray-500">No tenant bills were recorded for this month.</td></tr>}
+                      {viewedCycleTenantCycles.map(cycleTenant => {
+                        const tenant = tenants.find(record => record.id === cycleTenant.tenantId);
+                        const house = houses.find(record => record.id === cycleTenant.houseId);
+                        return <tr key={cycleTenant.id}>
+                          <td className="p-3 font-medium">{cycleTenant.tenantName}</td><td className="p-3 text-gray-500">{house?.name || cycleTenant.houseId || '—'}</td>
+                          <td className="p-3">{formatKes(cycleTenant.expectedRent)} <span className="text-xs text-gray-500">/ {formatKes(cycleTenant.paidRent)}</span></td>
+                          <td className="p-3">{formatKes(cycleTenant.expectedWater)} <span className="text-xs text-gray-500">/ {formatKes(cycleTenant.paidWater)}</span></td>
+                          <td className="p-3"><span className={`rounded-full px-2 py-1 text-xs font-semibold ${cycleTenant.status === 'CLEARED' ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300' : 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'}`}>{cycleTenant.status === 'CLEARED' ? 'Paid' : 'Balance due'}</span></td>
+                          {(isLandlord || role === ROLES.MANAGER) && <td className="p-3"><div className="flex flex-wrap gap-2">{(isLandlord || role === ROLES.MANAGER) && <button type="button" onClick={() => { setModalError(''); setSelectedTenantCycleForEdit(cycleTenant); setIsCycleChargeModalOpen(true); }} disabled={isProcessing} className={`rounded-lg border px-3 py-1.5 text-xs font-semibold disabled:opacity-50 ${theme === 'dark' ? 'border-[#505050] hover:bg-[#292929]' : 'border-[#d8d2c8] text-[#34483b] hover:bg-[#f6f4ef]'}`}>{isLandlord ? 'Edit bill' : 'Request correction'}</button>}{isLandlord && tenant && <button type="button" onClick={() => { setModalError(''); setSelectedTenant(tenant); setSelectedPaymentCycleId(viewedCycle.id); setIsPaymentModalOpen(true); }} disabled={isProcessing} className="rounded-lg bg-gray-800 px-3 py-1.5 text-xs font-semibold text-white hover:bg-gray-900 disabled:opacity-50">Record payment</button>}</div></td>}
+                        </tr>;
+                      })}
+                    </tbody>
+                  </table></div>
+                </section>}
+
+                {!isHistoricalCycleView && <div>
                   <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-                    <h3 className="text-lg font-bold font-mono uppercase tracking-wider text-gray-500">Tenant Billing Profiles</h3>
+                    <div><h3 className="text-lg font-bold font-mono uppercase tracking-wider text-gray-500">{focusedBillingTenantId ? 'Selected Tenant' : 'Tenant Billing Profiles'}</h3>{focusedBillingTenantId && <button type="button" onClick={() => setFocusedBillingTenantId('')} className="mt-1 text-xs font-semibold text-amber-700 underline underline-offset-2 dark:text-amber-300">Show all tenants</button>}</div>
                     <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                       <label className="sr-only" htmlFor="tenant-billing-search">Search tenants</label>
                       <input id="tenant-billing-search" value={tenantSearch} onChange={e => setTenantSearch(e.target.value)} placeholder="Search tenant name" className={`min-w-0 rounded-xl border px-3 py-2 text-sm outline-none focus:border-emerald-500 ${theme === 'dark' ? 'border-slate-700 bg-slate-900 text-white placeholder:text-slate-500' : 'border-[#DCD4C6] bg-white text-gray-900'}`} />
@@ -3036,7 +3766,7 @@ export default function App() {
                       const pendingPayments = activeCycle ? payments.filter(p => p.tenantId === tenant.id && p.status === 'PENDING' && p.cycleId === activeCycle.id) : [];
 
                       return (
-                        <div key={tenant.id} className={`p-5 rounded-2xl border shadow-sm flex flex-col justify-between transition-all duration-300 hover:-translate-y-1 hover:shadow-xl ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
+                        <div key={tenant.id} id={`billing-tenant-${tenant.id}`} className={`p-5 rounded-2xl border shadow-sm flex flex-col justify-between transition-all duration-300 hover:-translate-y-1 hover:shadow-xl ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-[#F4EFE6] border-[#E8DFCE]'}`}>
                           <div>
                             <div className={`flex justify-between items-start mb-3 border-b pb-3 gap-2 ${theme === 'dark' ? 'border-slate-800' : 'border-[#DCD4C6]'}`}>
                               <div>
@@ -3110,7 +3840,7 @@ export default function App() {
                     })}
                     {sortedBillingTenants.length === 0 && <p className="col-span-full rounded-xl border border-dashed border-gray-300 p-8 text-center text-sm font-medium text-gray-500">{activeTenants.length === 0 ? 'No active tenants registered.' : 'No tenants match the current search and filter.'}</p>}
                   </div>
-                </div>
+                </div>}
 
                 <div>
                   <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
@@ -3196,6 +3926,10 @@ export default function App() {
               <div className="space-y-6">
                 <div><p className="text-sm text-gray-500">Use current records to review operating performance.</p><h3 className={`text-xl font-semibold mt-1 ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Reports</h3></div>
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">{[['Rent collected', formatKes(stats.collectedRentRev)], ['Outstanding rent', formatKes(Math.max(0, stats.expectedRentRev - stats.collectedRentRev))], ['Operating expenses', formatKes(stats.totalOperatingExpenses)], ['Net operating result', formatKes(stats.netOperatingResult)]].map(([label, value]) => <div key={label} className={`p-4 border rounded-lg ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}><p className="text-xs text-gray-500">{label}</p><p className="text-xl font-semibold mt-1">{value}</p></div>)}</div>
+                {isLandlord && <section className={`overflow-hidden rounded-xl border ${theme === 'dark' ? 'border-[#383838] bg-[#1f1f1f]' : 'border-[#e7e1d7] bg-white'}`} aria-labelledby="rent-payouts-title">
+                  <div className="flex flex-wrap items-center justify-between gap-3 border-b border-inherit p-4"><div><h3 id="rent-payouts-title" className="font-semibold">Rent payout guide</h3><p className="mt-1 text-sm text-gray-500">Confirmed rent allocated by unit for {viewedCycle?.month || 'the selected month'}.</p></div><span className="text-sm font-bold">{formatKes(rentPayoutSummary.reduce((sum, item) => sum + item.rentCollected, 0))}</span></div>
+                  {rentPayoutSummary.length === 0 ? <p className="p-5 text-sm text-gray-500">No confirmed rent has been recorded for this month.</p> : <div className="divide-y divide-inherit">{rentPayoutSummary.map(item => <div key={item.houseId} className="flex flex-col gap-2 p-4 sm:flex-row sm:items-center sm:justify-between"><div><p className={`font-semibold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{item.houseName}</p><p className="mt-1 text-sm text-gray-500">Send to: {item.beneficiaryName || 'No recipient assigned'}{item.beneficiaryPhone ? ` · ${item.beneficiaryPhone}` : ''}</p></div><p className="font-mono font-bold">{formatKes(item.rentCollected)}</p></div>)}</div>}
+                </section>}
                 <div className={`border rounded-lg p-5 ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}><div className="flex items-center justify-between gap-4"><div><h3 className="font-semibold">Occupancy</h3><p className="text-sm text-gray-500 mt-1">{stats.occupiedUnits} of {stats.totalUnits} units occupied.</p></div><span className="text-3xl font-semibold">{stats.occupancyRate}%</span></div><div className="mt-4 h-2 bg-gray-200 dark:bg-[#262626] rounded-full overflow-hidden"><div className="h-full bg-amber-600" style={{ width: `${stats.occupancyRate}%` }} /></div></div>
                 <p className="text-xs text-gray-500">Financial values are calculated from confirmed payment and recorded expense documents. Export permissions are role-controlled; CSV/PDF export is not enabled in this client-only build.</p>
               </div>
@@ -3206,7 +3940,27 @@ export default function App() {
             )}
 
             {activeTab === 'settings' && (
-              <div className="space-y-6"><div><p className="text-sm text-gray-500">Workspace defaults and access controls.</p><h3 className={`text-xl font-semibold mt-1 ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Settings</h3></div><div className={`border rounded-lg divide-y divide-inherit ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}><div className="p-4 flex items-center gap-3"><SlidersHorizontal size={18} className="text-amber-600"/><div><p className="font-semibold">General</p><p className="text-sm text-gray-500">Currency: {DEFAULT_CURRENCY} · Timezone: {DEFAULT_TIMEZONE}</p></div></div><div className="p-4 flex items-center gap-3"><ShieldCheck size={18} className="text-amber-600"/><div><p className="font-semibold">Access model</p><p className="text-sm text-gray-500">Roles are resolved from Firebase custom claims or protected user profiles.</p></div></div><div className="p-4 flex items-center gap-3"><Database size={18} className="text-amber-600"/><div><p className="font-semibold">Audit and backups</p><p className="text-sm text-gray-500">Audit records are append-only in the normal UI. Configure scheduled Firebase exports for production backup.</p></div></div></div></div>
+              <div className="space-y-6">
+                <div><p className="text-sm text-gray-500">Workspace defaults and access controls.</p><h3 className={`text-xl font-semibold mt-1 ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Settings</h3></div>
+                <div className={`border rounded-lg divide-y divide-inherit ${theme === 'dark' ? 'bg-[#0A0A0A] border-[#262626]' : 'bg-white border-[#E5E5E5]'}`}>
+                  <div className="p-4 flex items-center gap-3"><SlidersHorizontal size={18} className="text-amber-600"/><div><p className="font-semibold">General</p><p className="text-sm text-gray-500">Currency: {DEFAULT_CURRENCY} · Timezone: {DEFAULT_TIMEZONE}</p></div></div>
+                  <div className="p-4 flex items-center gap-3"><ShieldCheck size={18} className="text-amber-600"/><div><p className="font-semibold">Access model</p><p className="text-sm text-gray-500">Roles are resolved from Firebase custom claims or protected user profiles.</p></div></div>
+                  <div className="p-4 flex items-center gap-3"><Database size={18} className="text-amber-600"/><div><p className="font-semibold">Audit and backups</p><p className="text-sm text-gray-500">Audit records are append-only in the normal UI. Configure scheduled Firebase exports for production backup.</p></div></div>
+                </div>
+                {isLandlord && <section className={`rounded-xl border p-5 ${theme === 'dark' ? 'border-[#383838] bg-[#1f1f1f]' : 'border-[#e7e1d7] bg-white'}`} aria-labelledby="manager-access-heading">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div><h4 id="manager-access-heading" className={`font-semibold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Manager accounts</h4><p className="mt-1 text-sm text-gray-500">Turn access off temporarily or delete a manager account. Rental records and audit history are retained.</p></div>
+                    <button type="button" onClick={() => void refreshManagerAccounts()} disabled={managerAccountsLoading || isProcessing} className={`rounded-lg border px-3 py-2 text-sm font-semibold disabled:opacity-50 ${theme === 'dark' ? 'border-[#505050] text-slate-200 hover:bg-white/5' : 'border-[#d8d2c8] text-gray-700 hover:bg-gray-50'}`}>{managerAccountsLoading ? 'Loading…' : 'Refresh'}</button>
+                  </div>
+                  {managerAccountsError && <p role="alert" className="mt-4 rounded-lg border border-rose-300 bg-rose-50 px-3 py-2 text-sm text-rose-700">{managerAccountsError}</p>}
+                  {managerAccountsLoading && managerAccounts.length === 0 ? <p className="mt-4 text-sm text-gray-500">Loading manager accounts…</p> : managerAccounts.length === 0 ? <p className="mt-4 text-sm text-gray-500">No manager accounts were found in this workspace.</p> : <div className="mt-4 space-y-3">
+                    {managerAccounts.map(manager => <div key={manager.uid} className={`flex flex-col gap-3 rounded-lg border p-4 sm:flex-row sm:items-center sm:justify-between ${theme === 'dark' ? 'border-[#383838] bg-[#171717]' : 'border-[#e7e1d7] bg-[#fdfbf7]'}`}>
+                      <div className="min-w-0"><p className={`truncate font-semibold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{manager.displayName || manager.email || 'Manager account'}</p><p className="mt-1 truncate text-sm text-gray-500">{manager.email || manager.uid}</p><span className={`mt-2 inline-flex rounded-full px-2.5 py-1 text-xs font-semibold ${manager.disabled ? 'bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300' : 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300'}`}>{manager.disabled ? 'Access off' : 'Access on'}</span>{manager.accessStateMismatch && <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">Authentication access state needs syncing. Use the access button to correct it.</p>}{manager.authExists === false && <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">No Firebase Authentication account is attached to this profile.</p>}</div>
+                      <div className="flex shrink-0 flex-wrap gap-2"><button type="button" onClick={() => void handleManagerAccessChange(manager)} disabled={isProcessing || manager.authExists === false} className={`rounded-lg px-3 py-2 text-sm font-semibold text-white disabled:opacity-50 ${theme === 'dark' ? 'bg-[#383838] hover:bg-[#505050]' : 'bg-slate-900 hover:bg-slate-800'}`}>{manager.disabled ? 'Restore access' : 'Turn access off'}</button><button type="button" onClick={() => setConfirmationAction({ type: 'deleteManagerAccount', manager })} disabled={isProcessing} className="rounded-lg border border-rose-300 px-3 py-2 text-sm font-semibold text-rose-700 hover:bg-rose-50 disabled:opacity-50 dark:border-rose-900 dark:text-rose-300 dark:hover:bg-rose-950/30">Delete account</button></div>
+                    </div>)}
+                  </div>}
+                </section>}
+              </div>
             )}
 
             {activeTab === 'repairs' && (
@@ -3428,7 +4182,7 @@ export default function App() {
           <div role="dialog" aria-modal="true" aria-labelledby="historical-bill-title" className={`app-enter w-full max-w-md rounded-2xl border p-6 shadow-2xl ${theme === 'dark' ? 'border-[#383838] bg-[#1f1f1f] text-white' : 'border-[#e7e1d7] bg-[#fffdf9] text-gray-900'}`} onClick={e => e.stopPropagation()}>
             <div className="mb-5 flex items-center justify-between">
               <div>
-                <h3 id="historical-bill-title" className="text-xl font-semibold">Edit past month bill</h3>
+                <h3 id="historical-bill-title" className="text-xl font-semibold">{isLandlord ? 'Edit past month bill' : 'Request past month bill correction'}</h3>
                 <p className="mt-1 text-sm text-gray-500">{selectedTenantCycleForEdit.tenantName} · {billingCycles.find(cycle => cycle.id === selectedTenantCycleForEdit.cycleId)?.month}</p>
               </div>
               <button type="button" disabled={isProcessing} onClick={() => setIsCycleChargeModalOpen(false)} className="rounded-lg p-2 text-gray-500 hover:bg-black/5 disabled:opacity-50" aria-label="Close dialog"><X size={20}/></button>
@@ -3443,10 +4197,10 @@ export default function App() {
                 <label htmlFor="historical-water" className="mb-1.5 block text-xs font-semibold uppercase tracking-wider text-gray-500">Water billed (KES)</label>
                 <input id="historical-water" name="expectedWater" required type="number" min={selectedTenantCycleForEdit.paidWater || 0} step="0.01" defaultValue={selectedTenantCycleForEdit.expectedWater} className={`w-full rounded-xl border p-3 outline-none focus:border-[#2f5542] ${theme === 'dark' ? 'border-[#505050] bg-[#111111] text-white' : 'border-[#d8d2c8] bg-white text-gray-900'}`} />
               </div>
-              <p className="text-xs leading-5 text-gray-500">The billed amount cannot be set below payments already recorded for that charge.</p>
+              <p className="text-xs leading-5 text-gray-500">The billed amount cannot be set below payments already recorded for that charge. {role === ROLES.MANAGER ? 'Your request will be applied only after the landlord approves it.' : 'Your changes will update this historical bill.'}</p>
               <div className="flex justify-end gap-2 pt-2">
                 <button type="button" disabled={isProcessing} onClick={() => setIsCycleChargeModalOpen(false)} className={`rounded-xl px-4 py-2.5 text-sm font-semibold disabled:opacity-50 ${theme === 'dark' ? 'text-gray-300 hover:bg-white/5' : 'text-gray-600 hover:bg-black/5'}`}>Cancel</button>
-                <button type="submit" disabled={isProcessing} className="rounded-xl bg-[#2f5542] px-5 py-2.5 text-sm font-semibold text-white hover:bg-[#244433] disabled:opacity-50">{isProcessing ? 'Saving…' : 'Save bill'}</button>
+                <button type="submit" disabled={isProcessing} className="rounded-xl bg-[#2f5542] px-5 py-2.5 text-sm font-semibold text-white hover:bg-[#244433] disabled:opacity-50">{isProcessing ? 'Saving…' : role === ROLES.MANAGER ? 'Send request' : 'Save bill'}</button>
               </div>
             </form>
           </div>
@@ -3457,7 +4211,7 @@ export default function App() {
         <div className="fixed inset-0 z-70 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={() => !isProcessing && setConfirmationAction(null)}>
           <div role="dialog" aria-modal="true" aria-labelledby="confirmation-title" className={`w-full max-w-md rounded-2xl border p-6 shadow-2xl ${theme === 'dark' ? 'border-slate-800 bg-slate-900 text-white' : 'border-[#E8DFCE] bg-white text-gray-900'}`} onClick={e => e.stopPropagation()}>
             <h3 id="confirmation-title" className={`text-lg font-bold ${confirmationAction.type === 'requestTenantRemoval' ? 'text-amber-600' : 'text-rose-600'}`}>
-              {confirmationAction.type === 'resetData' ? 'Reset payment and operations data?' : confirmationAction.type === 'closeCycle' ? 'Close the current billing cycle?' : confirmationAction.type === 'requestTenantRemoval' ? 'Send tenant removal request?' : 'Remove tenant from the active directory?'}
+              {confirmationAction.type === 'resetData' ? 'Reset payment and operations data?' : confirmationAction.type === 'closeCycle' ? 'Close the current billing cycle?' : confirmationAction.type === 'requestTenantRemoval' ? 'Send tenant removal request?' : confirmationAction.type === 'deleteManagerAccount' ? 'Delete this manager account?' : 'Remove tenant from the active directory?'}
             </h3>
             <p className={`mt-3 text-sm leading-relaxed ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>
               {confirmationAction.type === 'resetData'
@@ -3466,12 +4220,14 @@ export default function App() {
                   ? `Close ${activeCycle?.month || 'the current month'}? New payments will require a new billing cycle.`
                   : confirmationAction.type === 'requestTenantRemoval'
                     ? `Ask the landlord to remove ${confirmationAction.tenant.name}? The tenant stays active and their financial history is preserved unless the landlord approves the request.`
-                    : `Archive ${confirmationAction.tenant.name} from the active directory? Their financial history will remain available for audit.`}
+                    : confirmationAction.type === 'deleteManagerAccount'
+                      ? `Permanently delete ${confirmationAction.manager.displayName || confirmationAction.manager.email || 'this manager'} from Firebase Authentication and remove their manager profile? Rental records and audit history will be kept.`
+                      : `Archive ${confirmationAction.tenant.name} from the active directory? Their financial history will remain available for audit.`}
             </p>
             <div className="mt-6 flex justify-end gap-2">
               <button type="button" onClick={() => setConfirmationAction(null)} disabled={isProcessing} className={`rounded-xl px-4 py-2.5 text-sm font-bold transition disabled:opacity-50 ${theme === 'dark' ? 'text-slate-300 hover:bg-white/5' : 'text-gray-600 hover:bg-black/5'}`}>Cancel</button>
-              <button type="button" onClick={handleConfirmationSubmit} disabled={isProcessing} className={`rounded-xl px-4 py-2.5 text-sm font-bold text-white transition disabled:opacity-50 ${confirmationAction.type === 'requestTenantRemoval' ? 'bg-gray-800 hover:bg-gray-900' : 'bg-rose-600 hover:bg-rose-700'}`}>
-                {isProcessing ? 'Working…' : confirmationAction.type === 'resetData' ? 'Reset Data' : confirmationAction.type === 'closeCycle' ? 'Close Cycle' : confirmationAction.type === 'requestTenantRemoval' ? 'Request Removal' : 'Remove Tenant'}
+              <button type="button" onClick={handleConfirmationSubmit} disabled={isProcessing} className={`rounded-xl px-4 py-2.5 text-sm font-bold text-white transition disabled:opacity-50 ${confirmationAction.type === 'requestTenantRemoval' || confirmationAction.type === 'deleteManagerAccount' ? 'bg-gray-800 hover:bg-gray-900' : 'bg-rose-600 hover:bg-rose-700'}`}>
+                {isProcessing ? 'Working…' : confirmationAction.type === 'resetData' ? 'Reset Data' : confirmationAction.type === 'closeCycle' ? 'Close Cycle' : confirmationAction.type === 'requestTenantRemoval' ? 'Request Removal' : confirmationAction.type === 'deleteManagerAccount' ? 'Delete Manager' : 'Remove Tenant'}
               </button>
             </div>
           </div>
@@ -3520,6 +4276,11 @@ export default function App() {
                   <input required name="rent" type="number" min="0" step="0.01" defaultValue={selectedHouseForEdit?.rent ?? ''} className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 font-bold transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`} placeholder="e.g. 15000" />
                 </div>
               </div>
+              {selectedHouseForEdit && <div className={`grid grid-cols-2 gap-4 rounded-xl border p-4 ${theme === 'dark' ? 'border-slate-800 bg-slate-950' : 'border-[#E8DFCE] bg-[#F4EFE6]'}`}>
+                <div className="col-span-2"><p className={`text-sm font-semibold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Rent recipient</p><p className="mt-1 text-xs text-gray-500">Add who should receive rent collected for this unit.</p></div>
+                <div><label className="mb-2 block text-xs font-bold uppercase tracking-wider text-gray-500">Recipient name</label><input name="beneficiaryName" maxLength="120" defaultValue={selectedHouseForEdit.beneficiaryName || ''} className={`w-full rounded-xl border p-3 text-sm outline-none ${theme === 'dark' ? 'border-slate-800 bg-[#111111] text-white' : 'border-[#DCD4C6] bg-white text-gray-900'}`} placeholder="e.g. Family member" /></div>
+                <div><label className="mb-2 block text-xs font-bold uppercase tracking-wider text-gray-500">Contact (optional)</label><input name="beneficiaryPhone" maxLength="40" defaultValue={selectedHouseForEdit.beneficiaryPhone || ''} className={`w-full rounded-xl border p-3 text-sm outline-none ${theme === 'dark' ? 'border-slate-800 bg-[#111111] text-white' : 'border-[#DCD4C6] bg-white text-gray-900'}`} placeholder="Phone number" /></div>
+              </div>}
               {selectedHouseForEdit && <p className="text-xs leading-5 text-gray-500">Changing the unit rent affects new monthly bills. Existing month records keep the rent already billed.</p>}
               <button type="submit" disabled={isProcessing} className="w-full bg-gray-800 hover:bg-gray-900 text-white font-bold py-3.5 rounded-xl mt-6 disabled:opacity-50 transition-all shadow-md hover:shadow-lg">
                 {isProcessing ? 'Saving Unit...' : selectedHouseForEdit ? 'Save Unit Details' : 'Save Unit'}
@@ -3539,10 +4300,10 @@ export default function App() {
             {role === ROLES.MANAGER && <p className="mb-5 rounded-xl border border-amber-500/20 bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-300">The tenant will be added only after the landlord approves this request.</p>}
             <form onSubmit={handleAddTenant} className="space-y-4">
               <div className="grid grid-cols-2 gap-4">
-                <div className="col-span-2">
+                {isLandlord && <div className="col-span-2">
                   <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Full Name</label>
                   <input required maxLength={120} name="name" className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 font-medium text-sm transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`} />
-                </div>
+                </div>}
                 <div>
                   <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Phone Number</label>
                   <input required maxLength={40} name="phone" className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 font-medium text-sm transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`} />
@@ -3564,7 +4325,7 @@ export default function App() {
                     ))}
                   </select>
                 </div>
-                <div className={`col-span-2 grid grid-cols-2 gap-3 rounded-xl border p-4 ${theme === 'dark' ? 'border-slate-800 bg-slate-950' : 'border-[#E8DFCE] bg-[#F4EFE6]'}`}>
+                {isLandlord && <div className={`col-span-2 grid grid-cols-2 gap-3 rounded-xl border p-4 ${theme === 'dark' ? 'border-slate-800 bg-slate-950' : 'border-[#E8DFCE] bg-[#F4EFE6]'}`}>
                   <div>
                     <p className="text-[10px] font-bold uppercase tracking-wider text-gray-500">Monthly rent target</p>
                     <p className="mt-1 font-mono text-lg font-bold">{formatKes(selectedNewTenantHouse?.rent || 0)}</p>
@@ -3574,7 +4335,7 @@ export default function App() {
                     <p className="mt-1 font-mono text-lg font-bold">{formatKes(selectedNewTenantHouse?.rent || 0)}</p>
                   </div>
                   <p className="col-span-2 text-xs text-gray-500">Rent and deposit follow the selected unit’s rent. Water is added separately for each billing month after the tenant’s share is calculated.</p>
-                </div>
+                </div>}
               </div>
               <button type="submit" disabled={isProcessing} className="w-full bg-gray-800 hover:bg-gray-900 text-white font-bold py-3.5 rounded-xl mt-6 disabled:opacity-50 transition-all shadow-md hover:shadow-lg">
                 {isProcessing ? (role === ROLES.MANAGER ? 'Submitting Request…' : 'Saving Details…') : (role === ROLES.MANAGER ? 'Submit for Landlord Approval' : 'Save Tenant')}
@@ -3915,9 +4676,9 @@ export default function App() {
 
               <div className={`flex justify-between items-center pt-5 border-t ${theme === 'dark' ? 'border-slate-800' : 'border-[#DCD4C6]'}`}>
                 {(role === ROLES.LANDLORD || role === ROLES.MANAGER) && <button onClick={() => handleDeleteTenant(selectedTenantForDetails)} disabled={isProcessing} className={`text-sm font-bold px-4 py-2.5 rounded-xl transition disabled:opacity-50 ${theme === 'dark' ? 'text-rose-500 hover:bg-rose-500/10' : 'text-rose-600 hover:bg-rose-500/10'}`}>{isLandlord ? 'Remove Tenant' : 'Request Removal'}</button>}
-                {canManageTenants ? (
+                {isLandlord || role === ROLES.MANAGER ? (
                   <button onClick={() => { setEditTenantHouseId(selectedTenantForDetails.houseId || ''); setModalError(''); setIsEditTenantModalOpen(true); }} disabled={isProcessing} className="bg-gray-800 hover:bg-gray-900 text-white font-bold text-sm px-6 py-3 rounded-xl transition flex items-center gap-2 shadow-md hover:shadow-lg"><Edit size={16}/> Edit Details</button>
-                ) : (
+                ) : canManageTenants ? null : (
                   <p className="text-xs text-gray-500 flex items-center gap-1.5 ml-auto font-medium"><Info size={14}/> Editing locked for Managers</p>
                 )}
               </div>
@@ -3967,7 +4728,27 @@ export default function App() {
           </div>
         </div>
       )}
-
+      {isNotificationsOpen && (
+        <div className="fixed inset-0 z-[90] flex justify-end bg-black/35 p-0 sm:p-4" role="presentation" onClick={() => setIsNotificationsOpen(false)}>
+          <section role="dialog" aria-modal="true" aria-labelledby="notifications-heading" className={`flex h-full w-full max-w-md flex-col border shadow-2xl sm:rounded-2xl ${theme === 'dark' ? 'border-[#383838] bg-[#1c1c1c] text-white' : 'border-[#e7e1d7] bg-[#fffdf9] text-gray-900'}`} onClick={event => event.stopPropagation()}>
+            <header className={`flex items-start justify-between gap-3 border-b p-5 ${theme === 'dark' ? 'border-[#383838]' : 'border-[#e7e1d7]'}`}>
+              <div><h2 id="notifications-heading" className="text-lg font-semibold">Notifications</h2><p className="mt-1 text-sm text-gray-500">Updates from the landlord and house managers.</p></div>
+              <button type="button" onClick={() => setIsNotificationsOpen(false)} aria-label="Close notifications" className={`rounded-lg p-2 ${theme === 'dark' ? 'text-slate-400 hover:bg-white/5' : 'text-gray-500 hover:bg-black/5'}`}><X size={18}/></button>
+            </header>
+            <div className="flex-1 space-y-2 overflow-y-auto p-3 sm:p-4">
+              {orderedNotifications.length === 0 ? <div className="py-12 text-center"><Bell size={23} className="mx-auto text-gray-400"/><p className="mt-3 text-sm font-medium">You’re all caught up</p><p className="mt-1 text-xs text-gray-500">Workspace changes and balance reminders will appear here.</p></div> : orderedNotifications.map(notification => {
+                const createdAt = new Date(notification.createdAt || 0);
+                const unread = Number.isFinite(createdAt.getTime()) && createdAt.getTime() > notificationReadAt;
+                return <button key={notification.id} type="button" onClick={() => openNotificationDestination(notification)} className={`block w-full rounded-xl border p-3 text-left transition ${unread ? theme === 'dark' ? 'border-amber-500/40 bg-amber-500/10' : 'border-amber-300 bg-amber-50' : theme === 'dark' ? 'border-[#383838] hover:bg-[#242424]' : 'border-[#e7e1d7] hover:bg-[#f5f2ec]'}`}>
+                  <span className="flex items-start gap-2"><span className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${unread ? 'bg-amber-500' : 'bg-gray-300 dark:bg-gray-600'}`}/><span className="min-w-0 flex-1"><span className="block text-sm font-semibold">{notification.title || 'Workspace update'}</span><span className="mt-1 block text-xs leading-5 text-gray-500">{notification.message || 'A workspace record changed.'}</span><span className="mt-2 block text-[10px] text-gray-500">{notification.actorName || (notification.actorRole === ROLES.LANDLORD ? 'Landlord' : 'House manager')} · {Number.isFinite(createdAt.getTime()) ? createdAt.toLocaleString() : 'Just now'}</span></span></span>
+                </button>;
+              })}
+            </div>
+            <footer className={`border-t p-3 text-center text-[11px] text-gray-500 ${theme === 'dark' ? 'border-[#383838]' : 'border-[#e7e1d7]'}`}>Notifications are shared across this property workspace.</footer>
+          </section>
+        </div>
+      )}
+      {appUpdateDialog}
     </div>
   );
 }
