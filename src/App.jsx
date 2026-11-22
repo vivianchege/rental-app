@@ -105,7 +105,7 @@ const formatKes = (amount) => new Intl.NumberFormat('en-KE', {
   maximumFractionDigits: 2,
 }).format(Number(amount || 0));
 const DEFAULT_WORKSPACE_ID = import.meta.env.VITE_DEFAULT_WORKSPACE_ID || 'main-workspace';
-const APP_RELEASE_VERSION = import.meta.env.VITE_APP_VERSION || '1.6.0';
+const APP_RELEASE_VERSION = import.meta.env.VITE_APP_VERSION || '1.6.1';
 const androidApiLevelFromUserAgent = () => {
   const match = /Android\s+(\d+)(?:\.(\d+))?/i.exec(navigator.userAgent || '');
   if (!match) return null;
@@ -252,12 +252,22 @@ export default function App() {
   const [tenantCycles, setTenantCycles] = useState([]);
   const [activeTab, setActiveTab] = useState('dashboard');
   useEffect(() => {
-    if (!Capacitor.isNativePlatform() || activeTab !== 'billing') return undefined;
+    if (!Capacitor.isNativePlatform()) return undefined;
     let registration;
     let disposed = false;
     CapacitorApp.addListener('backButton', () => {
-      if (document.querySelector('[aria-modal="true"]')) return;
-      setActiveTab('dashboard');
+      const overlays = Array.from(document.querySelectorAll('.fixed.inset-0'))
+        .filter(overlay => {
+          const style = window.getComputedStyle(overlay);
+          return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
+        })
+        .sort((left, right) => Number(window.getComputedStyle(left).zIndex || 0) - Number(window.getComputedStyle(right).zIndex || 0));
+      const topOverlay = overlays[overlays.length - 1];
+      if (topOverlay) {
+        topOverlay.click();
+        return;
+      }
+      if (activeTab !== 'dashboard') setActiveTab('dashboard');
     }).then(listener => {
       if (disposed) void listener.remove();
       else registration = listener;
@@ -771,7 +781,15 @@ export default function App() {
           const token = await getIdTokenResult(currentUser);
           const profileSnapshot = db ? await getDoc(doc(db, 'users', currentUser.uid)) : null;
           const profile = profileSnapshot?.exists() ? profileSnapshot.data() : {};
-          const resolvedRole = normalizeRole(token.claims.role || profile.role || LEGACY_ROLE_BY_UID[currentUser.uid]);
+          const claimRole = normalizeRole(token.claims.role);
+          const profileRole = normalizeRole(profile.role);
+          if (token.claims.role && profile.role && claimRole !== profileRole) {
+            await signOut(auth);
+            setLoginError('Access denied: the account role settings do not match. Contact the landlord.');
+            setLoading(false);
+            return;
+          }
+          const resolvedRole = claimRole || profileRole || LEGACY_ROLE_BY_UID[currentUser.uid];
 
           if (!resolvedRole) throw new Error('Account permissions could not be verified.');
           if (resolvedRole === ROLES.MANAGER && profile.disabled === true) {
@@ -877,9 +895,9 @@ export default function App() {
     } else if (role === ROLES.MANAGER) {
       subscribe('tenantChangeRequests', setTenantChangeRequests, 'requestedAt', undefined, collectionName => query(
         getColRef(collectionName),
-        ...(LEGACY_ROLE_BY_UID[user?.uid] !== undefined ? [where('workspaceId', '==', 'main-workspace')] : []),
+        where('workspaceId', '==', workspaceId),
         where('createdBy', '==', user.uid),
-        where('action', 'in', ['CREATE_TENANT', 'DELETE_TENANT'])
+        where('action', 'in', ['CREATE_TENANT', 'DELETE_TENANT', 'UPDATE_TENANT', 'UPDATE_TENANT_BILL'])
       ));
     }
     subscribe('billingCycles', setBillingCycles, null, records => records.sort((left, right) => new Date(right.openedAt || 0) - new Date(left.openedAt || 0)));
@@ -909,7 +927,7 @@ export default function App() {
   const visibleTenantChangeRequests = useMemo(() => tenantChangeRequests
     .filter(request => isLandlord
       ? request.status === 'PENDING'
-      : request.createdBy === user?.uid && ['CREATE_TENANT', 'DELETE_TENANT'].includes(request.action))
+      : request.createdBy === user?.uid && ['CREATE_TENANT', 'DELETE_TENANT', 'UPDATE_TENANT', 'UPDATE_TENANT_BILL'].includes(request.action))
     .sort((left, right) => new Date(right.requestedAt || 0) - new Date(left.requestedAt || 0)),
   [tenantChangeRequests, isLandlord, user]);
   const pendingTenantCreationHouseIds = useMemo(() => new Set(tenantChangeRequests
@@ -1217,7 +1235,15 @@ export default function App() {
       const token = await getIdTokenResult(result.user);
       const profileSnapshot = db ? await getDoc(doc(db, 'users', result.user.uid)) : null;
       const profile = profileSnapshot?.exists() ? profileSnapshot.data() : {};
-      const resolvedRole = normalizeRole(token.claims.role || profile.role || LEGACY_ROLE_BY_UID[result.user.uid]);
+      const claimRole = normalizeRole(token.claims.role);
+      const profileRole = normalizeRole(profile.role);
+      if (token.claims.role && profile.role && claimRole !== profileRole) {
+        rejectedGoogleUserUid.current = result.user.uid;
+        await signOut(auth);
+        setLoginError('Access denied: the account role settings do not match. Contact the landlord.');
+        return;
+      }
+      const resolvedRole = claimRole || profileRole || LEGACY_ROLE_BY_UID[result.user.uid];
       if (resolvedRole === ROLES.MANAGER && profile.disabled === true) {
         rejectedGoogleUserUid.current = result.user.uid;
         await signOut(auth);
@@ -2004,7 +2030,16 @@ export default function App() {
       const amount = parseMoney(formData.get('amount'));
       const type = formData.get('type');
       const messageCode = String(formData.get('messageCode') || '').trim().toUpperCase();
-      const method = formData.get('method');
+      const method = String(formData.get('method') || '').trim();
+      const configuredMethods = Array.isArray(userProfile?.paymentMethods)
+        ? userProfile.paymentMethods
+        : ['M-Pesa', 'Bank Transfer', 'Other'];
+      const availableMethods = configuredMethods.filter(candidate =>
+        typeof candidate === 'string' && candidate.trim() && candidate.trim().toLowerCase() !== 'cash');
+      const allowedMethods = availableMethods.length ? availableMethods : ['M-Pesa', 'Bank Transfer', 'Other'];
+      if (!method || /^cash$/i.test(method) || !allowedMethods.includes(method)) {
+        throw new Error('Choose a supported non-cash rent payment method.');
+      }
       const paymentDateValue = formData.get('paymentDate');
       const paymentDate = new Date(`${paymentDateValue}T12:00:00`);
       const paymentMonthKey = `${paymentCycle.year}-${String(Number(paymentCycle.monthIndex) + 1).padStart(2, '0')}`;
@@ -3600,7 +3635,7 @@ export default function App() {
                     <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
                       <div>
                         <h3 id="tenant-requests-title" className={`text-lg font-bold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{isLandlord ? 'Tenant Approval Requests' : 'My Tenant Requests'}</h3>
-                        <p className="mt-1 text-sm text-gray-500">{isLandlord ? 'Review manager tenant and past-bill requests before records change.' : 'New tenants and removal requests are listed here.'}</p>
+                        <p className="mt-1 text-sm text-gray-500">{isLandlord ? 'Review manager tenant and past-bill requests before records change.' : 'Your tenant and billing changes appear here with their latest status.'}</p>
                       </div>
                     </div>
                     {visibleTenantChangeRequests.length === 0 ? (
@@ -3625,7 +3660,7 @@ export default function App() {
                                   <p className="mt-1 text-xs text-gray-500">Requested by {request.requestedByName || 'Manager'} · {request.requestedAt ? new Date(request.requestedAt).toLocaleDateString('en-KE', { timeZone: DEFAULT_TIMEZONE }) : '—'}</p>
                                 </div>
                                 {!isLandlord && (
-                                  <span className={`rounded-full px-2.5 py-1 text-xs font-bold ${request.status === 'APPROVED' ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300' : request.status === 'REJECTED' ? 'bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300' : 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'}`}>{request.status === 'APPROVED' ? 'Approved' : request.status === 'REJECTED' ? 'Declined' : 'Pending landlord approval'}</span>
+                                  <span className={`rounded-full px-2.5 py-1 text-xs font-bold ${request.status === 'APPROVED' ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300' : request.status === 'REJECTED' ? 'bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300' : 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'}`}>{isUpdateRequest || isBillRequest ? (request.status === 'APPROVED' ? 'Saved' : request.status === 'REJECTED' ? 'Not applied' : 'Submitted') : (request.status === 'APPROVED' ? 'Approved' : request.status === 'REJECTED' ? 'Declined' : 'Pending landlord approval')}</span>
                                 )}
                               </div>
                               {isLandlord && (
@@ -4360,12 +4395,16 @@ export default function App() {
               <div className="grid grid-cols-2 gap-4">
                 <div className="col-span-2">
                   <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Assigned Property Unit</label>
-                  <select required name="houseId" value={editTenantHouseId} onChange={event => setEditTenantHouseId(event.target.value)} className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 text-sm font-bold transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`}>
-                    <option value="">-- Select a property unit --</option>
-                    {houses.filter(h => h.id === selectedTenantForDetails.houseId || (h.status === 'VACANT' && !occupiedHouseIds.has(h.id))).map(h => (
-                      <option key={h.id} value={h.id}>{h.id === selectedTenantForDetails.houseId ? 'Keep Current Unit: ' : 'Move to: '}{h.name}</option>
-                    ))}
-                  </select>
+                  {isLandlord ? (
+                    <select required name="houseId" value={editTenantHouseId} onChange={event => setEditTenantHouseId(event.target.value)} className={`w-full border rounded-xl p-3 outline-none focus:ring-2 focus:ring-gray-800 dark:focus:ring-gray-500 text-sm font-bold transition-all ${theme === 'dark' ? 'bg-slate-950 border-slate-800 text-white' : 'bg-[#F4EFE6] border-[#DCD4C6] text-gray-900'}`}>
+                      <option value="">-- Select a property unit --</option>
+                      {houses.filter(h => h.id === selectedTenantForDetails.houseId || (h.status === 'VACANT' && !occupiedHouseIds.has(h.id))).map(h => (
+                        <option key={h.id} value={h.id}>{h.id === selectedTenantForDetails.houseId ? 'Keep Current Unit: ' : 'Move to: '}{h.name}</option>
+                      ))}
+                    </select>
+                  ) : (
+                    <p className={`rounded-xl border p-3 text-sm font-semibold ${theme === 'dark' ? 'border-slate-800 bg-slate-950 text-slate-200' : 'border-[#DCD4C6] bg-[#F4EFE6] text-gray-800'}`}>{selectedDetailHouse?.name || 'Unit unavailable'}</p>
+                  )}
                 </div>
                 <div>
                   <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Phone Number</label>

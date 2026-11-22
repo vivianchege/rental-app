@@ -71,8 +71,25 @@ async function requireLandlord(request) {
   if (!authUser || authUser.disabled) {
     throw new HttpsError("unauthenticated", "This account is not available.");
   }
+  const customRole = typeof authUser.customClaims?.role === "string"
+    ? authUser.customClaims.role.trim().toUpperCase()
+    : "";
+  const tokenRole = typeof request.auth.token?.role === "string"
+    ? request.auth.token.role.trim().toUpperCase()
+    : "";
+  if ((customRole && customRole !== "LANDLORD") || (tokenRole && tokenRole !== "LANDLORD") ||
+      (customRole && tokenRole && customRole !== tokenRole)) {
+    throw new HttpsError("permission-denied", "This account's role settings do not match a landlord account.");
+  }
 
   if (uid === LEGACY_LANDLORD_UID) {
+    const legacyProfile = await readManagerProfile(uid);
+    if (legacyProfile.data?.role && legacyProfile.data.role !== "LANDLORD") {
+      throw new HttpsError("permission-denied", "This account does not have a landlord role.");
+    }
+    if (legacyProfile.data?.workspaceId && legacyProfile.data.workspaceId !== MAIN_WORKSPACE_ID) {
+      throw new HttpsError("permission-denied", "This account is not in the main workspace.");
+    }
     return { uid, workspaceId: MAIN_WORKSPACE_ID };
   }
 
@@ -80,6 +97,9 @@ async function requireLandlord(request) {
   const profile = profileSnapshot.exists ? profileSnapshot.data() : null;
   if (!profile || profile.role !== "LANDLORD") {
     throw new HttpsError("permission-denied", "Only a verified landlord profile may manage accounts.");
+  }
+  if (profile.role && customRole && profile.role !== customRole) {
+    throw new HttpsError("permission-denied", "The account profile and role claim do not match.");
   }
 
   if (
@@ -227,7 +247,6 @@ exports.setManagerAccess = callable("setManagerAccess", async (request) => {
   }
 
   if (data.disabled) {
-    await auth.updateUser(uid, { disabled: true });
     await manager.ref.set(
       {
         role: "MANAGER",
@@ -238,8 +257,10 @@ exports.setManagerAccess = callable("setManagerAccess", async (request) => {
       },
       { merge: true },
     );
+    await auth.updateUser(uid, { disabled: true });
     await auth.revokeRefreshTokens(uid);
   } else {
+    await auth.updateUser(uid, { disabled: false });
     await manager.ref.set(
       {
         role: "MANAGER",
@@ -250,7 +271,6 @@ exports.setManagerAccess = callable("setManagerAccess", async (request) => {
       },
       { merge: true },
     );
-    await auth.updateUser(uid, { disabled: false });
   }
 
   return { uid, disabled: data.disabled };
@@ -263,6 +283,15 @@ exports.deleteManagerAccount = callable("deleteManagerAccount", async (request) 
   const manager = await requireWorkspaceManager(uid, landlord.workspaceId);
   const authUser = await readAuthUser(uid);
 
+  if (manager.exists) {
+    await manager.ref.set({
+      role: "MANAGER",
+      workspaceId: manager.workspaceId,
+      disabled: true,
+      accessUpdatedBy: landlord.uid,
+      accessUpdatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }
   if (authUser) {
     await auth.updateUser(uid, { disabled: true });
     await auth.revokeRefreshTokens(uid);
@@ -324,6 +353,13 @@ async function requireAssistantActor(request) {
 
   const profileSnapshot = await db.collection("users").doc(uid).get();
   const profile = profileSnapshot.exists ? profileSnapshot.data() : null;
+  const profileRole = typeof profile?.role === "string" ? profile.role.trim().toUpperCase() : "";
+  const claimRole = typeof claims.role === "string" ? claims.role.trim().toUpperCase() : "";
+  const tokenRole = typeof tokenClaims.role === "string" ? tokenClaims.role.trim().toUpperCase() : "";
+  const suppliedRoles = [profileRole, claimRole, tokenRole].filter(Boolean);
+  if (suppliedRoles.some((role) => role !== suppliedRoles[0])) {
+    throw new HttpsError("permission-denied", "The account profile and role claims do not match.");
+  }
   if (profile?.disabled === true) {
     throw new HttpsError("permission-denied", "This account's workspace access is turned off.");
   }
@@ -332,7 +368,8 @@ async function requireAssistantActor(request) {
   let workspaceId;
   let allowLegacyRecords = false;
   if (uid === LEGACY_LANDLORD_UID) {
-    if (profile?.role && profile.role !== "LANDLORD") {
+    if ((profileRole && profileRole !== "LANDLORD") || (claimRole && claimRole !== "LANDLORD") ||
+        (tokenRole && tokenRole !== "LANDLORD")) {
       throw new HttpsError("permission-denied", "This account does not have a landlord role.");
     }
     if (validWorkspaceId(profile?.workspaceId) && profile.workspaceId !== MAIN_WORKSPACE_ID) {
@@ -345,7 +382,8 @@ async function requireAssistantActor(request) {
     workspaceId = MAIN_WORKSPACE_ID;
     allowLegacyRecords = true;
   } else if (isLegacyManager(uid)) {
-    if (profile?.role && profile.role !== "MANAGER") {
+    if ((profileRole && profileRole !== "MANAGER") || (claimRole && claimRole !== "MANAGER") ||
+        (tokenRole && tokenRole !== "MANAGER")) {
       throw new HttpsError("permission-denied", "This account does not have a manager role.");
     }
     if (profile?.workspaceId && profile.workspaceId !== MAIN_WORKSPACE_ID) {
@@ -358,11 +396,10 @@ async function requireAssistantActor(request) {
     workspaceId = MAIN_WORKSPACE_ID;
     allowLegacyRecords = true;
   } else {
-    const profileRole = typeof profile?.role === "string" ? profile.role.trim().toUpperCase() : "";
-    const claimRole = typeof claims.role === "string" ? claims.role.trim().toUpperCase() : "";
     role = ["LANDLORD", "MANAGER"].includes(profileRole)
       ? profileRole
-      : ["LANDLORD", "MANAGER"].includes(claimRole) ? claimRole : "";
+      : ["LANDLORD", "MANAGER"].includes(claimRole) ? claimRole
+        : ["LANDLORD", "MANAGER"].includes(tokenRole) ? tokenRole : "";
     const profileWorkspace = validWorkspaceId(profile?.workspaceId) ? profile.workspaceId : "";
     const claimedWorkspace = validWorkspaceId(claims.workspaceId) ? claims.workspaceId : "";
     if (profileWorkspace && claimedWorkspace && profileWorkspace !== claimedWorkspace) {
@@ -517,6 +554,7 @@ async function resolveAssistantManager(uid, workspaceId) {
   } else {
     const profileRole = typeof profile.data?.role === "string" ? profile.data.role.trim().toUpperCase() : "";
     const claimRole = typeof claims.role === "string" ? claims.role.trim().toUpperCase() : "";
+    if (profileRole && claimRole && profileRole !== claimRole) return null;
     const role = ["LANDLORD", "MANAGER"].includes(profileRole) ? profileRole : claimRole;
     const profileWorkspace = validWorkspaceId(profile.data?.workspaceId) ? profile.data.workspaceId : "";
     const claimWorkspace = validWorkspaceId(claims.workspaceId) ? claims.workspaceId : "";
@@ -617,13 +655,14 @@ async function loadManagerAssistantHistory(workspaceId, managers = null) {
 }
 
 async function buildRentalAssistantContext(actor) {
-  const [cycles, tenants, houses, tenantCycles, payments, auditLogs, repairs, expenses, septicLogs, garbageLogs, masterWaterBills, waterVaultResets] = await Promise.all([
+  const [cycles, tenants, houses, tenantCycles, payments, auditLogs, tenantChangeRequests, repairs, expenses, septicLogs, garbageLogs, masterWaterBills, waterVaultResets] = await Promise.all([
     readWorkspaceRecords("billingCycles", actor.workspaceId, 2000, actor.allowLegacyRecords),
     readWorkspaceRecords("tenants", actor.workspaceId, 1000, actor.allowLegacyRecords),
     readWorkspaceRecords("houses", actor.workspaceId, 1000, actor.allowLegacyRecords),
     readWorkspaceRecords("tenantCycles", actor.workspaceId, 10000, actor.allowLegacyRecords),
     readWorkspaceRecords("payments", actor.workspaceId, 10000, actor.allowLegacyRecords),
     readWorkspaceRecords("auditLogs", actor.workspaceId, 3000, actor.allowLegacyRecords),
+    readWorkspaceRecords("tenantChangeRequests", actor.workspaceId, 1000, actor.allowLegacyRecords),
     readWorkspaceRecords("repairs", actor.workspaceId, 500, actor.allowLegacyRecords),
     readWorkspaceRecords("expenses", actor.workspaceId, 500, actor.allowLegacyRecords),
     readWorkspaceRecords("septicLogs", actor.workspaceId, 500, actor.allowLegacyRecords),
@@ -781,9 +820,52 @@ async function buildRentalAssistantContext(actor) {
     },
   };
 
+  const sourceRecords = {
+    tenant_change_request: tenantChangeRequests,
+    payment: payments,
+    tenant: tenants,
+    unit: houses,
+    maintenance: repairs,
+    expense: expenses,
+    septic: septicLogs,
+    garbage_collection: garbageLogs,
+    utility_bill: masterWaterBills,
+    tenant_cycle: tenantCycles,
+  };
+  const managerAuditMatchesSource = (entry) => {
+    const uid = entry.actorId;
+    if (!uid || entry.createdBy !== uid) return false;
+    const expectedRequestAction = {
+      TENANT_CREATION_REQUESTED: "CREATE_TENANT",
+      TENANT_REMOVAL_REQUESTED: "DELETE_TENANT",
+      TENANT_DETAILS_CHANGE_SUBMITTED: "UPDATE_TENANT",
+      HISTORICAL_BILL_CHANGE_REQUESTED: "UPDATE_TENANT_BILL",
+    }[entry.action];
+    if (expectedRequestAction) {
+      return (sourceRecords.tenant_change_request || []).some((record) =>
+        record.id === entry.entityId && record.createdBy === uid && record.action === expectedRequestAction);
+    }
+    if (entry.action === "TENANT_WATER_SHARE_SET") {
+      return tenantCycles.some((record) => record.tenantId === entry.entityId &&
+        record.cycleId === entry.metadata?.cycleId && record.updatedBy === uid);
+    }
+    const actionSources = {
+      PAYMENT_RECORDED: ["payment", "createdBy", (record) => record.loggedBy === "MANAGER"],
+      EXPENSE_CREATED: ["expense", "createdBy"],
+      MAINTENANCE_CREATED: ["maintenance", "createdBy"],
+      MAINTENANCE_COMPLETED: ["maintenance", "updatedBy"],
+      GARBAGE_COLLECTION_LOGGED: ["garbage_collection", "createdBy"],
+      UTILITY_BILL_CREATED: ["utility_bill", "createdBy"],
+      PAYMENT_CONFIRMED: ["payment", "updatedBy", (record) => record.status === "CONFIRMED"],
+    }[entry.action];
+    if (!actionSources || entry.entity !== actionSources[0]) return false;
+    const [collectionName, actorField, extraCheck] = actionSources;
+    return (sourceRecords[collectionName] || []).some((record) =>
+      record.id === entry.entityId && record[actorField] === uid && (!extraCheck || extraCheck(record)));
+  };
   const activityEntries = auditLogs.filter((entry) => actor.role === "LANDLORD"
-    ? entry.actorRole === "MANAGER"
-    : entry.actorId === actor.uid || entry.createdBy === actor.uid)
+    ? entry.actorRole === "MANAGER" && managerAuditMatchesSource(entry)
+    : entry.actorId === actor.uid && entry.createdBy === actor.uid)
     .sort((left, right) => timestampMillis(right.timestamp) - timestampMillis(left.timestamp))
     .slice(0, 80);
   const managerActivityUids = actor.role === "LANDLORD"
@@ -796,7 +878,10 @@ async function buildRentalAssistantContext(actor) {
     manager.uid,
     safeOperationalText(manager.data.assistantDisplayName || manager.data.displayName || manager.data.name || "Workspace manager", 80),
   ]));
-  const permittedActivity = activityEntries
+  const trustedActivityEntries = actor.role === "LANDLORD"
+    ? activityEntries.filter((entry) => managerNamesByUid.has(entry.actorId))
+    : activityEntries;
+  const permittedActivity = trustedActivityEntries
     .map((entry) => ({
       action: cleanContextText(entry.action || "", 80),
       entity: cleanContextText(entry.entity || "", 40),
