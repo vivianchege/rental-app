@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Capacitor } from '@capacitor/core';
-import { FirebaseAuthentication } from '@capacitor-firebase/authentication';
 import { App as CapacitorApp } from '@capacitor/app';
+import { FirebaseAuthentication } from '@capacitor-firebase/authentication';
 import { BiometricAuth } from '@aparajita/capacitor-biometric-auth';
 import { Preferences } from '@capacitor/preferences';
 import { Browser } from '@capacitor/browser';
@@ -21,7 +21,8 @@ import { canAccessWorkspaceRecord, hasPermission, normalizeRole, PERMISSIONS, RO
 import { APP_IDLE_TIMEOUT_MS, formatLockoutDuration, getCurrentTimestamp, getNextPasswordFailure, getRemainingLockoutSeconds } from './lib/authSecurity.js';
 import { firebaseClientConfig } from './lib/firebaseClientConfig.js';
 import { probeInternetAccess } from './lib/connectivity.js';
-import { checkForAppUpdate } from './lib/releaseUpdates.js';
+import { checkForAppUpdate, normalizeInstalledVersion } from './lib/releaseUpdates.js';
+import { NativeAppUpdater } from './lib/nativeAppUpdater.js';
 
 // --- FIREBASE IMPORTS ---
 import { initializeApp, getApps, getApp } from 'firebase/app';
@@ -105,7 +106,7 @@ const formatKes = (amount) => new Intl.NumberFormat('en-KE', {
   maximumFractionDigits: 2,
 }).format(Number(amount || 0));
 const DEFAULT_WORKSPACE_ID = import.meta.env.VITE_DEFAULT_WORKSPACE_ID || 'main-workspace';
-const APP_RELEASE_VERSION = import.meta.env.VITE_APP_VERSION || '1.6.1';
+const APP_RELEASE_VERSION = __APP_VERSION__;
 const androidApiLevelFromUserAgent = () => {
   const match = /Android\s+(\d+)(?:\.(\d+))?/i.exec(navigator.userAgent || '');
   if (!match) return null;
@@ -331,6 +332,8 @@ export default function App() {
   const [managerAccountsError, setManagerAccountsError] = useState('');
   const [availableAppUpdate, setAvailableAppUpdate] = useState(null);
   const [showAppUpdateNotice, setShowAppUpdateNotice] = useState(false);
+  const [appUpdateStatus, setAppUpdateStatus] = useState(null);
+  const [showAppUpdateStatus, setShowAppUpdateStatus] = useState(false);
   const [appUpdateCheckPending, setAppUpdateCheckPending] = useState(false);
   const [appUpdateCheckMessage, setAppUpdateCheckMessage] = useState('');
   const [assistantMessages, setAssistantMessages] = useState([]);
@@ -533,14 +536,24 @@ export default function App() {
       const deviceInfo = Capacitor.isNativePlatform() ? await Device.getInfo().catch(() => null) : null;
       const androidApiLevel = Number(deviceInfo?.androidSDKVersion) || androidApiLevelFromUserAgent();
       if (!androidApiLevel) throw new Error('Could not identify the Android version on this device.');
+      const installedApp = Capacitor.isNativePlatform()
+        ? await CapacitorApp.getInfo().catch(() => null)
+        : null;
+      const currentVersion = installedApp?.version || APP_RELEASE_VERSION;
+      const normalizedCurrentVersion = normalizeInstalledVersion(currentVersion);
 
       const cacheKey = 'ruiru_release_update_check';
       if (!force) {
         try {
           const cached = JSON.parse(localStorage.getItem(cacheKey) || 'null');
-          if (cached?.checkedAt && Date.now() - cached.checkedAt < 6 * 60 * 60 * 1000) {
+          if (
+            cached?.checkedAt &&
+            Date.now() - cached.checkedAt < 6 * 60 * 60 * 1000 &&
+            cached?.info?.currentVersion === normalizedCurrentVersion
+          ) {
             const info = cached.info || null;
             setAvailableAppUpdate(info?.updateAvailable ? info : null);
+            setAppUpdateStatus(info ? { ...info, checkedAt: cached.checkedAt } : null);
             if (info?.updateAvailable) {
               const dismissedAt = Number(localStorage.getItem(`ruiru_update_dismissed_${info.latestVersion}`) || 0);
               if (Date.now() - dismissedAt >= 24 * 60 * 60 * 1000) setShowAppUpdateNotice(true);
@@ -552,21 +565,27 @@ export default function App() {
         }
       }
 
-      const info = await checkForAppUpdate({ currentVersion: APP_RELEASE_VERSION, androidApiLevel });
+      const info = await checkForAppUpdate({ currentVersion, androidApiLevel });
       setAvailableAppUpdate(info.updateAvailable ? info : null);
-      try { localStorage.setItem(cacheKey, JSON.stringify({ checkedAt: Date.now(), info })); } catch { /* Update checks still work without storage. */ }
+      const checkedAt = Date.now();
+      setAppUpdateStatus({ ...info, checkedAt, error: '' });
+      try { localStorage.setItem(cacheKey, JSON.stringify({ checkedAt, info })); } catch { /* Update checks still work without storage. */ }
       if (info.updateAvailable) {
+        setShowAppUpdateStatus(false);
         const dismissedAt = Number(localStorage.getItem(`ruiru_update_dismissed_${info.latestVersion}`) || 0);
         if (force || Date.now() - dismissedAt >= 24 * 60 * 60 * 1000) setShowAppUpdateNotice(true);
       } else if (force) {
-        setToastMessage('You are using the latest app version.');
+        setShowAppUpdateNotice(false);
+        setShowAppUpdateStatus(true);
       }
       return info;
     } catch (error) {
       if (force) {
         const message = error?.message || 'Could not check for app updates.';
         setAppUpdateCheckMessage(message);
-        setToastMessage(message);
+        setAppUpdateStatus({ error: message, checkedAt: Date.now() });
+        setShowAppUpdateNotice(false);
+        setShowAppUpdateStatus(true);
       }
       return null;
     } finally {
@@ -578,12 +597,34 @@ export default function App() {
     if (!availableAppUpdate?.apkDownloadUrl) return;
     try {
       if (Capacitor.isNativePlatform()) {
-        await Browser.open({ url: availableAppUpdate.apkDownloadUrl, toolbarColor: theme === 'dark' ? '#303030' : '#ffffff' });
+        const fileName = availableAppUpdate.apkDownloadUrl.split('/').pop();
+        const result = await NativeAppUpdater.downloadAndInstall({
+          url: availableAppUpdate.apkDownloadUrl,
+          fileName,
+        });
+        if (result?.needsPermission) {
+          setAppUpdateCheckMessage('Allow Ruiru Rentals to install updates in Android settings, return here, then tap Download update APK again.');
+        } else if (result?.openedInstaller) {
+          setAppUpdateCheckMessage('Review the Android install screen and confirm the update.');
+        } else if (result?.downloadInProgress) {
+          setAppUpdateCheckMessage('The APK is still downloading. Return here and tap Download update APK again when it finishes to open the installer.');
+        } else if (result?.downloadStarted) {
+          setAppUpdateCheckMessage('Download started. When it finishes, return here and tap Download update APK again to open the installer. Android will ask you to confirm Install.');
+        } else {
+          throw new Error('Android did not start the update download.');
+        }
       } else {
         window.open(availableAppUpdate.apkDownloadUrl, '_blank', 'noopener,noreferrer');
       }
     } catch {
-      setAppUpdateCheckMessage('Could not open the APK download. Open the release page and choose the APK for this Android version.');
+      try {
+        if (Capacitor.isNativePlatform()) {
+          await Browser.open({ url: availableAppUpdate.apkDownloadUrl, toolbarColor: theme === 'dark' ? '#303030' : '#ffffff' });
+          setAppUpdateCheckMessage('Android opened the official APK download in your browser. Open the downloaded file and confirm the install prompt.');
+          return;
+        }
+      } catch { /* Keep the update dialog open and show the recovery guidance below. */ }
+      setAppUpdateCheckMessage('Could not start the APK download. Use the release page to download the APK for this Android version.');
     }
   };
 
@@ -593,6 +634,8 @@ export default function App() {
     }
     setShowAppUpdateNotice(false);
   };
+
+  const dismissAppUpdateStatus = () => setShowAppUpdateStatus(false);
 
   useEffect(() => {
     if (!internetAvailable) return undefined;
@@ -3043,19 +3086,45 @@ export default function App() {
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4" role="presentation" onClick={dismissAppUpdateNotice}>
       <section role="dialog" aria-modal="true" aria-labelledby="app-update-title" className={`w-full max-w-md rounded-2xl border p-6 shadow-2xl ${theme === 'dark' ? 'border-[#383838] bg-[#1f1f1f] text-white' : 'border-[#e7e1d7] bg-[#fffdf9] text-gray-900'}`} onClick={event => event.stopPropagation()}>
         <div className="flex items-start justify-between gap-4"><div><p className="text-xs font-semibold uppercase tracking-wider text-amber-600">App update</p><h2 id="app-update-title" className="mt-1 text-xl font-semibold">Version {availableAppUpdate.latestVersion} is ready</h2></div><button type="button" onClick={dismissAppUpdateNotice} className={`rounded-lg p-2 ${theme === 'dark' ? 'text-slate-400 hover:bg-white/5' : 'text-gray-500 hover:bg-black/5'}`} aria-label="Close update notice"><X size={18}/></button></div>
-        <p className={`mt-3 text-sm leading-6 ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>This update is for Android {availableAppUpdate.androidApiLevel >= 29 ? '10 and newer' : '7–9'}. Download the APK, open it from Downloads, then confirm Android’s install prompt.</p>
-        {appUpdateCheckMessage && <p role="alert" className="mt-3 text-sm text-rose-600 dark:text-rose-300">{appUpdateCheckMessage}</p>}
-        <button type="button" onClick={() => void openAppUpdateDownload()} className={`mt-5 flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-semibold text-white ${theme === 'dark' ? 'bg-[#383838] hover:bg-[#505050]' : 'bg-slate-900 hover:bg-slate-800'}`}><Download size={17}/> Download and install update</button>
-        <div className={`mt-4 rounded-xl p-4 text-sm ${theme === 'dark' ? 'bg-[#292929] text-slate-300' : 'bg-[#f3f0e9] text-gray-700'}`}>
-          <p className="font-semibold">What’s improved</p>
+        <p className={`mt-3 text-sm leading-6 ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>Your Android {availableAppUpdate.androidApiLevel >= 29 ? '10 or newer' : '7–9'} device will download the matching APK. Open the downloaded file and approve Android’s installer to finish updating.</p>
+        {appUpdateCheckMessage && <p role="status" className={`mt-3 rounded-lg px-3 py-2 text-sm leading-5 ${theme === 'dark' ? 'bg-[#292929] text-slate-200' : 'bg-[#f3f0e9] text-gray-700'}`}>{appUpdateCheckMessage}</p>}
+        <button type="button" onClick={() => void openAppUpdateDownload()} className={`mt-5 flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-semibold text-white ${theme === 'dark' ? 'bg-[#383838] hover:bg-[#505050]' : 'bg-slate-900 hover:bg-slate-800'}`}><Download size={17}/> Download update APK</button>
+        {availableAppUpdate.releaseNotes?.length > 0 && <div className={`mt-4 rounded-xl p-4 text-sm ${theme === 'dark' ? 'bg-[#292929] text-slate-300' : 'bg-[#f3f0e9] text-gray-700'}`}>
+          <p className="font-semibold">What’s in this version</p>
           <ul className="mt-2 list-disc space-y-1 pl-5 text-xs leading-5">
-            <li>Clearer tenant and billing workflows</li>
-            <li>More reliable history and manager approvals</li>
-            <li>Small fixes for supported Android phones</li>
+            {availableAppUpdate.releaseNotes.map((note, index) => <li key={`${index}-${note}`}>{note}</li>)}
           </ul>
-        </div>
+        </div>}
         <p className={`mt-3 text-center text-xs leading-5 ${theme === 'dark' ? 'text-slate-400' : 'text-gray-500'}`}>After the download finishes, open the APK and follow Android’s install prompt.</p>
         <button type="button" onClick={dismissAppUpdateNotice} className={`mt-4 w-full rounded-xl px-4 py-2.5 text-sm font-semibold ${theme === 'dark' ? 'text-slate-300 hover:bg-white/5' : 'text-gray-600 hover:bg-black/5'}`}>Later</button>
+      </section>
+    </div>
+  );
+
+  const appUpdateStatusDialog = showAppUpdateStatus && (
+    <div className="fixed inset-0 z-[101] flex items-center justify-center bg-black/60 p-4" role="presentation" onClick={dismissAppUpdateStatus}>
+      <section role="dialog" aria-modal="true" aria-labelledby="app-update-status-title" className={`w-full max-w-md rounded-2xl border p-6 shadow-2xl ${theme === 'dark' ? 'border-[#383838] bg-[#1f1f1f] text-white' : 'border-[#e7e1d7] bg-[#fffdf9] text-gray-900'}`} onClick={event => event.stopPropagation()}>
+        <div className="flex items-start justify-between gap-4">
+          <div className={`flex h-11 w-11 items-center justify-center rounded-full ${appUpdateStatus?.error ? (theme === 'dark' ? 'bg-rose-950/60 text-rose-300' : 'bg-rose-100 text-rose-700') : (theme === 'dark' ? 'bg-emerald-950/60 text-emerald-300' : 'bg-emerald-100 text-emerald-700')}`}>
+            {appUpdateStatus?.error ? <AlertCircle size={22}/> : <CheckCircle2 size={22}/>}
+          </div>
+          <button type="button" onClick={dismissAppUpdateStatus} className={`rounded-lg p-2 ${theme === 'dark' ? 'text-slate-400 hover:bg-white/5' : 'text-gray-500 hover:bg-black/5'}`} aria-label="Close update status"><X size={18}/></button>
+        </div>
+        <p className="mt-4 text-xs font-semibold uppercase tracking-wider text-amber-600">App updates</p>
+        <h2 id="app-update-status-title" className="mt-1 text-xl font-semibold">{appUpdateStatus?.error ? 'Could not check for updates' : appUpdateStatus?.installedNewerThanLatest ? 'Installed version is ahead of the published release' : 'You’re using the latest version'}</h2>
+        {appUpdateStatus?.error ? (
+          <p role="alert" className={`mt-3 text-sm leading-6 ${theme === 'dark' ? 'text-slate-300' : 'text-gray-600'}`}>{appUpdateStatus.error}</p>
+        ) : (
+          <div className={`mt-4 rounded-xl p-4 text-sm ${theme === 'dark' ? 'bg-[#292929] text-slate-300' : 'bg-[#f3f0e9] text-gray-700'}`}>
+            <div className="flex justify-between gap-3"><span>Installed version</span><strong className={theme === 'dark' ? 'text-white' : 'text-gray-900'}>{appUpdateStatus?.currentVersion || APP_RELEASE_VERSION}</strong></div>
+            <div className="mt-2 flex justify-between gap-3"><span>Latest version</span><strong className={theme === 'dark' ? 'text-white' : 'text-gray-900'}>{appUpdateStatus?.latestVersion || APP_RELEASE_VERSION}</strong></div>
+          </div>
+        )}
+        {appUpdateStatus?.checkedAt && <p className={`mt-3 text-xs ${theme === 'dark' ? 'text-slate-400' : 'text-gray-500'}`}>Checked {new Date(appUpdateStatus.checkedAt).toLocaleString('en-KE', { timeZone: DEFAULT_TIMEZONE })}</p>}
+        <div className="mt-5 flex gap-3">
+          <button type="button" onClick={dismissAppUpdateStatus} className={`flex-1 rounded-xl border px-4 py-3 text-sm font-semibold ${theme === 'dark' ? 'border-[#505050] text-slate-200 hover:bg-white/5' : 'border-[#d8d2c8] text-gray-700 hover:bg-black/5'}`}>Close</button>
+          <button type="button" onClick={() => void checkAppUpdate({ force: true })} disabled={appUpdateCheckPending} className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-50"><RotateCcw size={16}/>{appUpdateCheckPending ? 'Checking…' : 'Check again'}</button>
+        </div>
       </section>
     </div>
   );
@@ -3194,6 +3263,7 @@ export default function App() {
         </section>
         {availableAppUpdate && !showAppUpdateNotice && <button type="button" onClick={() => setShowAppUpdateNotice(true)} className={`fixed bottom-4 right-4 z-40 flex items-center gap-2 rounded-xl px-4 py-3 text-sm font-semibold text-white shadow-lg ${theme === 'dark' ? 'bg-[#383838]' : 'bg-slate-900'}`}><Download size={16}/> Update to {availableAppUpdate.latestVersion}</button>}
         {appUpdateDialog}
+        {appUpdateStatusDialog}
       </main>
     );
   }
@@ -4788,6 +4858,7 @@ export default function App() {
         </div>
       )}
       {appUpdateDialog}
+      {appUpdateStatusDialog}
     </div>
   );
 }

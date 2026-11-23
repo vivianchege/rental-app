@@ -22,7 +22,7 @@ The assistant calls Firebase Cloud Functions and Google Gemini through Google Cl
 
 To enable answers in a Firebase project, enable Cloud Functions and the Vertex AI API, attach a billing account, and grant the Functions runtime service account the Vertex AI User role (`roles/aiplatform.user`). The default model is `gemini-3.8-flash` using the global endpoint; set `RENTAL_ASSISTANT_MODEL` or `GOOGLE_CLOUD_LOCATION` in `functions/.env` if you need to change them. Deploy with:
 
-For the production Firebase project `hse-app-b1d2b`, no callable functions were deployed at the latest review on November 23, 2026. The rental assistant and manager-account access controls need those functions and remain unavailable in the live app until the project is upgraded to Blaze and deployment succeeds.
+For the production Firebase project `hse-app-b1d2b`, no callable functions were deployed at the latest review on November 23, 2026. The rental assistant and manager-account access controls remain unavailable in the live app. A Supabase Free project has been created, but its Edge Functions are not yet deployed or connected to Firebase; the app continues to use Firebase Auth and Firestore. Do not treat the Supabase setup as a working replacement until token verification, workspace authorization, secret provisioning, and live tests have passed.
 
 ```bash
 npx firebase-tools deploy --only functions --project hse-app-b1d2b
@@ -67,12 +67,12 @@ npm run dev
 
 ## Build and install the Android APK
 
-The package name is `ke.co.houseapprentals`. Both builds support Android 7.0+ (API 24+) and use the Ruiru Rentals logo. The standard download is recommended for Android 10+ (API 29+) and uses Google Credential Manager. The older-device download is recommended for Android 7–9 (API 24–28), including the Galaxy S8 generation, and uses Google Play Services sign-in. Both use Tailwind CSS 3.4 and JavaScript output targeted to Chrome 72 for older Android WebViews. Keep Chrome updated on Android 7–9 because Chrome supplies WebView on those devices.
+The package name is `ke.co.houseapprentals`. Both builds support Android 7.0+ (API 24+) and use the Ruiru Rentals logo. The standard build targets Android 16/API 36, is recommended for Android 10+ (API 29+), and uses Google Credential Manager. The older-device build targets API 28, is recommended for Android 7–9 (API 24–28), including the Galaxy S8 generation, and uses Google Play Services sign-in. Both use Tailwind CSS 3.4 and JavaScript output targeted to Chrome 72 for older Android WebViews. Keep Chrome updated on Android 7–9 because Chrome supplies WebView on those devices.
 
 ### Download
 
-- [Android 10 and newer](https://github.com/vivianchege/rental-app/releases/latest/download/Ruiru-Rentals-1.6.1-Android-10-plus.apk)
-- [Android 7–9, including Galaxy S8](https://github.com/vivianchege/rental-app/releases/latest/download/Ruiru-Rentals-1.6.1-Android-7-to-9.apk)
+- [Android 10 and newer](https://github.com/vivianchege/rental-app/releases/latest/download/Ruiru-Rentals-1.6.2-Android-10-plus.apk)
+- [Android 7–9, including Galaxy S8](https://github.com/vivianchege/rental-app/releases/latest/download/Ruiru-Rentals-1.6.2-Android-7-to-9.apk)
 
 The Android 7–9 variant was previously smoke-tested on an Android 9 Samsung SM-J337A handset. Record a fresh device smoke check for each release before describing it as verified on a physical phone.
 
@@ -80,31 +80,18 @@ Both APKs have the same app ID and signing identity. Installing one updates/repl
 
 ### Build locally
 
-Use Android Studio's bundled JDK and install Android SDK/platform tools. From the project root, build the standard APK:
+Use Android Studio's bundled JDK and install Android SDK/platform tools. From the project root, build both APKs with the same process used for the GitHub release:
 
 ```bash
 npm install
-npm run build
-npx cap sync android
+npm run build:android-apks
 ```
 
-In PowerShell, build and save both signed APKs:
+The generated files are placed in `android/app/build/outputs/shareable-apks/`. The script builds the older-device Google sign-in bundle with the legacy Gradle flavor, then builds the standard bundle. On Windows it uses `gradlew.bat`; on macOS/Linux it uses `gradlew`.
 
-```powershell
-Push-Location android
-.\gradlew.bat assembleDebug
-Copy-Item .\app\build\outputs\apk\debug\app-debug.apk .\app\build\outputs\apk\debug\Ruiru-Rentals-1.6.1-Android-10-plus.apk
-Pop-Location
+The app version comes from `package.json`; Gradle derives a monotonically increasing Android version code from it. The APKs are non-debuggable release builds signed with the same local Android debug key as the existing GitHub downloads. The build script verifies that signer before it copies either APK, so a different computer's debug key cannot silently produce incompatible updates. Keep this key safe; replacing it prevents Android from installing future APKs as updates. These APKs are for direct installation and private sharing, not Play Store distribution.
 
-npm run build -- --mode android-legacy
-npx cap sync android
-Push-Location android
-.\gradlew.bat assembleDebug -PlegacyGoogleAuth=true
-Copy-Item .\app\build\outputs\apk\debug\app-debug.apk .\app\build\outputs\apk\debug\Ruiru-Rentals-1.6.1-Android-7-to-9.apk
-Pop-Location
-```
-
-The current Android version is **1.6.1** (version code **8**; the older-device APK displays **1.6.1-legacy**). Both builds use the local Android debug signing key so they can update the app already installed from this development machine. To sign with another key, add that key's SHA-1 fingerprint to the Android app in Firebase Console and download the refreshed `google-services.json`.
+On Android, **Settings → Check updates** fetches the latest published GitHub release each time it is pressed. It reports the installed and latest versions when current, or opens an update dialog with the matching device APK and release notes. The APK downloads through Android Download Manager; Android still asks the user to approve installation. On the first update, Android may ask the user to allow installs from Ruiru Rentals. Return to the app and press the update button again after granting that setting.
 
 ## Checks
 
@@ -114,7 +101,7 @@ npm test
 npm run build
 ```
 
-The Node test suite covers money allocation, workspace access, and the password cooldown schedule.
+The Node test suite covers money allocation, workspace access, password cooldowns, and update release parsing/version selection.
 
 ## Project layout
 

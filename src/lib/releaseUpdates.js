@@ -70,6 +70,10 @@ function parseInstalledVersion(value) {
   return parseVersion(value);
 }
 
+export function normalizeInstalledVersion(value) {
+  return parseInstalledVersion(value).normalized;
+}
+
 export class ReleaseUpdateError extends Error {
   constructor(code, message, cause) {
     super(message);
@@ -146,6 +150,23 @@ function selectApk(assets, version, tag, androidApiLevel) {
   );
 }
 
+function releaseNoteLines(body) {
+  if (typeof body !== 'string') return [];
+  return body
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line
+      .replace(/^#{1,6}\s+/, '')
+      .replace(/^[-*+]\s+/, '')
+      .replace(/\*\*(.*?)\*\*/g, '$1')
+      .replace(/`([^`]+)`/g, '$1')
+      .trim())
+    .filter(Boolean)
+    .slice(0, 5)
+    .map((line) => line.slice(0, 220));
+}
+
 /** Fetch latest release info and return a platform-specific APK only if newer. */
 export async function checkForAppUpdate({
   currentVersion,
@@ -202,7 +223,8 @@ export async function checkForAppUpdate({
       'INVALID_RELEASE_URL',
       'page',
     );
-    const updateAvailable = compareSemanticVersions(latest.normalized, current.normalized) > 0;
+    const versionComparison = compareSemanticVersions(latest.normalized, current.normalized);
+    const updateAvailable = versionComparison > 0;
     let apkDownloadUrl = null;
     if (updateAvailable) {
       if (!Array.isArray(release.assets)) throw failure('INVALID_ASSETS', 'GitHub release assets must be an array.');
@@ -213,9 +235,11 @@ export async function checkForAppUpdate({
       currentVersion: current.normalized,
       latestVersion: latest.normalized,
       updateAvailable,
+      installedNewerThanLatest: versionComparison < 0,
       releaseUrl,
       apkDownloadUrl,
       androidApiLevel,
+      releaseNotes: releaseNoteLines(release.body),
     };
   } finally {
     timeout.cleanup();

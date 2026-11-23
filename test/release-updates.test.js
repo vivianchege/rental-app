@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   checkForAppUpdate,
   compareSemanticVersions,
+  normalizeInstalledVersion,
   normalizeSemanticVersion,
   ReleaseUpdateError,
 } from '../src/lib/releaseUpdates.js';
@@ -12,6 +13,7 @@ const API_URL = 'https://api.github.com/repos/vivianchege/rental-app/releases/la
 function createRelease({
   tag = 'v1.6.0',
   assets,
+  body = '- Updated rent and payment workflows\n- Improved Android compatibility',
   htmlUrl = `https://github.com/vivianchege/rental-app/releases/tag/${tag}`,
 } = {}) {
   const releaseAssets = assets ?? [
@@ -26,7 +28,7 @@ function createRelease({
         `https://github.com/vivianchege/rental-app/releases/download/${tag}/Ruiru-Rentals-1.6.0-Android-7-to-9.apk`,
     },
   ];
-  return { tag_name: tag, html_url: htmlUrl, assets: releaseAssets };
+  return { tag_name: tag, html_url: htmlUrl, assets: releaseAssets, body };
 }
 
 function jsonResponse(value, overrides = {}) {
@@ -49,6 +51,7 @@ test('normalizes leading v and Android two-part versions', () => {
   assert.equal(normalizeSemanticVersion('v1.5'), '1.5.0');
   assert.equal(normalizeSemanticVersion('1.5-legacy'), '1.5.0-legacy');
   assert.equal(normalizeSemanticVersion('v1.6.0-rc.2+build.7'), '1.6.0-rc.2+build.7');
+  assert.equal(normalizeInstalledVersion('v1.6.2-legacy'), '1.6.2');
 });
 
 test('compares semantic versions including prerelease precedence and build metadata', () => {
@@ -72,11 +75,30 @@ test('selects modern APK for Android API 29 and newer', async () => {
     currentVersion: '1.5.0',
     latestVersion: '1.6.0',
     updateAvailable: true,
+    installedNewerThanLatest: false,
     releaseUrl: 'https://github.com/vivianchege/rental-app/releases/tag/v1.6.0',
     apkDownloadUrl:
       'https://github.com/vivianchege/rental-app/releases/download/v1.6.0/Ruiru-Rentals-1.6.0-Android-10-plus.apk',
     androidApiLevel: 35,
+    releaseNotes: ['Updated rent and payment workflows', 'Improved Android compatibility'],
   });
+});
+
+test('returns short plain-text release notes for the update dialog', async () => {
+  const result = await checkForAppUpdate({
+    currentVersion: '1.5.0',
+    androidApiLevel: 35,
+    fetchImpl: fetchRelease(createRelease({
+      body: '# Ruiru Rentals 1.6.0\n\n- **Faster billing** for past months.\n- `Back` closes the current screen.\n\nMore details are in the release page.',
+    })),
+  });
+
+  assert.deepEqual(result.releaseNotes, [
+    'Ruiru Rentals 1.6.0',
+    'Faster billing for past months.',
+    'Back closes the current screen.',
+    'More details are in the release page.',
+  ]);
 });
 
 test('selects legacy APK for Android API 28 and accepts prerelease asset versions', async () => {
@@ -115,6 +137,21 @@ test('does not offer a downgrade or same-version update', async () => {
 
   assert.equal(result.latestVersion, '1.5.0');
   assert.equal(result.updateAvailable, false);
+  assert.equal(result.installedNewerThanLatest, true);
+  assert.equal(result.apkDownloadUrl, null);
+});
+
+test('reports the current build as latest without requiring APK assets', async () => {
+  const result = await checkForAppUpdate({
+    currentVersion: '1.6.1-legacy',
+    androidApiLevel: 28,
+    fetchImpl: fetchRelease(createRelease({ tag: 'v1.6.1', assets: [] })),
+  });
+
+  assert.equal(result.currentVersion, '1.6.1');
+  assert.equal(result.latestVersion, '1.6.1');
+  assert.equal(result.updateAvailable, false);
+  assert.equal(result.installedNewerThanLatest, false);
   assert.equal(result.apkDownloadUrl, null);
 });
 

@@ -128,6 +128,9 @@ async function requireWorkspaceManager(uid, workspaceId) {
   }
 
   const profile = await readManagerProfile(uid);
+  if (profile.data?.deleted === true) {
+    throw new HttpsError("not-found", "The manager account has already been deleted.");
+  }
   if (isLegacyManager(uid)) {
     const conflictsWithLegacyIdentity =
       profile.data?.role && profile.data.role !== "MANAGER";
@@ -180,7 +183,7 @@ async function listManagersForWorkspace(workspaceId) {
 
   for (const snapshot of profileSnapshot.docs) {
     const data = snapshot.data();
-    if (data.role === "MANAGER") {
+    if (data.role === "MANAGER" && data.deleted !== true) {
       profiles.set(snapshot.id, {
         ref: snapshot.ref,
         exists: true,
@@ -192,6 +195,7 @@ async function listManagersForWorkspace(workspaceId) {
   if (workspaceId === MAIN_WORKSPACE_ID) {
     for (const uid of LEGACY_MANAGER_UIDS) {
       const profile = await readManagerProfile(uid);
+      if (profile.data?.deleted === true) continue;
       if (profile.data?.role && profile.data.role !== "MANAGER") continue;
       if (profile.data?.workspaceId && profile.data.workspaceId !== MAIN_WORKSPACE_ID) continue;
       profiles.set(uid, profile);
@@ -298,9 +302,20 @@ exports.deleteManagerAccount = callable("deleteManagerAccount", async (request) 
     await auth.deleteUser(uid);
   }
 
-  if (manager.exists) await manager.ref.delete();
+  // Keep a disabled tombstone. Legacy UID role fallbacks must not regain access
+  // after the profile is removed while an old Firebase token is still valid.
+  await manager.ref.set({
+    role: "MANAGER",
+    workspaceId: manager.workspaceId,
+    disabled: true,
+    deleted: true,
+    deletedBy: landlord.uid,
+    deletedAt: FieldValue.serverTimestamp(),
+    accessUpdatedBy: landlord.uid,
+    accessUpdatedAt: FieldValue.serverTimestamp(),
+  }, { merge: true });
 
-  return { uid, deleted: true, authAccountDeleted: Boolean(authUser) };
+  return { uid, deleted: true, authAccountDeleted: Boolean(authUser), accessTombstoneRetained: true };
 });
 
 const ASSISTANT_MAX_PROMPT_LENGTH = 4000;

@@ -1,6 +1,16 @@
+import groovy.json.JsonSlurper
+
 plugins {
     id 'com.android.application'
 }
+
+def packageMetadata = new JsonSlurper().parse(rootProject.file('../package.json'))
+def releaseVersion = (project.findProperty('rentalAppVersion') ?: packageMetadata.version).toString()
+def versionParts = releaseVersion.tokenize('.').collect { it as int }
+if (versionParts.size() != 3 || versionParts.any { it < 0 || it > 99 }) {
+    throw new GradleException('package.json version must be MAJOR.MINOR.PATCH with each number from 0 to 99.')
+}
+def releaseVersionCode = versionParts[0] * 1_000_000 + versionParts[1] * 10_000 + versionParts[2]
 
 android {
     namespace = "ke.co.houseapprentals"
@@ -10,8 +20,8 @@ android {
         applicationId = "ke.co.houseapprentals"
         minSdk = rootProject.ext.minSdkVersion
         targetSdk = rootProject.ext.targetSdkVersion
-        versionCode = 8
-        versionName = project.hasProperty('legacyGoogleAuth') ? "1.6.1-legacy" : "1.6.1"
+        versionCode = releaseVersionCode
+        versionName = releaseVersion
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -22,11 +32,23 @@ android {
         }
     }
 
+    flavorDimensions += 'androidCompatibility'
+    productFlavors {
+        legacy {
+            dimension 'androidCompatibility'
+            targetSdk 28
+            versionNameSuffix '-legacy'
+        }
+        modern {
+            dimension 'androidCompatibility'
+            targetSdk rootProject.ext.targetSdkVersion
+        }
+    }
+
     buildTypes {
         release {
-            minifyEnabled true
-            shrinkResources true
-            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.debug
+            minifyEnabled false
         }
     }
 
