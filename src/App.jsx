@@ -13,7 +13,7 @@ import {
   Droplet, Truck, Sun, Moon, BellRing, Menu,
   Eye, EyeOff, Download, Search, ReceiptText, FileBarChart, Fingerprint,
   Settings, Bell, Building2, Activity,
-  SlidersHorizontal, Database, ArrowUpRight, ArrowLeft, RotateCcw, Sparkles, Send, MessageCircle
+  SlidersHorizontal, Database, ArrowUpRight, ArrowLeft, RotateCcw, Send, Paperclip
 } from 'lucide-react';
 import { allocatePayment, parseMoney } from './lib/money.js';
 import { canAccessWorkspaceRecord, hasPermission, normalizeRole, PERMISSIONS, ROLES } from './lib/permissions.js';
@@ -57,6 +57,82 @@ import {
 } from 'firebase/firestore';
 
 const PORTFOLIO_URL = 'https://gikunjucreates.work.gd/';
+const RUIRU_LOGO_SRC = `${import.meta.env.BASE_URL}HSlogo.png`;
+const DEFAULT_ASSISTANT_IMAGE_QUESTION = 'Review the attached rental or payment list for the current open billing month. Read each clear tenant or unit label, amount, date, reference, and status. Compare it with the workspace records and tell me what appears missing or inconsistent and what I should enter or check next. If the month is unclear, ask me which month. Mark uncertain handwriting instead of guessing. Do not change or confirm any records.';
+
+async function prepareAssistantImage(file) {
+  const supportedTypes = ['image/jpeg', 'image/png', 'image/webp'];
+  if (!supportedTypes.includes(file?.type)) {
+    throw new Error('Choose a JPG, PNG, or WebP photo.');
+  }
+  if (file.size > 12 * 1024 * 1024) {
+    throw new Error('Choose a photo smaller than 12 MB.');
+  }
+
+  const objectUrl = URL.createObjectURL(file);
+  let image;
+  try {
+    image = await new Promise((resolve, reject) => {
+      const loadedImage = new Image();
+      loadedImage.onload = () => resolve(loadedImage);
+      loadedImage.onerror = () => reject(new Error('This photo could not be opened. Try another image.'));
+      loadedImage.src = objectUrl;
+    });
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+
+  const sourceWidth = image.naturalWidth || image.width;
+  const sourceHeight = image.naturalHeight || image.height;
+  if (!sourceWidth || !sourceHeight) throw new Error('This photo could not be opened. Try another image.');
+
+  let compressedBlob = null;
+  compression: for (const maxDimension of [1800, 1600, 1400]) {
+    const scale = Math.min(1, maxDimension / Math.max(sourceWidth, sourceHeight));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(sourceWidth * scale));
+    canvas.height = Math.max(1, Math.round(sourceHeight * scale));
+    const context = canvas.getContext('2d');
+    if (!context) throw new Error('This photo could not be prepared on this device.');
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(image, 0, 0, canvas.width, canvas.height);
+    for (const quality of [0.82, 0.74, 0.66]) {
+      compressedBlob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', quality));
+      if (compressedBlob && compressedBlob.size <= 2 * 1024 * 1024) break compression;
+    }
+  }
+  if (!compressedBlob || compressedBlob.size > 2 * 1024 * 1024) {
+    throw new Error('This photo is still too large after compression. Try a smaller or clearer photo.');
+  }
+
+  const dataUrl = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error('This photo could not be prepared on this device.'));
+    reader.readAsDataURL(compressedBlob);
+  });
+  const base64 = String(dataUrl).split(',')[1] || '';
+  if (!base64 || base64.length > 2_800_000) {
+    throw new Error('This photo is too large to send safely. Try a smaller photo.');
+  }
+  return { base64, mimeType: 'image/jpeg', previewUrl: String(dataUrl) };
+}
+
+function AssistantLoadingIndicator({ theme, label = 'The rental assistant is preparing a reply.' }) {
+  return (
+    <div role="status" className={`flex w-fit items-center gap-3 rounded-2xl border px-4 py-3 ${theme === 'dark' ? 'border-[#383838] bg-[#292929]' : 'border-[#e7e1d7] bg-[#f3f0e9]'}`}>
+      <img src={RUIRU_LOGO_SRC} alt="" className="assistant-loading-logo h-8 w-8 rounded-lg object-cover" />
+      <span className="sr-only">{label}</span>
+      <span aria-hidden="true" className="flex items-center gap-1.5 px-1">
+        <span className={`assistant-loading-dot h-2 w-2 rounded-full ${theme === 'dark' ? 'bg-slate-200' : 'bg-slate-700'}`} />
+        <span className={`assistant-loading-dot h-2 w-2 rounded-full ${theme === 'dark' ? 'bg-slate-200' : 'bg-slate-700'}`} />
+        <span className={`assistant-loading-dot h-2 w-2 rounded-full ${theme === 'dark' ? 'bg-slate-200' : 'bg-slate-700'}`} />
+      </span>
+    </div>
+  );
+}
+
 const handlePortfolioLinkClick = event => {
   event.preventDefault();
   if (Capacitor.isNativePlatform()) {
@@ -338,9 +414,16 @@ export default function App() {
   const [assistantMessages, setAssistantMessages] = useState([]);
   const [assistantInput, setAssistantInput] = useState('');
   const [assistantPending, setAssistantPending] = useState(false);
+  const [assistantPhotoPending, setAssistantPhotoPending] = useState(false);
   const [assistantError, setAssistantError] = useState('');
   const [assistantHistoryPending, setAssistantHistoryPending] = useState(false);
+  const [assistantReviewMode, setAssistantReviewMode] = useState('auto');
+  const [assistantImageAttachment, setAssistantImageAttachment] = useState(null);
+  const [assistantImageCandidate, setAssistantImageCandidate] = useState(null);
+  const [assistantImageConsentOpen, setAssistantImageConsentOpen] = useState(false);
+  const [assistantImagePreparing, setAssistantImagePreparing] = useState(false);
   const assistantEndRef = useRef(null);
+  const assistantImageInputRef = useRef(null);
 
   const isLandlord = hasPermission(role, PERMISSIONS.MANAGE_SETTINGS);
   const canManageProperties = hasPermission(role, PERMISSIONS.MANAGE_PROPERTIES);
@@ -1140,16 +1223,51 @@ export default function App() {
     setIsNotificationsOpen(false);
   };
 
+  const handleAssistantImageSelection = async (event) => {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = '';
+    if (!file) return;
+    if (!internetAvailable) {
+      setAssistantError('Connect to the internet before attaching a photo for assistant analysis.');
+      return;
+    }
+    setAssistantError('');
+    setAssistantImagePreparing(true);
+    try {
+      const prepared = await prepareAssistantImage(file);
+      setAssistantImageCandidate(prepared);
+      setAssistantImageConsentOpen(true);
+    } catch (error) {
+      setAssistantError(error?.message || 'This photo could not be prepared. Try another image.');
+    } finally {
+      setAssistantImagePreparing(false);
+    }
+  };
+
   const submitAssistantQuestion = async (event) => {
     event?.preventDefault?.();
-    const question = assistantInput.trim();
+    const attachment = assistantImageAttachment;
+    const question = assistantInput.trim() || (attachment ? DEFAULT_ASSISTANT_IMAGE_QUESTION : '');
     if (!question || assistantPending || question.length > 1000 || !user || !internetAvailable) return;
     setAssistantInput('');
     setAssistantError('');
     setAssistantPending(true);
-    setAssistantMessages(current => [...current, { id: `local-${Date.now()}`, role: 'user', content: question, createdAt: new Date().toISOString() }]);
+    setAssistantPhotoPending(Boolean(attachment));
+    setAssistantImageAttachment(null);
+    setAssistantMessages(current => [...current, {
+      id: `local-${Date.now()}`,
+      role: 'user',
+      content: question,
+      ...(attachment ? { attachmentLabel: 'Photo attached' } : {}),
+      createdAt: new Date().toISOString(),
+    }]);
     try {
-      const data = await callRentalFunction('rental-assistant', { action: 'ask', message: question }, user);
+      const data = await callRentalFunction('rental-assistant', {
+        action: 'ask',
+        message: question,
+        reviewMode: assistantReviewMode,
+        ...(attachment ? { image: { mimeType: attachment.mimeType, data: attachment.base64 } } : {}),
+      }, user);
       if (Array.isArray(data?.messages)) setAssistantMessages(data.messages);
       else {
         const answer = String(data?.answer || data?.message || '').trim();
@@ -1160,6 +1278,7 @@ export default function App() {
       setAssistantError(rentalAssistantErrorMessage(error, isLandlord));
     } finally {
       setAssistantPending(false);
+      setAssistantPhotoPending(false);
     }
   };
 
@@ -3070,7 +3189,7 @@ export default function App() {
 
   const navItems = [
     { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, permission: PERMISSIONS.VIEW_DASHBOARD },
-    { id: 'assistant', label: 'Rental assistant', icon: Sparkles, permission: PERMISSIONS.VIEW_DASHBOARD },
+    { id: 'assistant', label: 'Rental assistant', icon: null, permission: PERMISSIONS.VIEW_DASHBOARD },
     { id: 'houses', label: 'Houses & Units', icon: Building2, permission: PERMISSIONS.VIEW_PROPERTIES },
     { id: 'tenants', label: 'Tenants', icon: Users, permission: PERMISSIONS.VIEW_TENANTS },
     { id: 'billing', label: 'Rent & Payments', icon: Wallet, permission: PERMISSIONS.VIEW_RENT, badge: stats.pendingPaymentsCount },
@@ -3124,6 +3243,29 @@ export default function App() {
         <div className="mt-5 flex gap-3">
           <button type="button" onClick={dismissAppUpdateStatus} className={`flex-1 rounded-xl border px-4 py-3 text-sm font-semibold ${theme === 'dark' ? 'border-[#505050] text-slate-200 hover:bg-white/5' : 'border-[#d8d2c8] text-gray-700 hover:bg-black/5'}`}>Close</button>
           <button type="button" onClick={() => void checkAppUpdate({ force: true })} disabled={appUpdateCheckPending} className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-50"><RotateCcw size={16}/>{appUpdateCheckPending ? 'Checking…' : 'Check again'}</button>
+        </div>
+      </section>
+    </div>
+  );
+
+  const assistantImageConsentDialog = assistantImageConsentOpen && assistantImageCandidate && (
+    <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/65 p-4" role="presentation">
+      <section role="dialog" aria-modal="true" aria-labelledby="assistant-photo-consent-title" className={`max-h-[92svh] w-full max-w-lg overflow-y-auto rounded-2xl border p-5 shadow-2xl sm:p-6 ${theme === 'dark' ? 'border-[#383838] bg-[#1f1f1f] text-white' : 'border-[#e7e1d7] bg-[#fffdf9] text-gray-900'}`}>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-wider text-amber-700">Photo privacy</p>
+            <h2 id="assistant-photo-consent-title" className="mt-1 text-xl font-semibold">Review before sending</h2>
+          </div>
+          <button type="button" onClick={() => { setAssistantImageConsentOpen(false); setAssistantImageCandidate(null); }} className={`rounded-lg p-2 ${theme === 'dark' ? 'text-slate-400 hover:bg-white/5' : 'text-gray-500 hover:bg-black/5'}`} aria-label="Cancel photo attachment"><X size={18}/></button>
+        </div>
+        <img src={assistantImageCandidate.previewUrl} alt="Preview of the photo selected for rental assistant analysis" className="mt-4 max-h-56 w-full rounded-xl border border-black/10 bg-white object-contain" />
+        <div className={`mt-4 space-y-3 rounded-xl p-4 text-sm leading-6 ${theme === 'dark' ? 'bg-[#292929] text-slate-300' : 'bg-[#f3f0e9] text-gray-700'}`}>
+          <p>This photo may contain tenant names, unit labels, phone numbers, or payment references. If you continue, the compressed photo will be sent to Google Gemini’s free tier for analysis. Google may use free-tier content to improve its products.</p>
+          <p>The photo file is not saved in Ruiru Rentals. Your question and the assistant’s reply can remain in this account’s assistant history. The assistant only gives advice; it will not enter or confirm records.</p>
+        </div>
+        <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+          <button type="button" onClick={() => { setAssistantImageConsentOpen(false); setAssistantImageCandidate(null); }} className={`rounded-xl border px-4 py-3 text-sm font-semibold ${theme === 'dark' ? 'border-[#505050] text-slate-200 hover:bg-white/5' : 'border-[#d8d2c8] text-gray-700 hover:bg-black/5'}`}>Cancel</button>
+          <button type="button" onClick={() => { setAssistantImageAttachment(assistantImageCandidate); setAssistantImageCandidate(null); setAssistantImageConsentOpen(false); }} className="rounded-xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white hover:bg-slate-800">I understand — attach photo</button>
         </div>
       </section>
     </div>
@@ -3310,7 +3452,7 @@ export default function App() {
             const Icon = item.icon;
             return (
               <button key={item.id} onClick={() => { setActiveTab(item.id); setSidebarOpen(false); }} className={`w-full flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg text-sm font-semibold transition-all ${activeTab === item.id ? 'bg-gray-800 text-white shadow-sm' : theme === 'dark' ? 'hover:bg-slate-800 text-slate-400' : 'hover:bg-[#E8DFCE] text-gray-600'}`} aria-current={activeTab === item.id ? 'page' : undefined}>
-                <span className="flex items-center gap-3"><Icon size={17} aria-hidden="true" /> {item.label}</span>
+                <span className="flex items-center gap-3">{item.id === 'assistant' ? <img src={RUIRU_LOGO_SRC} alt="" className="h-[18px] w-[18px] rounded object-cover" /> : <Icon size={17} aria-hidden="true" />} {item.label}</span>
                 {item.badge > 0 && <span className="bg-amber-600 text-white text-[10px] px-1.5 py-0.5 rounded-full font-bold">{item.badge}</span>}
               </button>
             );
@@ -3363,27 +3505,43 @@ export default function App() {
               <section className={`mx-auto flex min-h-[min(72vh,760px)] max-w-4xl flex-col overflow-hidden rounded-2xl border ${theme === 'dark' ? 'border-[#383838] bg-[#1c1c1c]' : 'border-[#e7e1d7] bg-[#fffdf9]'}`} aria-labelledby="rental-assistant-heading">
                 <div className={`border-b p-5 sm:p-6 ${theme === 'dark' ? 'border-[#383838]' : 'border-[#e7e1d7]'}`}>
                   <div className="flex items-start gap-3">
-                    <div className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-xl ${theme === 'dark' ? 'bg-[#303030] text-slate-100' : 'bg-[#eee9df] text-slate-800'}`}><Sparkles size={20}/></div>
+                    <div className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border ${theme === 'dark' ? 'border-[#383838] bg-[#303030]' : 'border-[#e7e1d7] bg-[#eee9df]'}`}><img src={RUIRU_LOGO_SRC} alt="" className="h-8 w-8 rounded-lg object-cover" /></div>
                     <div><h3 id="rental-assistant-heading" className={`text-lg font-semibold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>Rental assistant</h3><p className="mt-1 max-w-2xl text-sm leading-5 text-gray-500">Ask about bills, tenants, repairs, or past months. It uses only workspace records your role can access, remembers recent conversation history, and cannot change or approve records.</p></div>
                   </div>
-                  {role === ROLES.MANAGER && <p className={`mt-4 rounded-lg px-3 py-2 text-xs leading-5 ${theme === 'dark' ? 'bg-[#292929] text-slate-300' : 'bg-[#f3f0e9] text-gray-600'}`}>The landlord can review assistant conversations and manager activity for this workspace.</p>}
                   {isLandlord && <p className={`mt-4 rounded-lg px-3 py-2 text-xs leading-5 ${theme === 'dark' ? 'bg-[#292929] text-slate-300' : 'bg-[#f3f0e9] text-gray-600'}`}>You can also ask what managers have changed or asked the assistant. The answer uses this workspace’s activity and assistant history.</p>}
                 </div>
                 <div className="flex-1 space-y-4 overflow-y-auto p-4 sm:p-6" aria-live="polite" aria-busy={assistantHistoryPending || assistantPending}>
-                  {assistantHistoryPending && <p className="py-8 text-center text-sm text-gray-500">Loading your conversation…</p>}
-                  {!assistantHistoryPending && assistantMessages.length === 0 && <div className="mx-auto max-w-xl py-10 text-center"><MessageCircle size={26} className={`mx-auto ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}/><p className={`mt-3 font-semibold ${theme === 'dark' ? 'text-slate-100' : 'text-gray-800'}`}>What would you like to understand?</p><p className="mt-1 text-sm text-gray-500">The assistant can summarize records and help you find useful patterns. It cannot change rental records.</p><div className="mt-5 flex flex-wrap justify-center gap-2">{(isLandlord ? ['Summarize rent collected over the past 3 months', 'What has the manager done recently?', 'Which tenants have the largest balances?'] : ['Who still has a balance this month?', 'Summarize the last closed month', 'Which maintenance issues are still open?']).map(suggestion => <button key={suggestion} type="button" onClick={() => setAssistantInput(suggestion)} className={`rounded-full border px-3 py-2 text-xs font-medium ${theme === 'dark' ? 'border-[#505050] text-slate-300 hover:bg-[#292929]' : 'border-[#d8d2c8] text-gray-700 hover:bg-[#f3f0e9]'}`}>{suggestion}</button>)}</div></div>}
+                  {assistantHistoryPending && <div className="flex justify-center py-8"><AssistantLoadingIndicator theme={theme} label="Loading your conversation history." /></div>}
+                  {!assistantHistoryPending && assistantMessages.length === 0 && <div className="mx-auto max-w-xl py-10 text-center"><img src={RUIRU_LOGO_SRC} alt="" className="mx-auto h-11 w-11 rounded-xl object-cover"/><p className={`mt-3 font-semibold ${theme === 'dark' ? 'text-slate-100' : 'text-gray-800'}`}>What would you like to understand?</p><p className="mt-1 text-sm text-gray-500">The assistant can summarize records and help you find useful patterns. It cannot change rental records.</p><div className="mt-5 flex flex-wrap justify-center gap-2">{(isLandlord ? ['Summarize rent collected over the past 3 months', 'What has the manager done recently?', 'Which tenants have the largest balances?'] : ['Who still has a balance this month?', 'Summarize the last closed month', 'Which maintenance issues are still open?']).map(suggestion => <button key={suggestion} type="button" onClick={() => setAssistantInput(suggestion)} className={`rounded-full border px-3 py-2 text-xs font-medium ${theme === 'dark' ? 'border-[#505050] text-slate-300 hover:bg-[#292929]' : 'border-[#d8d2c8] text-gray-700 hover:bg-[#f3f0e9]'}`}>{suggestion}</button>)}</div></div>}
                   {assistantMessages.map((message, index) => {
                     const isUserMessage = ['user', 'USER'].includes(message.role);
-                    return <div key={message.id || `${message.role}-${index}`} className={`flex ${isUserMessage ? 'justify-end' : 'justify-start'}`}><div className={`max-w-[92%] whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm leading-6 sm:max-w-[80%] ${isUserMessage ? 'bg-gray-800 text-white' : theme === 'dark' ? 'bg-[#292929] text-slate-100' : 'bg-[#f3f0e9] text-gray-800'}`}>{message.content || message.text || message.answer || ''}<p className={`mt-1 text-[10px] ${isUserMessage ? 'text-white/60' : 'text-gray-500'}`}>{isUserMessage ? 'You' : 'Rental assistant'}</p></div></div>;
+                    return <div key={message.id || `${message.role}-${index}`} className={`flex ${isUserMessage ? 'justify-end' : 'justify-start'}`}><div className={`max-w-[92%] whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm leading-6 sm:max-w-[80%] ${isUserMessage ? 'bg-gray-800 text-white' : theme === 'dark' ? 'bg-[#292929] text-slate-100' : 'bg-[#f3f0e9] text-gray-800'}`}>{message.content || message.text || message.answer || ''}{message.attachmentLabel && <p className={`mt-2 flex items-center gap-1.5 text-xs ${isUserMessage ? 'text-white/75' : 'text-gray-500'}`}><Paperclip size={13}/>{message.attachmentLabel}</p>}<p className={`mt-1 text-[10px] ${isUserMessage ? 'text-white/60' : 'text-gray-500'}`}>{isUserMessage ? 'You' : 'Rental assistant'}</p></div></div>;
                   })}
-                  {assistantPending && <div className={`w-fit rounded-xl px-4 py-3 text-sm ${theme === 'dark' ? 'bg-[#292929] text-slate-300' : 'bg-[#f3f0e9] text-gray-600'}`}>Reviewing the workspace records…</div>}
+                  {assistantPending && <AssistantLoadingIndicator theme={theme} label={assistantPhotoPending ? 'Analyzing your photo and workspace records.' : 'Reviewing your workspace records.'} />}
                   <div ref={assistantEndRef}/>
                 </div>
                 {assistantError && <p role="alert" className="mx-4 mb-2 rounded-lg border border-rose-300/50 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300 sm:mx-6">{assistantError}</p>}
-                <form onSubmit={submitAssistantQuestion} className={`flex items-end gap-2 border-t p-3 sm:p-4 ${theme === 'dark' ? 'border-[#383838]' : 'border-[#e7e1d7]'}`}>
-                  <label className="sr-only" htmlFor="rental-assistant-question">Ask the rental assistant</label>
-                  <textarea id="rental-assistant-question" rows="2" maxLength="1000" value={assistantInput} onChange={event => setAssistantInput(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitAssistantQuestion(event); } }} placeholder="Ask about your rental records…" className={`min-h-12 flex-1 resize-y rounded-xl border px-3 py-3 text-sm outline-none focus:ring-2 focus:ring-amber-600/30 ${theme === 'dark' ? 'border-[#505050] bg-[#111111] text-white placeholder:text-slate-500' : 'border-[#d8d2c8] bg-white text-gray-900 placeholder:text-gray-400'}`} />
-                  <button type="submit" disabled={assistantPending || !assistantInput.trim() || !internetAvailable} className="flex h-12 shrink-0 items-center gap-2 rounded-xl bg-gray-800 px-4 text-sm font-semibold text-white transition hover:bg-gray-900 disabled:cursor-not-allowed disabled:opacity-50"><Send size={16}/><span className="hidden sm:inline">Ask</span></button>
+                <form onSubmit={submitAssistantQuestion} className={`space-y-3 border-t p-3 sm:p-4 ${theme === 'dark' ? 'border-[#383838]' : 'border-[#e7e1d7]'}`}>
+                  <input ref={assistantImageInputRef} type="file" accept="image/jpeg,image/png,image/webp" onChange={handleAssistantImageSelection} className="sr-only" aria-label="Choose a photo for assistant analysis" />
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className={`text-xs font-semibold ${theme === 'dark' ? 'text-slate-400' : 'text-gray-500'}`}>Answer style</span>
+                      <div role="group" aria-label="Assistant answer detail" className={`flex rounded-lg border p-0.5 ${theme === 'dark' ? 'border-[#505050] bg-[#111111]' : 'border-[#d8d2c8] bg-white'}`}>
+                        {[['auto', 'Auto'], ['quick', 'Quick'], ['detailed', 'Detailed']].map(([mode, label]) => <button key={mode} type="button" aria-pressed={assistantReviewMode === mode} onClick={() => setAssistantReviewMode(mode)} disabled={assistantPending} className={`rounded-md px-2.5 py-1.5 text-xs font-semibold transition-colors disabled:opacity-50 ${assistantReviewMode === mode ? (theme === 'dark' ? 'bg-[#383838] text-white' : 'bg-[#e8dfce] text-gray-900') : (theme === 'dark' ? 'text-slate-400 hover:text-white' : 'text-gray-600 hover:text-gray-900')}`}>{label}</button>)}
+                      </div>
+                    </div>
+                    <button type="button" onClick={() => assistantImageInputRef.current?.click()} disabled={assistantPending || assistantImagePreparing || !internetAvailable} className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50 ${theme === 'dark' ? 'border-[#505050] text-slate-200 hover:bg-[#292929]' : 'border-[#d8d2c8] text-gray-700 hover:bg-[#f3f0e9]'}`}><Paperclip size={15}/>{assistantImagePreparing ? 'Preparing photo…' : 'Add photo'}</button>
+                  </div>
+                  {assistantImageAttachment && <div className={`flex items-center gap-3 rounded-xl border p-2.5 ${theme === 'dark' ? 'border-[#505050] bg-[#111111]' : 'border-[#d8d2c8] bg-white'}`}>
+                    <img src={assistantImageAttachment.previewUrl} alt="Photo ready to send for assistant analysis" className="h-12 w-12 shrink-0 rounded-lg bg-white object-cover" />
+                    <div className="min-w-0 flex-1"><p className={`text-xs font-semibold ${theme === 'dark' ? 'text-slate-100' : 'text-gray-800'}`}>Photo ready for analysis</p><p className="mt-0.5 text-[11px] leading-4 text-gray-500">It will be sent to Gemini only when you ask.</p></div>
+                    <button type="button" onClick={() => setAssistantImageAttachment(null)} disabled={assistantPending} className={`rounded-lg p-2 disabled:opacity-50 ${theme === 'dark' ? 'text-slate-400 hover:bg-white/5' : 'text-gray-500 hover:bg-black/5'}`} aria-label="Remove attached photo"><X size={17}/></button>
+                  </div>}
+                  <div className="flex items-end gap-2">
+                    <label className="sr-only" htmlFor="rental-assistant-question">Ask the rental assistant</label>
+                    <textarea id="rental-assistant-question" rows="2" maxLength="1000" value={assistantInput} onChange={event => setAssistantInput(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitAssistantQuestion(event); } }} placeholder={assistantImageAttachment ? 'Add a question, or analyze this photo…' : 'Ask about your rental records…'} className={`min-h-12 flex-1 resize-y rounded-xl border px-3 py-3 text-sm outline-none focus:ring-2 focus:ring-amber-600/30 ${theme === 'dark' ? 'border-[#505050] bg-[#111111] text-white placeholder:text-slate-500' : 'border-[#d8d2c8] bg-white text-gray-900 placeholder:text-gray-400'}`} />
+                    <button type="submit" disabled={assistantPending || (!assistantInput.trim() && !assistantImageAttachment) || !internetAvailable} className="flex h-12 shrink-0 items-center gap-2 rounded-xl bg-gray-800 px-4 text-sm font-semibold text-white transition hover:bg-gray-900 disabled:cursor-not-allowed disabled:opacity-50"><Send size={16}/><span>{assistantImageAttachment && !assistantInput.trim() ? 'Analyze' : 'Ask'}</span></button>
+                  </div>
                 </form>
               </section>
             )}
@@ -4859,6 +5017,7 @@ export default function App() {
       )}
       {appUpdateDialog}
       {appUpdateStatusDialog}
+      {assistantImageConsentDialog}
     </div>
   );
 }

@@ -12,7 +12,7 @@ Ruiru Rentals is a React and Capacitor property-management app for landlords and
 - Payment reference checks: landlord-entered payments require a reference; managers can submit a pending payment without one, but the landlord must enter a reference before confirming it. References cannot be reused. Cash is not offered as a rent-payment method.
 - Responsive light and dark themes, with the Ruiru Rentals logo in the Android app drawer.
 - Shared workspace notifications for rental, payment, maintenance, utility, and account changes, plus one daily follow-up reminder for a randomly selected tenant with a large balance.
-- A role-aware rental assistant. It reads workspace data on the server, keeps a conversation history, summarizes the latest 18 closed billing months, and lets the landlord ask about managers' recent activity and assistant conversations. It cannot change records. Managers can see only their own assistant history and permitted rental records.
+- A role-aware rental assistant with Auto, Quick, and Detailed answer styles. It reads workspace data on the server, keeps a conversation history, summarizes the latest 18 closed billing months, and lets the landlord ask about managers' recent activity and assistant conversations. It can review one attached rental-list photo after an explicit consent warning, but it cannot change records. Managers can see only their own assistant history and permitted rental records.
 - Native Google sign-in in Android and browser Google sign-in on the website.
 - Android ledger Back control and system Back navigation.
 
@@ -25,7 +25,7 @@ Firebase Authentication and Firestore remain the identity and rental-data stores
 
 Supabase's gateway JWT check is disabled for these two functions because the app's existing bearer token is a Firebase token. Each handler validates the Firebase token signature, project, issuer, audience, expiry, and subject itself, then checks the current Firebase Auth account and trusted role/workspace data before accessing Firebase. Do not remove those in-function checks.
 
-The rental assistant uses the Gemini Developer API with `gemini-3.5-flash-lite`. Before a prompt is sent, the server pseudonymizes known tenant, manager, and unit names/IDs; it also redacts emails, phone numbers, transaction references, and recognizable IDs. The server restores workspace labels only after Gemini replies. Financial amounts and months remain in the prompt so the assistant can answer record questions. Google states that free-tier Gemini content may be used to improve its products, so use this option only with that data handling understood. See [Gemini API pricing and data use](https://ai.google.dev/gemini-api/docs/pricing).
+The rental assistant uses the Gemini Developer API with `gemini-3.5-flash-lite`. For text-only questions, the server pseudonymizes known tenant, manager, and unit names/IDs and redacts emails, phone numbers, transaction references, and recognizable IDs before sending workspace context to Gemini. For photo analysis, the app first shows a consent warning because the photo may contain identifying information; if the user continues, a compressed copy is sent to Gemini's free tier, where Google may use submitted content to improve its products. The photo file is not saved by Ruiru Rentals, but the question and answer can remain in the user's assistant history. Financial amounts and months remain available for analysis. The assistant advises only and never writes or confirms a bill or payment. See [Gemini image understanding](https://ai.google.dev/gemini-api/docs/image-understanding) and [Gemini API pricing and data use](https://ai.google.dev/gemini-api/docs/pricing).
 
 ### Required server secrets
 
@@ -94,8 +94,8 @@ The package name is `ke.co.houseapprentals`. Both builds support Android 7.0+ (A
 
 ### Download
 
-- [Android 10 and newer](https://github.com/vivianchege/rental-app/releases/latest/download/Ruiru-Rentals-1.6.2-Android-10-plus.apk)
-- [Android 7–9, including Galaxy S8](https://github.com/vivianchege/rental-app/releases/latest/download/Ruiru-Rentals-1.6.2-Android-7-to-9.apk)
+- [Android 10 and newer](https://github.com/vivianchege/rental-app/releases/latest/download/Ruiru-Rentals-1.6.3-Android-10-plus.apk)
+- [Android 7–9, including Galaxy S8](https://github.com/vivianchege/rental-app/releases/latest/download/Ruiru-Rentals-1.6.3-Android-7-to-9.apk)
 
 The Android 7–9 variant was previously smoke-tested on an Android 9 Samsung SM-J337A handset. Record a fresh device smoke check for each release before describing it as verified on a physical phone.
 
