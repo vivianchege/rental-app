@@ -1,5 +1,7 @@
 import {
   authGetUser,
+  FirebaseConfigurationError,
+  FirebaseServiceError,
   firestoreGet,
   firestoreList,
   firestoreQueryString,
@@ -96,6 +98,12 @@ function stringClaim(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function firebaseFailureReason(error: unknown): string {
+  if (error instanceof FirebaseConfigurationError) return "configuration";
+  if (error instanceof FirebaseServiceError) return error.reason;
+  return "unexpected";
+}
+
 async function requireActor(req: Request): Promise<Actor> {
   let token: { uid: string; email?: string; name?: string; [key: string]: unknown };
   try {
@@ -110,16 +118,19 @@ async function requireActor(req: Request): Promise<Actor> {
     fail(401, "unauthenticated", "Sign in again to use the rental assistant.");
   }
 
-  let authUser: Awaited<ReturnType<typeof authGetUser>>;
-  let profileResult: Awaited<ReturnType<typeof firestoreGet>>;
-  try {
-    [authUser, profileResult] = await Promise.all([
-      authGetUser(uid),
-      firestoreGet(`users/${uid}`),
-    ]);
-  } catch {
+  const [authCheck, profileCheck] = await Promise.allSettled([
+    authGetUser(uid),
+    firestoreGet(`users/${uid}`),
+  ]);
+  if (authCheck.status === "rejected" || profileCheck.status === "rejected") {
+    console.error("rental-assistant Firebase verification failed", {
+      identity: authCheck.status === "rejected" ? firebaseFailureReason(authCheck.reason) : "ok",
+      profile: profileCheck.status === "rejected" ? firebaseFailureReason(profileCheck.reason) : "ok",
+    });
     fail(503, "unavailable", "Account access could not be verified. Please try again.");
   }
+  const authUser = authCheck.value;
+  const profileResult = profileCheck.value;
   if (!authUser || authUser.disabled) {
     fail(403, "permission-denied", "This account is disabled or unavailable.");
   }

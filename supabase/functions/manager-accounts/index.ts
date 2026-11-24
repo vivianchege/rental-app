@@ -2,6 +2,7 @@ import {
   authDeleteUser,
   authGetUser,
   authSetDisabled,
+  FirebaseConfigurationError,
   FirebaseServiceError,
   FirebaseTokenError,
   FirebaseUserNotFoundError,
@@ -463,7 +464,15 @@ async function handleRequest(request: Request): Promise<Response> {
         message: "The Firebase account was not found.",
       });
     }
+    if (error instanceof FirebaseConfigurationError) {
+      console.error("manager-accounts Firebase verification failed", { reason: "configuration" });
+      return jsonResponse(500, {
+        code: "internal-error",
+        message: "The account operation could not be completed. Please try again.",
+      });
+    }
     if (error instanceof FirebaseServiceError) {
+      console.error("manager-accounts Firebase verification failed", { reason: error.reason });
       return jsonResponse(500, {
         code: "internal-error",
         message: "The account operation could not be completed. Please try again.",

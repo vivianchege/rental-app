@@ -55,9 +55,12 @@ export class FirebaseUserNotFoundError extends Error {
 }
 
 export class FirebaseServiceError extends Error {
-  constructor() {
+  readonly reason: string;
+
+  constructor(reason = "firebase-service-failed") {
     super("The Firebase service request failed.");
     this.name = "FirebaseServiceError";
+    this.reason = /^[a-z0-9-]{1,80}$/.test(reason) ? reason : "firebase-service-failed";
   }
 }
 
@@ -172,23 +175,23 @@ async function requestGoogleAccessToken(): Promise<string> {
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch {
-    throw new FirebaseServiceError();
+    throw new FirebaseServiceError("oauth-network");
   }
 
   let payload: unknown;
   try {
     payload = await response.json();
   } catch {
-    throw new FirebaseServiceError();
+    throw new FirebaseServiceError("oauth-invalid-response");
   }
+  if (!response.ok) throw new FirebaseServiceError(`oauth-http-${response.status}`);
   if (
-    !response.ok ||
     !isRecord(payload) ||
     typeof payload.access_token !== "string" ||
     !payload.access_token ||
     !Number.isFinite(Number(payload.expires_in))
   ) {
-    throw new FirebaseServiceError();
+    throw new FirebaseServiceError("oauth-invalid-response");
   }
 
   const expiresIn = Math.max(0, Number(payload.expires_in));
@@ -232,6 +235,7 @@ async function googleJson(
   url: string,
   body: Record<string, unknown>,
   missingMode: GoogleErrorMode = "throw-user-not-found",
+  provider = "google-api",
 ): Promise<Record<string, unknown> | null> {
   const accessToken = await getGoogleAccessToken();
   let response: Response;
@@ -246,14 +250,14 @@ async function googleJson(
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch {
-    throw new FirebaseServiceError();
+    throw new FirebaseServiceError(`${provider}-network`);
   }
 
   let payload: unknown = null;
   try {
     payload = await response.json();
   } catch {
-    if (response.ok) throw new FirebaseServiceError();
+    if (response.ok) throw new FirebaseServiceError(`${provider}-invalid-response`);
   }
 
   if (!response.ok) {
@@ -261,9 +265,9 @@ async function googleJson(
     if (missing && missingMode === "return-null") return null;
     if (missing && missingMode === "ignore-user-not-found") return null;
     if (missing) throw new FirebaseUserNotFoundError();
-    throw new FirebaseServiceError();
+    throw new FirebaseServiceError(`${provider}-http-${response.status}`);
   }
-  if (!isRecord(payload)) throw new FirebaseServiceError();
+  if (!isRecord(payload)) throw new FirebaseServiceError(`${provider}-invalid-response`);
   return payload;
 }
 
@@ -453,19 +457,19 @@ async function firestoreRequest(
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch {
-    throw new FirebaseServiceError();
+    throw new FirebaseServiceError("firestore-network");
   }
 }
 
 async function firestoreJsonResponse(response: Response): Promise<Record<string, unknown>> {
-  if (!response.ok) throw new FirebaseServiceError();
+  if (!response.ok) throw new FirebaseServiceError(`firestore-http-${response.status}`);
   let payload: unknown;
   try {
     payload = await response.json();
   } catch {
-    throw new FirebaseServiceError();
+    throw new FirebaseServiceError("firestore-invalid-response");
   }
-  if (!isRecord(payload)) throw new FirebaseServiceError();
+  if (!isRecord(payload)) throw new FirebaseServiceError("firestore-invalid-response");
   return payload;
 }
 
@@ -564,15 +568,15 @@ export async function firestoreQueryString(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ structuredQuery }),
     });
-    if (!response.ok) throw new FirebaseServiceError();
+    if (!response.ok) throw new FirebaseServiceError(`firestore-http-${response.status}`);
 
     let rows: unknown;
     try {
       rows = await response.json();
     } catch {
-      throw new FirebaseServiceError();
+      throw new FirebaseServiceError("firestore-invalid-response");
     }
-    if (!Array.isArray(rows)) throw new FirebaseServiceError();
+    if (!Array.isArray(rows)) throw new FirebaseServiceError("firestore-invalid-response");
 
     const pageDocuments = rows
       .filter((row) => isRecord(row) && isRecord(row.document))
@@ -648,6 +652,7 @@ export async function authGetUser(uid: string): Promise<FirebaseAuthUser | null>
     identityToolkitUrl(requiredProjectId(), "lookup"),
     { localId: [uid] },
     "return-null",
+    "identity-toolkit",
   );
   const users = Array.isArray(result?.users) ? result.users : [];
   const user = users.find((candidate) => isRecord(candidate) && candidate.localId === uid);
@@ -670,12 +675,17 @@ export async function authSetDisabled(uid: string, disabled: boolean): Promise<v
   ) {
     throw new FirebaseServiceError();
   }
-  await googleJson(identityToolkitUrl(requiredProjectId(), "update"), {
-    localId: uid,
-    disableUser: disabled,
-    ...(disabled ? { validSince: String(Math.floor(Date.now() / 1_000)) } : {}),
-    returnSecureToken: false,
-  });
+  await googleJson(
+    identityToolkitUrl(requiredProjectId(), "update"),
+    {
+      localId: uid,
+      disableUser: disabled,
+      ...(disabled ? { validSince: String(Math.floor(Date.now() / 1_000)) } : {}),
+      returnSecureToken: false,
+    },
+    "throw-user-not-found",
+    "identity-toolkit",
+  );
 }
 
 export async function authDeleteUser(uid: string): Promise<void> {
@@ -686,5 +696,6 @@ export async function authDeleteUser(uid: string): Promise<void> {
     identityToolkitUrl(requiredProjectId(), "delete"),
     { localId: uid },
     "ignore-user-not-found",
+    "identity-toolkit",
   );
 }
