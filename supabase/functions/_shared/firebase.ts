@@ -65,9 +65,12 @@ export class FirebaseServiceError extends Error {
 }
 
 export class FirebaseConfigurationError extends Error {
-  constructor() {
+  readonly reason: string;
+
+  constructor(reason = "configuration") {
     super("Firebase server configuration is invalid.");
     this.name = "FirebaseConfigurationError";
+    this.reason = /^[a-z0-9-]{1,80}$/.test(reason) ? reason : "configuration";
   }
 }
 
@@ -91,7 +94,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function requiredProjectId(): string {
   const projectId = Deno.env.get("FIREBASE_PROJECT_ID")?.trim();
   if (!projectId || projectId.length > 128 || projectId.includes("/")) {
-    throw new FirebaseConfigurationError();
+    throw new FirebaseConfigurationError("project-id-invalid");
   }
   return projectId;
 }
@@ -99,26 +102,28 @@ function requiredProjectId(): string {
 function loadServiceAccount(projectId: string): ServiceAccount {
   if (serviceAccountCache) {
     if (serviceAccountCache.projectId !== projectId) {
-      throw new FirebaseConfigurationError();
+      throw new FirebaseConfigurationError("service-account-project-mismatch");
     }
     return serviceAccountCache;
   }
 
   const raw = Deno.env.get("FIREBASE_SERVICE_ACCOUNT_JSON");
-  if (!raw) throw new FirebaseConfigurationError();
+  if (!raw) throw new FirebaseConfigurationError("service-account-secret-missing");
 
   try {
     const parsed: unknown = JSON.parse(raw);
-    if (
-      !isRecord(parsed) ||
-      typeof parsed.project_id !== "string" ||
-      parsed.project_id !== projectId ||
-      typeof parsed.client_email !== "string" ||
-      !parsed.client_email.trim() ||
-      typeof parsed.private_key !== "string" ||
-      !parsed.private_key.includes("BEGIN PRIVATE KEY")
-    ) {
-      throw new FirebaseConfigurationError();
+    if (!isRecord(parsed)) throw new FirebaseConfigurationError("service-account-json-invalid");
+    if (typeof parsed.project_id !== "string") {
+      throw new FirebaseConfigurationError("service-account-project-id-missing");
+    }
+    if (parsed.project_id !== projectId) {
+      throw new FirebaseConfigurationError("service-account-project-mismatch");
+    }
+    if (typeof parsed.client_email !== "string" || !parsed.client_email.trim()) {
+      throw new FirebaseConfigurationError("service-account-client-email-missing");
+    }
+    if (typeof parsed.private_key !== "string" || !parsed.private_key.includes("BEGIN PRIVATE KEY")) {
+      throw new FirebaseConfigurationError("service-account-private-key-missing-or-invalid");
     }
 
     serviceAccountCache = {
@@ -129,7 +134,7 @@ function loadServiceAccount(projectId: string): ServiceAccount {
     return serviceAccountCache;
   } catch (error) {
     if (error instanceof FirebaseConfigurationError) throw error;
-    throw new FirebaseConfigurationError();
+    throw new FirebaseConfigurationError("service-account-json-invalid");
   }
 }
 
@@ -140,7 +145,7 @@ async function getSigningKey(account: ServiceAccount): Promise<CryptoKey> {
     return await pending;
   } catch {
     if (signingKeyPromise === pending) signingKeyPromise = null;
-    throw new FirebaseConfigurationError();
+    throw new FirebaseConfigurationError("service-account-private-key-invalid");
   }
 }
 
@@ -160,7 +165,7 @@ async function requestGoogleAccessToken(): Promise<string> {
       .sign(await getSigningKey(account));
   } catch (error) {
     if (error instanceof FirebaseConfigurationError) throw error;
-    throw new FirebaseConfigurationError();
+    throw new FirebaseConfigurationError("service-account-signing-failed");
   }
 
   let response: Response;

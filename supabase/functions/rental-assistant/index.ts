@@ -99,7 +99,7 @@ function stringClaim(value: unknown): string {
 }
 
 function firebaseFailureReason(error: unknown): string {
-  if (error instanceof FirebaseConfigurationError) return "configuration";
+  if (error instanceof FirebaseConfigurationError) return error.reason;
   if (error instanceof FirebaseServiceError) return error.reason;
   return "unexpected";
 }

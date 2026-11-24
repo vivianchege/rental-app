@@ -465,7 +465,7 @@ async function handleRequest(request: Request): Promise<Response> {
       });
     }
     if (error instanceof FirebaseConfigurationError) {
-      console.error("manager-accounts Firebase verification failed", { reason: "configuration" });
+      console.error("manager-accounts Firebase verification failed", { reason: error.reason });
       return jsonResponse(500, {
         code: "internal-error",
         message: "The account operation could not be completed. Please try again.",
