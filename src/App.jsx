@@ -6,7 +6,6 @@ import { BiometricAuth } from '@aparajita/capacitor-biometric-auth';
 import { Preferences } from '@capacitor/preferences';
 import { Browser } from '@capacitor/browser';
 import { Device } from '@capacitor/device';
-import { getFunctions, httpsCallable } from 'firebase/functions';
 import { 
   Users, Home, Wallet, Wrench, LayoutDashboard, LogOut, Trash2,
   CheckCircle2, Plus, AlertCircle, Phone, X, ShieldCheck,
@@ -23,6 +22,7 @@ import { firebaseClientConfig } from './lib/firebaseClientConfig.js';
 import { probeInternetAccess } from './lib/connectivity.js';
 import { checkForAppUpdate, normalizeInstalledVersion } from './lib/releaseUpdates.js';
 import { NativeAppUpdater } from './lib/nativeAppUpdater.js';
+import { callRentalFunction } from './lib/supabaseFunctions.js';
 
 // --- FIREBASE IMPORTS ---
 import { initializeApp, getApps, getApp } from 'firebase/app';
@@ -96,7 +96,6 @@ const auth = app ? (Capacitor.isNativePlatform()
 const db = app ? initializeFirestore(app, {
   localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
 }) : null;
-const functionsClient = app ? getFunctions(app, 'us-central1') : null;
 const appId = firebaseConfig.projectId || 'house-management-portal';
 const DEFAULT_CURRENCY = import.meta.env.VITE_DEFAULT_CURRENCY || 'KES';
 const DEFAULT_TIMEZONE = import.meta.env.VITE_DEFAULT_TIMEZONE || 'Africa/Nairobi';
@@ -483,11 +482,11 @@ export default function App() {
   }, []);
 
   const refreshManagerAccounts = useCallback(async () => {
-    if (!user || role !== ROLES.LANDLORD || !functionsClient) return;
+    if (!user || role !== ROLES.LANDLORD) return;
     setManagerAccountsLoading(true);
     setManagerAccountsError('');
     try {
-      const { data } = await httpsCallable(functionsClient, 'listWorkspaceManagers')({});
+      const data = await callRentalFunction('manager-accounts', { action: 'list' }, user);
       setManagerAccounts(Array.isArray(data?.managers) ? data.managers : []);
     } catch (error) {
       setManagerAccountsError(error?.message?.replace(/^Firebase:\s*/i, '') || 'Could not load manager accounts.');
@@ -503,14 +502,15 @@ export default function App() {
   }, [activeTab, isLandlord, internetAvailable, refreshManagerAccounts]);
 
   const handleManagerAccessChange = async (manager) => {
-    if (!functionsClient || role !== ROLES.LANDLORD || isProcessing) return;
+    if (role !== ROLES.LANDLORD || isProcessing) return;
     setIsProcessing(true);
     setManagerAccountsError('');
     try {
-      await httpsCallable(functionsClient, 'setManagerAccess')({
+      await callRentalFunction('manager-accounts', {
+        action: 'setAccess',
         uid: manager.uid,
         disabled: !manager.disabled,
-      });
+      }, user);
       await writeWorkspaceNotification({
         title: manager.disabled ? 'Manager access restored' : 'Manager access turned off',
         message: `${manager.displayName || manager.email || 'A manager'}’s sign-in access was ${manager.disabled ? 'restored' : 'turned off'} by the landlord.`,
@@ -1096,9 +1096,9 @@ export default function App() {
       if (cancelled) return null;
       setAssistantHistoryPending(true);
       setAssistantError('');
-      return httpsCallable(functionsClient, 'getRentalAssistantHistory')({ limit: 50 });
+      return callRentalFunction('rental-assistant', { action: 'history', limit: 50 }, user);
     })
-      .then(result => result?.data || null)
+      .then(result => result || null)
       .then(data => {
         if (!cancelled && data) setAssistantMessages(Array.isArray(data?.messages) ? data.messages : []);
       })
@@ -1149,7 +1149,7 @@ export default function App() {
     setAssistantPending(true);
     setAssistantMessages(current => [...current, { id: `local-${Date.now()}`, role: 'user', content: question, createdAt: new Date().toISOString() }]);
     try {
-      const { data } = await httpsCallable(functionsClient, 'askRentalAssistant')({ message: question });
+      const data = await callRentalFunction('rental-assistant', { action: 'ask', message: question }, user);
       if (Array.isArray(data?.messages)) setAssistantMessages(data.messages);
       else {
         const answer = String(data?.answer || data?.message || '').trim();
@@ -2816,10 +2816,10 @@ export default function App() {
       } else if (confirmationAction.type === 'closeCycle') {
         await handleCloseCycle();
       } else if (confirmationAction.type === 'deleteManagerAccount') {
-        if (!functionsClient || role !== ROLES.LANDLORD) throw new Error('Only the landlord can delete manager accounts.');
+        if (role !== ROLES.LANDLORD) throw new Error('Only the landlord can delete manager accounts.');
         const manager = confirmationAction.manager;
         if (!manager?.uid) throw new Error('Select a valid manager account.');
-        await httpsCallable(functionsClient, 'deleteManagerAccount')({ uid: manager.uid });
+        await callRentalFunction('manager-accounts', { action: 'delete', uid: manager.uid }, user);
         setManagerAccounts(current => current.filter(account => account.uid !== manager.uid));
         await writeWorkspaceNotification({ title: 'Manager account deleted', message: `${manager.displayName || manager.email || 'A manager'}’s sign-in account was removed by the landlord. Existing rental records were kept.`, action: 'MANAGER_ACCOUNT_DELETED', entity: 'manager', entityId: manager.uid });
         setToastMessage(`${manager.displayName || manager.email || 'Manager'} account was deleted. Rental history was retained.`);

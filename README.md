@@ -1,6 +1,6 @@
 # Ruiru Rentals
 
-Ruiru Rentals is a React and Capacitor property-management app for landlords and managers. The website and Android APK use Firebase Authentication and Cloud Firestore.
+Ruiru Rentals is a React and Capacitor property-management app for landlords and managers. The website and Android APK use Firebase Authentication and Cloud Firestore. Supabase Edge Functions provide the server-side rental assistant and landlord manager-account controls without requiring Firebase Cloud Functions.
 
 ## What it includes
 
@@ -16,19 +16,42 @@ Ruiru Rentals is a React and Capacitor property-management app for landlords and
 - Native Google sign-in in Android and browser Google sign-in on the website.
 - Android ledger Back control and system Back navigation.
 
-## Rental assistant setup
+## Rental assistant and manager-account setup
 
-The assistant calls Firebase Cloud Functions and Google Gemini through Google Cloud's Vertex AI service. No model API key is stored in the website or APK. The server verifies the signed-in role and workspace before reading records. Manager conversations are private to that manager and landlord-accessible within the same workspace; no other workspace is included. The assistant uses recent billing cycles and operational records, and it does not create or approve records.
+Firebase Authentication and Firestore remain the identity and rental-data stores. The app sends the signed-in Firebase ID token to these Supabase Edge Functions:
 
-To enable answers in a Firebase project, enable Cloud Functions and the Vertex AI API, attach a billing account, and grant the Functions runtime service account the Vertex AI User role (`roles/aiplatform.user`). The default model is `gemini-3.8-flash` using the global endpoint; set `RENTAL_ASSISTANT_MODEL` or `GOOGLE_CLOUD_LOCATION` in `functions/.env` if you need to change them. Deploy with:
+- `rental-assistant`: reads only the caller's workspace, stores conversation history and rate limits in Firestore, and provides landlord-only summaries of verified manager activity. It is read-only.
+- `manager-accounts`: verifies the landlord and workspace, then lists, disables/enables, or deletes manager sign-in accounts. Disabled/deleted Firestore profiles deny access immediately; deleting a manager keeps rental records.
 
-For the production Firebase project `hse-app-b1d2b`, no callable functions were deployed at the latest review on November 23, 2026. The rental assistant and manager-account access controls remain unavailable in the live app. A Supabase Free project has been created, but its Edge Functions are not yet deployed or connected to Firebase; the app continues to use Firebase Auth and Firestore. Do not treat the Supabase setup as a working replacement until token verification, workspace authorization, secret provisioning, and live tests have passed.
+Supabase's gateway JWT check is disabled for these two functions because the app's existing bearer token is a Firebase token. Each handler validates the Firebase token signature, project, issuer, audience, expiry, and subject itself, then checks the current Firebase Auth account and trusted role/workspace data before accessing Firebase. Do not remove those in-function checks.
 
-```bash
-npx firebase-tools deploy --only functions --project hse-app-b1d2b
+The rental assistant uses the Gemini Developer API with `gemini-3.5-flash-lite`. Before a prompt is sent, the server pseudonymizes known tenant, manager, and unit names/IDs; it also redacts emails, phone numbers, transaction references, and recognizable IDs. The server restores workspace labels only after Gemini replies. Financial amounts and months remain in the prompt so the assistant can answer record questions. Google states that free-tier Gemini content may be used to improve its products, so use this option only with that data handling understood. See [Gemini API pricing and data use](https://ai.google.dev/gemini-api/docs/pricing).
+
+### Required server secrets
+
+Create a dedicated service account in Google Cloud for Firebase project `hse-app-b1d2b`. Grant only the Firebase Authentication Admin role and Cloud Datastore User role needed for the account controls and Firestore data operations. Create a JSON key and store the complete JSON only as a Supabase Edge Function secret; never commit it or put it in a `VITE_*` variable.
+
+Create a Gemini API key in Google AI Studio. Add these secrets in the Supabase dashboard under **Edge Functions → Secrets** for project `fxxfhowztjlzvisurxga`:
+
+```text
+FIREBASE_PROJECT_ID=hse-app-b1d2b
+FIREBASE_SERVICE_ACCOUNT_JSON=<complete service-account JSON>
+GEMINI_API_KEY=<Google AI Studio API key>
+RENTAL_ASSISTANT_MODEL=gemini-3.5-flash-lite
 ```
 
-Cloud Functions deployment requires the Firebase project to use the Blaze plan. Gemini model usage may incur separate Google Cloud charges; set budget alerts in Google Cloud before enabling regular use. The app shows an actionable setup error if the backend or model service is not configured.
+Restrict the Gemini key to the Generative Language API when creating it. Never send either key in chat, the repository, or the website/APK build. Adding or changing function secrets does not require a redeploy.
+
+### Deploy Edge Functions
+
+The Supabase project is `fxxfhowztjlzvisurxga`. From the repository root, deploy each handler with Supabase JWT verification disabled because Firebase verification happens in the code:
+
+```bash
+npx supabase functions deploy manager-accounts --project-ref fxxfhowztjlzvisurxga --no-verify-jwt
+npx supabase functions deploy rental-assistant --project-ref fxxfhowztjlzvisurxga --no-verify-jwt
+```
+
+The same setting is recorded in `supabase/config.toml`. The app calls the project URL configured by `VITE_SUPABASE_URL` (the production URL is `https://fxxfhowztjlzvisurxga.supabase.co`). These two features do not require Firebase Cloud Functions or Firebase's Blaze plan. The existing `functions/` folder is the older implementation and is not used by the current app path.
 
 ## Sign-in and app security
 

@@ -5,6 +5,15 @@
 # working directory name when running `supabase init`.
 project_id = "ruiru-rentals"
 
+# Firebase ID tokens are validated inside these functions against Google's
+# Secure Token signing keys, project audience, issuer, and expiry. Supabase's
+# own JWT verifier cannot validate this app's existing Firebase role claims.
+[functions.manager-accounts]
+verify_jwt = false
+
+[functions.rental-assistant]
+verify_jwt = false
+
 [api]
 enabled = true
 # Port to use for the API URL.
